@@ -22,8 +22,12 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/macros.h"
+<<<<<<< HEAD
 #include "phy_page.h"  // Includes page_id_t definition
 #include "platform/vmm_api.h"
+=======
+#include "platform/vmm/vmm_api.h"
+>>>>>>> a70a6e8 (feat: add VMM submitter APIs for non-blocking vmm::map/unmap)
 
 namespace xllm {
 

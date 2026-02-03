@@ -5,6 +5,8 @@ if(USE_NPU)
   add_subdirectory(npu)
 endif()
 
+include_directories(.)
+
 cc_library(
   NAME
     platform
@@ -13,13 +15,22 @@ cc_library(
     device.h
     vmm_api.h
     shared_vmm_allocator.h
+    vmm_torch_allocator.h
+    vmm_submitter/vmm_common.h
+    vmm_submitter/vmm_manager.h
+    vmm_submitter/vmm_submitter.h
+    vmm_submitter/vmm_worker.h
   SRCS
     stream.cpp
     device.cpp
     vmm_api.cpp
     shared_vmm_allocator.cpp
+    vmm_submitter/vmm_manager.cpp
+    vmm_submitter/vmm_submitter.cpp
+    vmm_submitter/vmm_worker.cpp
   DEPS
     torch
+    Folly::folly
     $<$<BOOL:${USE_NPU}>:torch_npu>
     $<$<BOOL:${USE_NPU}>:ascendcl>
     $<$<BOOL:${USE_MLU}>:torch_mlu>
