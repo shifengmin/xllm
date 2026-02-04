@@ -2,14 +2,18 @@ include(cc_library)
 
 cc_library(
   NAME
-    platform
+    platform_vmm
   HDRS
-    stream.h
-    device.h
+    submitter/common.h
+    submitter/manager.h
+    submitter/submitter.h
+    submitter/worker.h
     vmm_api.h
   SRCS
-    stream.cpp
-    device.cpp
+    submitter/common.cpp
+    submitter/manager.cpp
+    submitter/submitter.cpp
+    submitter/worker.cpp
     vmm_api.cpp
   DEPS
     torch
@@ -23,9 +27,3 @@ cc_library(
     $<$<BOOL:${USE_MUSA}>:musa>
     $<$<BOOL:${USE_MUSA}>:musart>
 )
-
-if(USE_NPU)
-  add_subdirectory(npu)
-endif()
-
-add_subdirectory(vmm)
