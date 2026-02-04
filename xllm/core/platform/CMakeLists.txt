@@ -14,7 +14,6 @@ cc_library(
   SRCS
     stream.cpp
     device.cpp
-    vmm/submitter/common.cpp
     vmm/submitter/manager.cpp
     vmm/submitter/submitter.cpp
     vmm/submitter/worker.cpp
