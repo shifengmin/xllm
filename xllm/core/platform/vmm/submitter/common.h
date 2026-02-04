@@ -19,7 +19,7 @@ limitations under the License.
 
 #include <folly/concurrency/UnboundedQueue.h>
 
-#include "../../test_vmm/vmm_api.h"
+#include "../../vmm/vmm_api.h"
 
 using VirtPtr = void*;
 using PhyMemHandle = void*;
