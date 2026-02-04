@@ -6,11 +6,9 @@ cc_library(
   HDRS
     stream.h
     device.h
-    vmm_api.h
   SRCS
     stream.cpp
     device.cpp
-    vmm_api.cpp
   DEPS
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>

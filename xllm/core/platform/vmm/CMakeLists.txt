@@ -10,7 +10,6 @@ cc_library(
     submitter/worker.h
     vmm_api.h
   SRCS
-    submitter/common.cpp
     submitter/manager.cpp
     submitter/submitter.cpp
     submitter/worker.cpp
