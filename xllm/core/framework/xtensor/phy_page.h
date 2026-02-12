@@ -17,7 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include "platform/vmm/vmm_api.h"
+#include "platform/vmm_api.h"
 
 namespace xllm {
 
