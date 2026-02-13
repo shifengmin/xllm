@@ -23,7 +23,7 @@ limitations under the License.
 namespace xllm {
 namespace vmm {
 
-enum class OpType { MAP, UNMAP };
+enum class OpType { MAP, UNMAP, RELEASE_VADDR };
 
 class VMMSubmitter;
 

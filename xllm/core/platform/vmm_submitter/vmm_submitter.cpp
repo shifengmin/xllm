@@ -26,47 +26,12 @@ limitations under the License.
 namespace xllm {
 namespace vmm {
 
-VMMSubmitter::VMMSubmitter(int32_t device_id) : device_id_(device_id) {
-  connect(device_id);
-}
+VMMSubmitter::VMMSubmitter(int32_t device_id, std::shared_ptr<VMMWorker> worker)
+    : device_id_(device_id), worker_(std::move(worker)) {}
 
-VMMSubmitter::~VMMSubmitter() {
-  wait_all();
-  disconnect();
-}
-
-bool VMMSubmitter::connect(int32_t device_id) {
-  if (connected_) {
-    LOG(WARNING) << "Already connected to device " << device_id;
-    return false;
-  }
-
-  worker_ = VMMManager::get_instance().get_worker(device_id);
-  if (!worker_) {
-    LOG(ERROR) << "Failed to get worker for device " << device_id
-               << ". Device not initialized?";
-    return false;
-  }
-  device_id_ = device_id;
-  connected_ = true;
-  LOG(INFO) << "Submitter connected to device " << device_id;
-  return true;
-}
-
-void VMMSubmitter::disconnect() {
-  if (connected_) {
-    LOG(INFO) << "Disconnecting submitter from device " << device_id_;
-    wait_all();
-    worker_.reset();
-    connected_ = false;
-  }
-}
+VMMSubmitter::~VMMSubmitter() {}
 
 uint64_t VMMSubmitter::map(VirPtr va, PhyMemHandle phy) {
-  if (!is_connected()) {
-    LOG(ERROR) << "Not connected or worker destroyed";
-    return 0;
-  }
 
   uint64_t request_id = next_request_id_++;
   VMMRequest req(OpType::MAP, va, phy, 0, request_id, this);
@@ -81,10 +46,6 @@ uint64_t VMMSubmitter::map(VirPtr va, PhyMemHandle phy) {
 }
 
 uint64_t VMMSubmitter::unmap(VirPtr va, size_t aligned_size) {
-  if (!is_connected()) {
-    LOG(ERROR) << "Not connected or worker destroyed";
-    return 0;
-  }
 
   uint64_t request_id = next_request_id_++;
   VMMRequest req(OpType::UNMAP, va, 0, aligned_size, request_id, this);
@@ -96,6 +57,15 @@ uint64_t VMMSubmitter::unmap(VirPtr va, size_t aligned_size) {
 
   pending_unmap_++;
   return request_id;
+}
+
+void VMMSubmitter::release_vaddr(VirPtr va, size_t aligned_size) {
+
+  uint64_t request_id = next_request_id_++;
+  VMMRequest req(OpType::RELEASE_VADDR, va, 0, aligned_size, request_id, this);
+  if (!worker_->submit_request(req)) {
+    LOG(ERROR) << "Failed to submit release_vaddr request";
+  }
 }
 
 size_t VMMSubmitter::poll_completions(size_t max_completions) {

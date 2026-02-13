@@ -211,6 +211,8 @@ DECLARE_int32(max_requests_per_batch);
 
 DECLARE_bool(enable_xtensor);
 
+DECLARE_bool(enable_xtensor_async_map);
+
 DECLARE_int64(phy_page_granularity_size);
 
 DECLARE_int64(cache_size_per_token);

@@ -59,6 +59,8 @@ class VMMWorker {
 
   void execute_unmap(VMMRequest& req);
 
+  void execute_release_vaddr(VMMRequest& req);
+
   void notify_completion(VMMSubmitter* submitter,
                          uint64_t request_id,
                          OpType op_type,

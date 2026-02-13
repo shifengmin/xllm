@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -35,13 +36,14 @@ class VMMManager {
     return instance;
   }
 
-  bool init_device(int32_t device_id);
+  VMMSubmitter* get_submitter(int32_t device_id);
 
-  void shutdown();
-
-  std::unique_ptr<VMMSubmitter> create_submitter(int32_t device_id);
-
-  std::shared_ptr<VMMWorker> get_worker(int32_t device_id);
+#ifdef XLLM_VMM_TEST
+  size_t test_worker_count() const;
+  size_t test_worker_create_count() const {
+    return worker_create_count_.load(std::memory_order_relaxed);
+  }
+#endif
 
  private:
   VMMManager() = default;
@@ -49,11 +51,20 @@ class VMMManager {
 
   DISALLOW_COPY_AND_MOVE(VMMManager);
 
+  std::unique_ptr<VMMSubmitter> create_submitter(int32_t device_id);
+
+  std::shared_ptr<VMMWorker> get_worker(int32_t device_id);
+
   std::shared_ptr<VMMWorker> create_worker(int32_t device_id);
 
+  void shutdown();
+
   std::unordered_map<int32_t, std::shared_ptr<VMMWorker>> workers_;
-  mutable std::mutex workers_mutex_;
+  mutable std::mutex mutex_;
   std::atomic<bool> shutdown_flag_{false};
+#ifdef XLLM_VMM_TEST
+  std::atomic<size_t> worker_create_count_{0};
+#endif
 };
 
 }  // namespace vmm

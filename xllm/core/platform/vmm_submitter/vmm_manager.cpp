@@ -24,29 +24,8 @@ namespace vmm {
 
 VMMManager::~VMMManager() { shutdown(); }
 
-bool VMMManager::init_device(int32_t device_id) {
-  std::lock_guard<std::mutex> lock(workers_mutex_);
-
-  if (workers_.find(device_id) != workers_.end()) {
-    LOG(WARNING) << "Device " << device_id << " already initialized";
-    return false;
-  }
-
-  // Create worker using private factory method
-  auto worker = create_worker(device_id);
-  if (!worker) {
-    LOG(ERROR) << "Failed to create worker for device " << device_id;
-    return false;
-  }
-
-  worker->start();
-  workers_[device_id] = worker;
-  LOG(INFO) << "Initialized worker for device " << device_id;
-  return true;
-}
-
 void VMMManager::shutdown() {
-  std::lock_guard<std::mutex> lock(workers_mutex_);
+  std::lock_guard<std::mutex> lock(mutex_);
   if (shutdown_flag_.exchange(true)) {
     return;  // Already shutting down or done
   }
@@ -61,26 +40,55 @@ void VMMManager::shutdown() {
   LOG(INFO) << "VMMManager shutdown complete";
 }
 
+VMMSubmitter* VMMManager::get_submitter(int32_t device_id) {
+  thread_local std::unordered_map<int32_t, std::unique_ptr<VMMSubmitter>> maps;
+  auto it = maps.find(device_id);
+  if (it != maps.end()) {
+    return it->second.get();
+  } else {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto sub = vmm::VMMManager::get_instance().create_submitter(device_id);
+    if (!sub) {
+      return nullptr;
+    }
+    VMMSubmitter* p = sub.get();
+    maps[device_id] = std::move(sub);
+    return p;
+  }
+}
+
 std::unique_ptr<VMMSubmitter> VMMManager::create_submitter(int32_t device_id) {
-  // Use private constructor to create submitter
-  return std::unique_ptr<VMMSubmitter>(new VMMSubmitter(device_id));
+  std::shared_ptr<VMMWorker> worker = get_worker(device_id);
+  if (worker == nullptr) {
+    worker = create_worker(device_id);
+    worker->start();
+    workers_[device_id] = worker;
+  }
+  return std::unique_ptr<VMMSubmitter>(new VMMSubmitter(device_id, worker));
 }
 
 std::shared_ptr<VMMWorker> VMMManager::get_worker(int32_t device_id) {
-  std::lock_guard<std::mutex> lock(workers_mutex_);
-
   auto it = workers_.find(device_id);
-  if (it == workers_.end()) {
-    return nullptr;
+  if (it != workers_.end()) {
+    return it->second;  
   }
-
-  return it->second;
+  return nullptr;
 }
 
 std::shared_ptr<VMMWorker> VMMManager::create_worker(int32_t device_id) {
   // Use private constructor to create worker
+#ifdef XLLM_VMM_TEST
+  worker_create_count_.fetch_add(1, std::memory_order_relaxed);
+#endif
   return std::shared_ptr<VMMWorker>(new VMMWorker(device_id));
 }
+
+#ifdef XLLM_VMM_TEST
+size_t VMMManager::test_worker_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return workers_.size();
+}
+#endif
 
 }  // namespace vmm
 }  // namespace xllm

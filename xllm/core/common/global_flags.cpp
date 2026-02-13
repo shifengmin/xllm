@@ -424,6 +424,12 @@ DEFINE_bool(
     false,
     "Whether to enable xtensor for model weights with physical page pool.");
 
+DEFINE_bool(
+    enable_xtensor_async_map,
+    true,
+    "When true, use VMM submitter for xtensor map/unmap (async). When false, "
+    "use synchronous vmm::map/unmap.");
+
 DEFINE_int64(
     phy_page_granularity_size,
     2 * 1024 * 1024,

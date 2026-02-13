@@ -16,6 +16,7 @@ limitations under the License.
 #include "vmm_worker.h"
 
 #include <glog/logging.h>
+#include <chrono>
 
 #include "core/common/macros.h"
 #include "vmm_submitter.h"
@@ -67,6 +68,13 @@ void VMMWorker::worker_loop() {
 bool VMMWorker::step_current() {
   VMMRequest* req = nullptr;
   while (nullptr != (req = const_cast<VMMRequest*>(work_queue_.try_peek()))) {
+    // RELEASE_VADDR: defer so it runs after all unmaps (caller submits unmap
+    // then release).
+    if (req->op_type == OpType::RELEASE_VADDR) {
+      deferred_requests_.push_back(*req);
+      work_queue_.dequeue();
+      continue;
+    }
     if (has_conflict(req->va)) {
       return false;
     }
@@ -87,12 +95,16 @@ bool VMMWorker::step_deferred() {
     return false;
   }
   auto req = deferred_requests_.front();
-  if (req.op_type == OpType::MAP) {
+  if (req.op_type == OpType::RELEASE_VADDR) {
+    execute_release_vaddr(req);
+  } else if (req.op_type == OpType::MAP) {
     execute_map(req);
   } else {
     execute_unmap(req);
   }
-  deferred_va_.erase(req.va);
+  if (req.op_type != OpType::RELEASE_VADDR) {
+    deferred_va_.erase(req.va);
+  }
   deferred_requests_.pop_front();
   return true;
 }
@@ -123,8 +135,14 @@ void VMMWorker::execute_unmap(VMMRequest& req) {
   notify_completion(req.submitter, req.request_id, OpType::UNMAP, true);
 }
 
+void VMMWorker::execute_release_vaddr(VMMRequest& req) {
+  vmm::release_vir_ptr(req.va, req.size);
+}
+
 void VMMWorker::defer_request(const VMMRequest& req) {
-  deferred_va_.insert(req.va);
+  if (req.op_type == OpType::RELEASE_VADDR) {
+    deferred_va_.insert(req.va);
+  }
   deferred_requests_.push_back(req);
 }
 

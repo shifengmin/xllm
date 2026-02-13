@@ -17,10 +17,16 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <memory>
+#include <thread>
+#include <unordered_map>
+
 #include "common/global_flags.h"
 #include "core/util/tensor_helper.h"
 #include "phy_page_pool.h"
 #include "platform/vmm_api.h"
+#include "platform/vmm_submitter/vmm_manager.h"
+#include "platform/vmm_submitter/vmm_submitter.h"
 
 namespace xllm {
 
@@ -240,11 +246,16 @@ bool XTensor::map_with_page_ids(const std::vector<page_id_t>& page_ids) {
     VirPtr vaddr = add_vir_ptr_offset(vaddr_, offset);
 
     PhyMemHandle phy_handle = page->get_phy_handle();
-    vmm::map(vaddr, phy_handle);
+    if (!map_one(vaddr, phy_handle)) {
+      LOG(ERROR) << "XTensor::map_with_page_ids: submit map failed at offset "
+                 << offset;
+      return false;
+    }
 
     // Note: we don't store in mapping_ since we don't own these pages
     // They will be freed via free_weight_pages() in PhyPagePool
   }
+  wait_all_map_done();
 
   LOG(INFO) << "XTensor::map_with_page_ids: mapped " << page_ids.size()
             << " preallocated pages";
@@ -350,6 +361,53 @@ torch::Tensor XTensor::to_torch_tensor(size_t offset,
       torch::TensorOptions().dtype(dtype).device(dev_).requires_grad(false);
   return torch::from_blob(reinterpret_cast<void*>(addr), dims, options);
 #endif
+}
+
+static inline vmm::VMMSubmitter* get_vmm_submitter(int32_t device_id) {
+  if (FLAGS_enable_xtensor_async_map) {
+    return vmm::VMMManager::get_instance().get_submitter(device_id);
+  }
+  return nullptr;
+}
+
+bool XTensor::map_one(VirPtr &vir, PhyMemHandle &phy) {
+  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+  if (sub != nullptr) {
+    return 0 != sub->map(vir, phy);
+  }
+  vmm::map(vir, phy);
+  return true;
+}
+
+bool XTensor::unmap_one(VirPtr &vir, size_t aligned_size) {
+  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+  if (sub != nullptr) {
+    return 0 != sub->unmap(vir, aligned_size);
+  }
+  vmm::unmap(vir, aligned_size);
+  return true;
+}
+
+bool XTensor::release_vir_ptr(VirPtr &vir, size_t size) {
+  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+  if (sub != nullptr) {
+    sub->release_vaddr(vir, size);
+    return true;
+  }
+  vmm::release_vir_ptr(vir, size);
+  return true;
+}
+
+bool XTensor::wait_all_map_done() {
+  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+  if (sub != nullptr) {
+    while (!sub->all_map_done()) {
+      sub->poll_completions(32);
+      std::this_thread::yield();
+    }
+    return true;
+  }
+  return true;
 }
 
 }  // namespace xllm

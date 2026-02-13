@@ -45,6 +45,9 @@ class VMMSubmitter {
 
   uint64_t unmap(VirPtr va, size_t aligned_size);
 
+  /// Fire-and-forget: submit release of virtual address range (no completion).
+  void release_vaddr(VirPtr va, size_t aligned_size);
+
   /// Polls completed map/unmap operations from the completion queue.
   /// Called by the submitter thread. Returns the number of completions
   /// processed.
@@ -56,24 +59,16 @@ class VMMSubmitter {
 
   void wait_all();
 
-  bool is_connected() const { return connected_ && worker_ != nullptr; }
-
   /// Pushes a completion into the submitter's completion queue.
   /// Called by the worker thread after a map/unmap operation finishes.
   bool push_completion(const VMMCompletion& completion);
 
  private:
-  VMMSubmitter(int32_t device_id);
-
-  bool connect(int32_t device_id);
-
-  void disconnect();
+  VMMSubmitter(int32_t device_id, std::shared_ptr<VMMWorker> worker);
 
   int32_t device_id_;
 
   std::shared_ptr<VMMWorker> worker_ = nullptr;
-
-  bool connected_ = false;
 
   CompletionQueue completion_queue_;
 
