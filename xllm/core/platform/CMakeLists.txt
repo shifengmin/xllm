@@ -1,11 +1,11 @@
 include(cc_library)
 include(cc_test)
 
+include_directories(.)
+
 if(USE_NPU)
   add_subdirectory(npu)
 endif()
-
-include_directories(.)
 
 cc_library(
   NAME
@@ -15,7 +15,6 @@ cc_library(
     device.h
     vmm_api.h
     shared_vmm_allocator.h
-    vmm_torch_allocator.h
     vmm_submitter/vmm_common.h
     vmm_submitter/vmm_manager.h
     vmm_submitter/vmm_submitter.h
@@ -28,6 +27,8 @@ cc_library(
     vmm_submitter/vmm_manager.cpp
     vmm_submitter/vmm_submitter.cpp
     vmm_submitter/vmm_worker.cpp
+  INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}
   DEPS
     torch
     Folly::folly

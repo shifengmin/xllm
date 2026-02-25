@@ -42,7 +42,7 @@ BaseManualLoader::~BaseManualLoader() {
 void BaseManualLoader::free_weights() { release_host_storage(); }
 
 void BaseManualLoader::reload_weights() {
-  if (!device_storage_) {
+  if (true) {
     auto& allocator = XTensorAllocator::get_instance();
     bool ok =
         allocator.allocate_weight(model_id_, device_storage_, storage_size_);
@@ -121,7 +121,7 @@ void BaseManualLoader::copy_weights_to_device_async() {
 
   void* dst = static_cast<char*>(device_storage_);
   void* src = static_cast<char*>(host_pinned_storage_);
-
+  LOG(WARNING) << "dst " << dst << " src " << src;
   auto ret = aclrtMemcpyAsync(dst,
                               storage_size_,
                               src,

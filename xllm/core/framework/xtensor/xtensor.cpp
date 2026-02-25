@@ -30,6 +30,16 @@ limitations under the License.
 
 namespace xllm {
 
+static vmm::VMMSubmitter* get_vmm_submitter(int32_t device_id);
+static bool map_one(int32_t device_id, VirPtr& vir, PhyMemHandle& phy);
+static bool unmap_one(int32_t device_id, VirPtr& vir, size_t aligned_size);
+static bool release_vir_ptr(int32_t device_id, VirPtr& vir, size_t size);
+static bool wait_all_map_done(int32_t device_id);
+static void unmap_and_release_virtual_mem(int32_t device_id,
+                                          VirPtr vaddr,
+                                          size_t size,
+                                          size_t page_size);
+
 // Align size up to page_size granularity
 static inline size_t align_up(size_t size, size_t page_size) {
   return ((size + page_size - 1) / page_size) * page_size;
@@ -45,18 +55,20 @@ static inline VirPtr alloc_virtual_mem(size_t size) {
   return vaddr;
 }
 
-static inline void unmap_and_release_virtual_mem(VirPtr vaddr,
-                                                 size_t size,
-                                                 size_t page_size) {
+static void unmap_and_release_virtual_mem(int32_t device_id,
+                                          VirPtr vaddr,
+                                          size_t size,
+                                          size_t page_size) {
   if (is_null_vir_ptr(vaddr)) {
     return;
   }
 
   for (size_t offset = 0; offset < size; offset += page_size) {
     VirPtr addr = add_vir_ptr_offset(vaddr, offset);
-    vmm::unmap(addr, page_size);
+    unmap_one(device_id, addr, page_size);
   }
-  vmm::release_vir_ptr(vaddr, size);
+  LOG(WARNING) << "release XTensor.addr " << vaddr;
+  release_vir_ptr(device_id, vaddr, size);
 }
 
 static inline void return_owned_pages_to_pool(
@@ -119,6 +131,8 @@ XTensor::XTensor(const std::vector<page_id_t>& page_ids,
   size_ = page_ids.size() * page_size_;
   vaddr_ = alloc_virtual_mem(size_);
 
+  LOG(WARNING) << "alloc XTensor.vaddr " << vaddr_;
+
   if (!map_with_page_ids(page_ids)) {
     LOG(ERROR) << "XTensor: failed to map preallocated pages";
     vmm::release_vir_ptr(vaddr_, size_);
@@ -129,7 +143,7 @@ XTensor::XTensor(const std::vector<page_id_t>& page_ids,
 
 XTensor::~XTensor() {
   if (use_preallocated_pages_) {
-    unmap_and_release_virtual_mem(vaddr_, size_, page_size_);
+    unmap_and_release_virtual_mem(get_device_id(), vaddr_, size_, page_size_);
     free_preallocated_weight_pages(preallocated_page_ids_);
     return;
   }
@@ -137,7 +151,7 @@ XTensor::~XTensor() {
   return_owned_pages_to_pool(mapping_);
   // zero_page_ is not owned, don't delete it
 
-  unmap_and_release_virtual_mem(vaddr_, size_, page_size_);
+  unmap_and_release_virtual_mem(get_device_id(), vaddr_, size_, page_size_);
 }
 
 bool XTensor::map(offset_t offset) {
@@ -223,6 +237,7 @@ bool XTensor::unmap_all() {
 bool XTensor::map_with_page_ids(const std::vector<page_id_t>& page_ids) {
   auto& pool = PhyPagePool::get_instance();
   const auto& all_pages = pool.get_all_pages();
+  auto device_id = get_device_id();
 
   for (size_t i = 0; i < page_ids.size(); ++i) {
     page_id_t phy_page_id = page_ids[i];
@@ -246,7 +261,7 @@ bool XTensor::map_with_page_ids(const std::vector<page_id_t>& page_ids) {
     VirPtr vaddr = add_vir_ptr_offset(vaddr_, offset);
 
     PhyMemHandle phy_handle = page->get_phy_handle();
-    if (!map_one(vaddr, phy_handle)) {
+    if (!map_one(device_id, vaddr, phy_handle)) {
       LOG(ERROR) << "XTensor::map_with_page_ids: submit map failed at offset "
                  << offset;
       return false;
@@ -255,7 +270,7 @@ bool XTensor::map_with_page_ids(const std::vector<page_id_t>& page_ids) {
     // Note: we don't store in mapping_ since we don't own these pages
     // They will be freed via free_weight_pages() in PhyPagePool
   }
-  wait_all_map_done();
+  wait_all_map_done(device_id);
 
   LOG(INFO) << "XTensor::map_with_page_ids: mapped " << page_ids.size()
             << " preallocated pages";
@@ -363,15 +378,15 @@ torch::Tensor XTensor::to_torch_tensor(size_t offset,
 #endif
 }
 
-static inline vmm::VMMSubmitter* get_vmm_submitter(int32_t device_id) {
+static vmm::VMMSubmitter* get_vmm_submitter(int32_t device_id) {
   if (FLAGS_enable_xtensor_async_map) {
     return vmm::VMMManager::get_instance().get_submitter(device_id);
   }
   return nullptr;
 }
 
-bool XTensor::map_one(VirPtr &vir, PhyMemHandle &phy) {
-  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+static bool map_one(int32_t device_id, VirPtr& vir, PhyMemHandle& phy) {
+  vmm::VMMSubmitter* sub = get_vmm_submitter(device_id);
   if (sub != nullptr) {
     return 0 != sub->map(vir, phy);
   }
@@ -379,8 +394,8 @@ bool XTensor::map_one(VirPtr &vir, PhyMemHandle &phy) {
   return true;
 }
 
-bool XTensor::unmap_one(VirPtr &vir, size_t aligned_size) {
-  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+static bool unmap_one(int32_t device_id, VirPtr& vir, size_t aligned_size) {
+  vmm::VMMSubmitter* sub = get_vmm_submitter(device_id);
   if (sub != nullptr) {
     return 0 != sub->unmap(vir, aligned_size);
   }
@@ -388,8 +403,8 @@ bool XTensor::unmap_one(VirPtr &vir, size_t aligned_size) {
   return true;
 }
 
-bool XTensor::release_vir_ptr(VirPtr &vir, size_t size) {
-  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+static bool release_vir_ptr(int32_t device_id, VirPtr& vir, size_t size) {
+  vmm::VMMSubmitter* sub = get_vmm_submitter(device_id);
   if (sub != nullptr) {
     sub->release_vaddr(vir, size);
     return true;
@@ -398,8 +413,8 @@ bool XTensor::release_vir_ptr(VirPtr &vir, size_t size) {
   return true;
 }
 
-bool XTensor::wait_all_map_done() {
-  vmm::VMMSubmitter *sub = get_vmm_submitter(device_id());
+static bool wait_all_map_done(int32_t device_id) {
+  vmm::VMMSubmitter* sub = get_vmm_submitter(device_id);
   if (sub != nullptr) {
     while (!sub->all_map_done()) {
       sub->poll_completions(32);

@@ -166,6 +166,9 @@ page_id_t PhyPagePool::allocate_contiguous_from_right(size_t count) {
 
   CHECK(initialized_) << "PhyPagePool not initialized";
 
+  LOG(WARNING) << "Disable contiguous phypage allocation for fallback tests";
+  return -1;
+
   if (count == 0 || count > free_page_ids_.size()) {
     return -1;
   }

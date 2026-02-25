@@ -92,7 +92,9 @@ class XTensor {
   // Getters for compatibility
   inline torch::Dtype dtype() const noexcept { return dtype_; }
   inline const torch::Device& device() const noexcept { return dev_; }
-  inline const int32_t device_id() const noexcept { return static_cast<int32_t>(dev_.index()); }
+  inline const int32_t get_device_id() const noexcept {
+    return static_cast<int32_t>(dev_.index());
+  }
 
   // Alias for vaddr() for backward compatibility
   inline VirPtr get_base_ptr() const noexcept { return vaddr_; }
@@ -107,11 +109,6 @@ class XTensor {
   // Map a single physical page at the given offset
   bool map_phy_page_(PhyPage* page, offset_t offset);
   bool init_with_zero_();
-
-  bool map_one(VirPtr &vir, PhyMemHandle &phy);
-  bool unmap_one(VirPtr &vir, size_t aligned_size);
-  bool release_vir_ptr(VirPtr &vir, size_t size);
-  bool wait_all_map_done();
 
   VirPtr vaddr_;
   size_t size_;
