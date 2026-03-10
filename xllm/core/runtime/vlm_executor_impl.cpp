@@ -32,7 +32,8 @@ VlmExecutorImpl::VlmExecutorImpl(CausalLM* model,
       options_(options) {}
 
 ForwardInput VlmExecutorImpl::prepare_inputs(Batch& batch) {
-  return batch.prepare_forward_input(options_.num_decoding_tokens(), 0, args_);
+  return batch.prepare_forward_input(
+      options_.num_decoding_tokens(), 0, args_, options_.cp_size());
 }
 
 MMDict VlmExecutorImpl::encode(const ModelInputParams& params) {
