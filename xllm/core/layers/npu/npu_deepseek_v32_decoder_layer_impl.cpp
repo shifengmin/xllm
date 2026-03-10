@@ -17,15 +17,140 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <iostream>
+#include <numeric>
 #include <utility>
+#include <vector>
 
 #include "common/global_flags.h"
 #include "layers/common/rotary_embedding_util.h"
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+struct CpPrefillInputs {
+  torch::Tensor seq_len_cp;
+  torch::Tensor cp_load_balance_idx_first;
+  torch::Tensor cp_load_balance_idx_last;
+  torch::Tensor cp_o_recover_idx;
+  torch::Tensor cp_kv_recover_idx;
+};
+
+std::vector<int32_t> get_seq_lens_for_cp_prefill(const ModelInputParams& input_params) {
+  std::vector<int32_t> seq_lens;
+  if (input_params.q_seq_lens_vec.empty()) {
+    return seq_lens;
+  }
+
+  const bool is_cumsum = input_params.q_seq_lens_vec.size() ==
+                             static_cast<size_t>(input_params.num_sequences + 1) &&
+                         input_params.q_seq_lens_vec.front() == 0;
+  if (is_cumsum) {
+    seq_lens.reserve(input_params.num_sequences);
+    for (int32_t i = 0; i < input_params.num_sequences; ++i) {
+      seq_lens.push_back(static_cast<int32_t>(
+          input_params.q_seq_lens_vec[i + 1] - input_params.q_seq_lens_vec[i]));
+    }
+    return seq_lens;
+  }
+
+  seq_lens.reserve(input_params.q_seq_lens_vec.size());
+  for (int q_len : input_params.q_seq_lens_vec) {
+    seq_lens.push_back(static_cast<int32_t>(q_len));
+  }
+  return seq_lens;
+}
+
+// TODO(shifengmin.3): replace this mock with real prepare_cp_prefill_inputs.
+CpPrefillInputs prepare_cp_prefill_inputs(const ModelInputParams& input_params,
+                                          int32_t cp_size) {
+  CpPrefillInputs outputs;
+
+  torch::TensorOptions options = torch::TensorOptions().dtype(torch::kInt32);
+  if (input_params.q_seq_lens.defined()) {
+    options = options.device(input_params.q_seq_lens.device());
+  }
+
+  const std::vector<int32_t> seq_lens = get_seq_lens_for_cp_prefill(input_params);
+  const int32_t token_num =
+      std::accumulate(seq_lens.begin(), seq_lens.end(), static_cast<int32_t>(0));
+
+  std::vector<int32_t> chunk_lengths;
+  chunk_lengths.reserve(seq_lens.size());
+  std::vector<int32_t> cp_load_balance_idx_first;
+  std::vector<int32_t> cp_load_balance_idx_last;
+  cp_load_balance_idx_first.reserve(std::max(token_num / 2, 0));
+  cp_load_balance_idx_last.reserve(std::max(token_num / 2, 0));
+
+  int32_t base = 0;
+  for (int32_t length : seq_lens) {
+    const int32_t safe_length = std::max(length, 0);
+    const int32_t divider = safe_length / 2;
+    chunk_lengths.push_back(divider);
+
+    for (int32_t idx = 0; idx < divider; ++idx) {
+      cp_load_balance_idx_first.push_back(base + idx);
+    }
+    for (int32_t idx = divider; idx < safe_length; ++idx) {
+      cp_load_balance_idx_last.push_back(base + idx);
+    }
+    base += safe_length;
+  }
+
+  std::vector<int32_t> cp_o_recover_idx;
+  int32_t chunk_lengths_sum =
+      std::accumulate(chunk_lengths.begin(), chunk_lengths.end(), static_cast<int32_t>(0));
+  base = 0;
+  for (int32_t chunk_len : chunk_lengths) {
+    for (int32_t idx = 0; idx < chunk_len; ++idx) {
+      cp_o_recover_idx.push_back(base + idx);
+    }
+    for (int32_t idx = 0; idx < chunk_len; ++idx) {
+      cp_o_recover_idx.push_back(base + idx + chunk_lengths_sum);
+    }
+    base += chunk_len;
+  }
+
+  std::vector<int32_t> cp_kv_recover_idx;
+  if (cp_size > 0 && token_num > 0) {
+    int32_t req_offset = 0;
+    for (int32_t req_chunk_len : chunk_lengths) {
+      std::vector<std::vector<int32_t>> gather_idx_per_chunk(cp_size * 2);
+      for (int32_t cp_rank_id = 0; cp_rank_id < cp_size; ++cp_rank_id) {
+        const int32_t rank_offset = cp_rank_id * token_num;
+        for (int32_t idx = 0; idx < req_chunk_len; ++idx) {
+          gather_idx_per_chunk[cp_rank_id].push_back(rank_offset + req_offset + idx);
+          gather_idx_per_chunk[cp_size * 2 - 1 - cp_rank_id].push_back(
+              rank_offset + req_offset + req_chunk_len + idx);
+        }
+      }
+      for (const auto& chunk : gather_idx_per_chunk) {
+        cp_kv_recover_idx.insert(cp_kv_recover_idx.end(), chunk.begin(), chunk.end());
+      }
+      req_offset += req_chunk_len * 2;
+    }
+  }
+
+  auto to_tensor = [&](const std::vector<int32_t>& values) {
+    if (values.empty()) {
+      return torch::zeros({1}, options);
+    }
+    return torch::tensor(values, options);
+  };
+
+  outputs.seq_len_cp = to_tensor(chunk_lengths);
+  outputs.cp_load_balance_idx_first = to_tensor(cp_load_balance_idx_first);
+  outputs.cp_load_balance_idx_last = to_tensor(cp_load_balance_idx_last);
+  outputs.cp_o_recover_idx = to_tensor(cp_o_recover_idx);
+  outputs.cp_kv_recover_idx = to_tensor(cp_kv_recover_idx);
+  return outputs;
+}
+
+}  // namespace
 
 enum DecoderLayerTensorId : int {
   IN_INPUT_NORM_WEIGHT = 0,
@@ -908,8 +1033,36 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
       atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.dynamic_ep_idx());
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 29) =
       atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.moe_idx());
+  int32_t offset = 30;
+
+  // deepseek v3.2 indexer input tensors.
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_index_cache());
+
+  if (input_params.q_seq_lens.numel() != 0) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.q_cu_seq_lens);
+  } else {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
+  }
+
+  if (cp_size_ > 1 && is_prefill) {
+    const auto cp_inputs = prepare_cp_prefill_inputs(input_params, cp_size_);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_inputs.seq_len_cp);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx_first);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx_last);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_o_recover_idx);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_kv_recover_idx);
+  }
+
   if (FLAGS_enable_eplb && layer_id_ >= layer_param_.firstKDenseReplace) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
         atb_speed::Utils::AtTensor2Tensor(expert_routing_map_);
     if (!is_prefill) {
       node.variantPack.outTensors.at(1) = atb_speed::Utils::AtTensor2Tensor(
@@ -922,17 +1075,6 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     CHECK_THROW(node.inTensors.at(i) == nullptr,
                 model_name_ << " inTensor " << i << " is NULL");
     node.variantPack.inTensors.at(i) = *node.inTensors.at(i);
-  }
-
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
-      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_index_cache());
-
-  if (input_params.q_seq_lens.numel() != 0) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.q_cu_seq_lens);
-  } else {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
-        atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
   }
   node.variantPack.outTensors.at(0) = internal_tensor_;
 }

@@ -143,7 +143,7 @@ struct ForwardInput {
     return inputs;
   }
 
-  ForwardInput cp_partition(int32_t cp_rank, int32_t cp_size) {
+  ForwardInput cp_partition(int32_t cp_rank, int32_t cp_size) const {
     ForwardInput outputs = *this;
     if (cp_size <= 1 || !token_ids.defined() || token_ids.numel() == 0 ||
         !input_params.batch_forward_type.is_prefill()) {
