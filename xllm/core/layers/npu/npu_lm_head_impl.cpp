@@ -36,7 +36,11 @@ void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
   param.linearParallelParam.fusionLinearParam.transposeType = 1;
   if (parallel_args.world_size() > 1) {
     if (parallel_args.mapping_data().empty()) {
-      if (dp_size_ > 1) {
+      const bool use_local_tp = (dp_size_ > 1) || (cp_size_ > 1);
+      if (use_local_tp) {
+        CHECK_GT(dp_local_tp_size_, 0);
+        CHECK_GE(dp_local_tp_rank_, 0);
+        CHECK_LT(dp_local_tp_rank_, dp_local_tp_size_);
         param.linearParallelParam.tensorParallelInfo.rank = dp_local_tp_rank_;
         param.linearParallelParam.tensorParallelInfo.worldSize =
             dp_local_tp_size_;
@@ -48,8 +52,10 @@ void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
       }
       param.linearParallelParam.parallelType =
           atb_speed::common::COLUMN_PARALLEL;
+      const int32_t tp_group_id =
+          use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;
       param.linearParallelParam.tensorParallelInfo.commDomain =
-          std::to_string(dp_rank_);
+          std::to_string(tp_group_id);
       param.linearParallelParam.tensorParallelInfo.backend = "lccl";
     } else {
       param.linearParallelParam.parallelType =
