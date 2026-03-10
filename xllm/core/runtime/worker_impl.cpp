@@ -35,6 +35,7 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
+#include "common/cp_runtime_check.h"
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -526,11 +527,24 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 #endif
   c10::StreamGuard streamGuard = prepare_stream_->set_stream_guard();
+  cp_check::XLLM_CPCHK_CHECK_PARALLEL_ROLE(
+      "WorkerImpl::prepare_work_before_execute",
+      parallel_args_.rank(),
+      parallel_args_.world_size(),
+      parallel_args_.dp_size(),
+      parallel_args_.cp_size());
 
   ForwardInput partitioned_input = input;
   if (parallel_args_.cp_size() > 1 &&
       input.input_params.batch_forward_type.is_prefill()) {
     const int32_t cp_rank = resolve_cp_rank(parallel_args_);
+    cp_check::XLLM_CPCHK_CHECK_CP_RANK(
+        "WorkerImpl::prepare_work_before_execute",
+        cp_rank,
+        parallel_args_.rank(),
+        parallel_args_.world_size(),
+        parallel_args_.dp_size(),
+        parallel_args_.cp_size());
     partitioned_input = input.cp_partition(cp_rank, parallel_args_.cp_size());
   }
 

@@ -26,6 +26,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "common/cp_runtime_check.h"
 #include "common/types.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/mm_batch_data.h"
@@ -153,6 +154,12 @@ struct ForwardInput {
     CHECK_GT(cp_size, 0);
     CHECK_GE(cp_rank, 0);
     CHECK_LT(cp_rank, cp_size);
+    cp_check::XLLM_CPCHK_CHECK_CP_PARTITION_BEFORE("ForwardInput::cp_partition",
+                                                   token_ids,
+                                                   positions,
+                                                   input_params,
+                                                   cp_rank,
+                                                   cp_size);
 
     const int32_t num_sequences = input_params.num_sequences;
     CHECK_GT(num_sequences, 0);
@@ -298,6 +305,19 @@ struct ForwardInput {
     partition_token_level_tensor(out_params.new_cache_slots);
     partition_token_level_tensor(out_params.new_cache_slot_offsets);
     partition_token_level_tensor(out_params.input_embedding);
+    cp_check::XLLM_CPCHK_CHECK_TOKEN_LEVEL_TENSOR("ForwardInput::cp_partition",
+                                                  out_params.new_cache_slots,
+                                                  outputs.token_ids.size(0),
+                                                  "new_cache_slots");
+    cp_check::XLLM_CPCHK_CHECK_TOKEN_LEVEL_TENSOR(
+        "ForwardInput::cp_partition",
+        out_params.new_cache_slot_offsets,
+        outputs.token_ids.size(0),
+        "new_cache_slot_offsets");
+    cp_check::XLLM_CPCHK_CHECK_TOKEN_LEVEL_TENSOR("ForwardInput::cp_partition",
+                                                  out_params.input_embedding,
+                                                  outputs.token_ids.size(0),
+                                                  "input_embedding");
 
     std::unordered_map<int64_t, int64_t> old_to_new_idx;
     old_to_new_idx.reserve(gather_indices.size());
@@ -354,6 +374,21 @@ struct ForwardInput {
 
     remap_selected_token_idxes(outputs.sampling_params);
     remap_selected_token_idxes(outputs.decoder_sampling_params);
+    cp_check::XLLM_CPCHK_CHECK_SELECTED_TOKEN_IDXES(
+        "ForwardInput::cp_partition",
+        outputs.sampling_params.selected_token_idxes,
+        outputs.token_ids.numel(),
+        "sampling_params.selected_token_idxes");
+    cp_check::XLLM_CPCHK_CHECK_SELECTED_TOKEN_IDXES(
+        "ForwardInput::cp_partition",
+        outputs.decoder_sampling_params.selected_token_idxes,
+        outputs.token_ids.numel(),
+        "decoder_sampling_params.selected_token_idxes");
+    cp_check::XLLM_CPCHK_CHECK_CP_PARTITION_AFTER("ForwardInput::cp_partition",
+                                                  token_ids,
+                                                  outputs.token_ids,
+                                                  outputs.positions,
+                                                  outputs.input_params);
     return outputs;
   }
 

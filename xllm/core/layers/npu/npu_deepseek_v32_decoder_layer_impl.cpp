@@ -24,6 +24,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "common/cp_runtime_check.h"
 #include "common/global_flags.h"
 #include "layers/common/rotary_embedding_util.h"
 
@@ -338,6 +339,14 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
   dp_local_tp_size_ = parallel_args.world_size() / (dp_size_ * cp_size_);
   CHECK_EQ(parallel_args.world_size(), dp_size_ * dp_local_tp_size_ * cp_size_);
   dp_local_tp_rank_ = parallel_args.rank() % dp_local_tp_size_;
+  cp_check::XLLM_CPCHK_CHECK_TP_CP_SHARD_CONFIG(
+      "NpuDeepseekV32DecoderLayerImpl::ctor",
+      parallel_args.rank(),
+      parallel_args.world_size(),
+      dp_size_,
+      cp_size_,
+      dp_local_tp_size_,
+      dp_local_tp_rank_);
 
   bool is_prefill_ = false;
 
@@ -1034,6 +1043,14 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 29) =
       atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.moe_idx());
   int32_t offset = 30;
+  const int32_t cp_extra_inputs = (cp_size_ > 1 && is_prefill) ? 5 : 0;
+  const int32_t eplb_extra_inputs =
+      (FLAGS_enable_eplb && layer_id_ >= layer_param_.firstKDenseReplace) ? 1
+                                                                           : 0;
+  cp_check::XLLM_CPCHK_CHECK_VARIANT_PACK_CAPACITY(
+      "NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack",
+      node.variantPack.inTensors.size(),
+      WEIGHT_COUNT_PER_LAYER + 30 + 2 + cp_extra_inputs + eplb_extra_inputs);
 
   // deepseek v3.2 indexer input tensors.
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
@@ -1049,6 +1066,15 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
 
   if (cp_size_ > 1 && is_prefill) {
     const auto cp_inputs = prepare_cp_prefill_inputs(input_params, cp_size_);
+    cp_check::XLLM_CPCHK_CHECK_CP_PREFILL_TENSOR_SHAPES(
+        "NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack",
+        input_params,
+        cp_inputs.seq_len_cp,
+        cp_inputs.cp_load_balance_idx_first,
+        cp_inputs.cp_load_balance_idx_last,
+        cp_inputs.cp_o_recover_idx,
+        cp_inputs.cp_kv_recover_idx,
+        cp_size_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
         atb_speed::Utils::AtTensor2Tensor(cp_inputs.seq_len_cp);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
