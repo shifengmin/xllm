@@ -96,8 +96,10 @@ LLMEngine::LLMEngine(const runtime::Options& options,
   setup_workers(options);
 
   dp_size_ = options_.dp_size();
+  cp_size_ = options_.cp_size();
   worker_clients_num_ = worker_clients_.size();
-  dp_local_tp_size_ = worker_clients_num_ / dp_size_;
+  dp_local_size_ = worker_clients_num_ / dp_size_;
+  dp_local_tp_size_ = dp_local_size_ / cp_size_;
 
   // create ThreadPool for link cluster
   link_threadpool_ = std::make_unique<ThreadPool>(worker_clients_num_);
@@ -184,8 +186,7 @@ bool LLMEngine::init_model(int32_t master_status) {
   tokenizer_args_ = model_loader->tokenizer_args();
 
   // compute the number of local kv heads and head dim
-  const int world_size = dp_size_ > 1 ? (dp_local_tp_size_)
-                                      : static_cast<int>(worker_clients_num_);
+  const int world_size = dp_local_tp_size_;
   const int64_t n_heads = args_.n_heads();
   const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
   n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
@@ -925,7 +926,7 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
 
   // update dp related global paramters and then execute model
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
-    auto dp_rank = worker_rank / dp_local_tp_size_;
+    auto dp_rank = worker_rank / dp_local_size_;
     futures.emplace_back(
         worker_clients_[worker_rank]->step_async(raw_forward_inputs[dp_rank]));
   }
@@ -937,10 +938,10 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
     process_eplb_data(results);
   }
 
-  assert(dp_size_ == worker_clients_num_ / dp_local_tp_size_);
+  assert(dp_size_ == worker_clients_num_ / dp_local_size_);
   size_t dp_rank = 0;
   for (auto worker_rank = 0; worker_rank < worker_clients_num_;
-       worker_rank += dp_local_tp_size_) {
+       worker_rank += dp_local_size_) {
     auto result = results[worker_rank].value();
     if (result.has_value()) {
       if (result.value().outputs.empty() && layer_forward_interrupted_) {
@@ -1067,7 +1068,7 @@ void LLMEngine::process_eplb_data(
 std::vector<RawForwardInput> LLMEngine::prepare_inputs(
     std::vector<Batch>& batch) {
   std::vector<RawForwardInput> batched_inputs;
-  batched_inputs.reserve(dp_size_);
+  batched_inputs.reserve(dp_size_ * cp_size_);
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
@@ -1079,7 +1080,7 @@ std::vector<RawForwardInput> LLMEngine::prepare_inputs(
   // build model input for every single micro batch
   for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
     batched_inputs.emplace_back(std::move(
-        batch[dp_rank].prepare_forward_input(args_, threadpool_.get())));
+        batch[dp_rank].prepare_forward_input(args_, threadpool_.get(), cp_size_)));
     dp_global_token_nums[dp_rank] =
         batched_inputs[dp_rank].flatten_tokens_vec.size();
     if (batch_forward_type.is_empty() &&

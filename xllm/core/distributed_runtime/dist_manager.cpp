@@ -116,13 +116,16 @@ void DistManager::setup_multi_node_workers(
   const int32_t world_size = each_node_ranks * options.nnodes();
   const int32_t base_rank = options.node_rank() * each_node_ranks;
   const int32_t dp_size = options.dp_size();
+  const int32_t cp_size = options.cp_size();
   const int32_t ep_size = options.ep_size();
+  /* TODO(CP): support smem  + CP */
   const int32_t dp_local_tp_size = world_size / dp_size;
 
   LOG(INFO) << "Multi-node serving world_size = " << world_size
             << ", each_node_ranks = " << each_node_ranks
             << ", current node rank = " << options.node_rank()
             << ", nnodes = " << options.nnodes() << ", dp_size = " << dp_size
+            << ", cp_size = " << cp_size
             << ", ep_size = " << ep_size << ", tp_size = " << dp_local_tp_size;
 
   CHECK_EQ((world_size % dp_size), 0)
@@ -168,7 +171,8 @@ void DistManager::setup_multi_node_workers(
     // we use spawn process worker to launch a xllm instance
     // when start a offline inference task with multi-gpu/npu/mpu/...
     bool use_spawn_worker = options.enable_offline_inference() && i > 0;
-    ParallelArgs parallel_args(rank, world_size, dp_size, nullptr, ep_size);
+    ParallelArgs parallel_args(
+        rank, world_size, dp_size, cp_size, nullptr, ep_size);
 
     servers_.emplace_back(std::make_unique<WorkerServer>(i,
                                                          master_node_addr,
@@ -211,6 +215,7 @@ void DistManager::setup_multi_node_workers(
                    << r;
         return;
       }
+      /* TODO(CP): support smem  + CP */
       auto channel =
           create_channel(worker_addrs_map[r], r, dp_local_tp_size, options);
       worker_clients_.emplace_back(

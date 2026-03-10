@@ -106,7 +106,8 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
 
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
-                                          const ModelArgs& args) {
+                                          const ModelArgs& args,
+                                          int32_t cp_size) {
   if (sequences_.empty() && !sequence_groups_.empty()) {
     return prepare_rec_forward_input(
         num_decoding_tokens, min_decoding_batch_size, args);
@@ -118,7 +119,8 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             swap_block_transfer_infos_,
                             batch_id_,
                             &args,
-                            batch_forward_type_);
+                            batch_forward_type_,
+                            cp_size);
   return builder.build_forward_input(num_decoding_tokens,
                                      min_decoding_batch_size);
 }
@@ -276,7 +278,8 @@ std::map<uint32_t, uint32_t> Batch::cal_seq_exchange_index(
 }
 
 RawForwardInput Batch::prepare_forward_input(const ModelArgs& args,
-                                             ThreadPool* thread_pool) {
+                                             ThreadPool* thread_pool,
+                                             int32_t cp_size) {
   dp_balance_shuffle_seqs();
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
@@ -286,6 +289,7 @@ RawForwardInput Batch::prepare_forward_input(const ModelArgs& args,
                             batch_id_,
                             &args,
                             batch_forward_type_,
+                            cp_size,
                             thread_pool);
   return builder.build_raw_forward_input();
 }
