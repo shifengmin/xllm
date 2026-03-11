@@ -326,7 +326,8 @@ struct ForwardInput {
       old_to_new_idx[gather_indices[new_idx]] = new_idx;
     }
 
-    auto remap_selected_token_idxes = [&](SamplingParameters& params) {
+    auto remap_selected_token_idxes = [&](SamplingParameters& params,
+                                          bool enable_cp_lm_head_idx) {
       if (!params.selected_token_idxes.defined()) {
         return;
       }
@@ -349,40 +350,140 @@ struct ForwardInput {
       std::vector<int64_t> remapped_idxes;
       remapped_idxes.reserve(selected_num);
 
-      for (int64_t i = 0; i < selected_num; ++i) {
-        const int64_t old_idx = selected_ptr[i];
-        const auto it = old_to_new_idx.find(old_idx);
-        if (it != old_to_new_idx.end()) {
-          remapped_idxes.push_back(it->second);
-          continue;
+      bool use_cp_lm_head_idx = false;
+      if (enable_cp_lm_head_idx &&
+          selected_num == static_cast<int64_t>(num_sequences)) {
+        // MindIE-aligned lm_head indices for CP prefill:
+        // compute from context lengths before CP padding.
+        const int64_t num_chunks = static_cast<int64_t>(cp_size) * 2;
+        std::vector<int64_t> seq_context_lens(num_sequences, 0);
+        std::vector<int64_t> selected_seq_idx(selected_num, 0);
+        bool valid = true;
+
+        for (int64_t i = 0; i < selected_num; ++i) {
+          const int64_t old_idx = selected_ptr[i];
+          if (old_idx < 0 || old_idx >= old_seq_offsets.back()) {
+            valid = false;
+            break;
+          }
+          auto upper =
+              std::upper_bound(old_seq_offsets.begin(), old_seq_offsets.end(), old_idx);
+          int64_t seq_idx = static_cast<int64_t>(upper - old_seq_offsets.begin()) - 1;
+          seq_idx = std::max<int64_t>(
+              0, std::min<int64_t>(seq_idx, static_cast<int64_t>(num_sequences) - 1));
+          selected_seq_idx[i] = seq_idx;
+
+          const int64_t seq_start = old_seq_offsets[seq_idx];
+          const int64_t seq_end = old_seq_offsets[seq_idx + 1];
+          const int64_t seq_len = std::max<int64_t>(0, seq_end - seq_start);
+          const int64_t context_len =
+              std::max<int64_t>(1, std::min<int64_t>(old_idx - seq_start + 1, seq_len));
+          seq_context_lens[seq_idx] = std::max(seq_context_lens[seq_idx], context_len);
         }
 
-        auto upper =
-            std::upper_bound(old_seq_offsets.begin(), old_seq_offsets.end(), old_idx);
-        int64_t seq_idx = static_cast<int64_t>(upper - old_seq_offsets.begin()) - 1;
-        seq_idx = std::max<int64_t>(
-            0, std::min<int64_t>(seq_idx, static_cast<int64_t>(num_sequences) - 1));
+        if (valid) {
+          for (int32_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+            if (seq_context_lens[seq_idx] <= 0) {
+              valid = false;
+              break;
+            }
+          }
+        }
 
-        const int64_t new_start = new_seq_offsets[seq_idx];
-        const int64_t new_end = new_seq_offsets[seq_idx + 1];
-        remapped_idxes.push_back(new_end > new_start ? new_end - 1 : 0);
+        if (valid) {
+          std::vector<int64_t> chunk_lens(num_sequences, 1);
+          std::vector<int64_t> seq_prefix_per_rank(num_sequences, 0);
+          int64_t token_num_per_rank = 0;
+
+          for (int32_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+            int64_t chunk_len =
+                (seq_context_lens[seq_idx] + num_chunks - 1) / num_chunks;
+            chunk_len = std::max<int64_t>(1, chunk_len);
+            chunk_lens[seq_idx] = chunk_len;
+            seq_prefix_per_rank[seq_idx] = token_num_per_rank;
+            token_num_per_rank += (chunk_len * num_chunks) / cp_size;
+          }
+
+          remapped_idxes.clear();
+          for (int64_t i = 0; i < selected_num; ++i) {
+            const int64_t old_idx = selected_ptr[i];
+            const int64_t seq_idx = selected_seq_idx[i];
+            const int64_t seq_start = old_seq_offsets[seq_idx];
+            const int64_t seq_context_len = seq_context_lens[seq_idx];
+            const int64_t chunk_len = chunk_lens[seq_idx];
+
+            int64_t token_pos = old_idx - seq_start;
+            token_pos = std::max<int64_t>(
+                0, std::min<int64_t>(token_pos, seq_context_len - 1));
+            const int64_t chunk_id = token_pos / chunk_len;
+            const int64_t offset = token_pos % chunk_len;
+            const int64_t rank_id = chunk_id >= cp_size
+                                        ? static_cast<int64_t>(2 * cp_size) - chunk_id - 1
+                                        : chunk_id;
+            if (rank_id < 0 || rank_id >= cp_size) {
+              valid = false;
+              break;
+            }
+
+            const int64_t remap_idx =
+                token_num_per_rank * rank_id + seq_prefix_per_rank[seq_idx] +
+                (chunk_id / cp_size) * chunk_len + offset;
+            remapped_idxes.push_back(remap_idx);
+          }
+
+          use_cp_lm_head_idx = valid;
+        }
+      }
+
+      if (!use_cp_lm_head_idx) {
+        remapped_idxes.clear();
+        for (int64_t i = 0; i < selected_num; ++i) {
+          const int64_t old_idx = selected_ptr[i];
+          const auto it = old_to_new_idx.find(old_idx);
+          if (it != old_to_new_idx.end()) {
+            remapped_idxes.push_back(it->second);
+            continue;
+          }
+
+          auto upper = std::upper_bound(old_seq_offsets.begin(),
+                                        old_seq_offsets.end(),
+                                        old_idx);
+          int64_t seq_idx = static_cast<int64_t>(upper - old_seq_offsets.begin()) - 1;
+          seq_idx = std::max<int64_t>(
+              0, std::min<int64_t>(seq_idx, static_cast<int64_t>(num_sequences) - 1));
+
+          const int64_t new_start = new_seq_offsets[seq_idx];
+          const int64_t new_end = new_seq_offsets[seq_idx + 1];
+          remapped_idxes.push_back(new_end > new_start ? new_end - 1 : 0);
+        }
       }
 
       params.selected_token_idxes =
           torch::tensor(remapped_idxes, params.selected_token_idxes.options());
     };
 
-    remap_selected_token_idxes(outputs.sampling_params);
-    remap_selected_token_idxes(outputs.decoder_sampling_params);
+    remap_selected_token_idxes(outputs.sampling_params, /*enable_cp_lm_head_idx=*/true);
+    remap_selected_token_idxes(outputs.decoder_sampling_params,
+                               /*enable_cp_lm_head_idx=*/false);
+    auto selected_idx_check_bound = [&](const torch::Tensor& idxes) -> int64_t {
+      int64_t token_num = outputs.token_ids.numel();
+      if (!idxes.defined() || idxes.numel() == 0) {
+        return token_num;
+      }
+      auto idx_cpu = safe_to(idxes, torch::kCPU, true).to(torch::kLong).contiguous();
+      const int64_t max_idx = idx_cpu.max().item<int64_t>();
+      token_num = std::max<int64_t>(token_num, max_idx + 1);
+      return token_num;
+    };
     cp_check::XLLM_CPCHK_CHECK_SELECTED_TOKEN_IDXES(
         "ForwardInput::cp_partition",
         outputs.sampling_params.selected_token_idxes,
-        outputs.token_ids.numel(),
+        selected_idx_check_bound(outputs.sampling_params.selected_token_idxes),
         "sampling_params.selected_token_idxes");
     cp_check::XLLM_CPCHK_CHECK_SELECTED_TOKEN_IDXES(
         "ForwardInput::cp_partition",
         outputs.decoder_sampling_params.selected_token_idxes,
-        outputs.token_ids.numel(),
+        selected_idx_check_bound(outputs.decoder_sampling_params.selected_token_idxes),
         "decoder_sampling_params.selected_token_idxes");
     cp_check::XLLM_CPCHK_CHECK_CP_PARTITION_AFTER("ForwardInput::cp_partition",
                                                   token_ids,
