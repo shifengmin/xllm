@@ -317,7 +317,7 @@ void BatchInputBuilder::process_single_sequence(
   setup_kv_cache_info(sequence,
                       n_kv_cache_tokens,
                       seq_len,
-                      q_seq_len,
+                      padded_q_seq_len,
                       state_ptr,
                       write_block_ids_ptr);
 
@@ -420,7 +420,7 @@ void BatchInputBuilder::setup_kv_cache_info(
     Sequence* sequence,
     uint32_t n_kv_cache_tokens,
     uint32_t seq_len,
-    uint32_t logical_q_seq_len,
+    uint32_t q_seq_len,
     BuilderState* state_ptr,
     std::unordered_set<int32_t>* write_block_ids_ptr) {
   BuilderState& state = state_ptr ? *state_ptr : state_;
@@ -428,7 +428,7 @@ void BatchInputBuilder::setup_kv_cache_info(
       write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
 
   // Keep logical KV progress unchanged by right-padding tokens.
-  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/logical_q_seq_len);
+  sequence->kv_state().incr_kv_cache_tokens_num(/*size=*/q_seq_len);
 
   const auto blocks = sequence->kv_state().kv_blocks();
   const auto slot_ids =
