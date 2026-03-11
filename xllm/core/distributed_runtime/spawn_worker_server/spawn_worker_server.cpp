@@ -69,7 +69,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
   FLAGS_enable_atb_comm_multiprocess = true;
 #endif
 
-  ParallelArgs parallel_args(global_rank, world_size, 1, nullptr, 1);
+  ParallelArgs parallel_args(global_rank, world_size, 1, 1, nullptr, 1);
   WorkerServer worker_server(local_rank,
                              master_node_addr,
                              done,

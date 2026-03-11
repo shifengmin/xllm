@@ -30,10 +30,12 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <utility>
 
+#include "common/cp_runtime_check.h"
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -109,6 +111,17 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
+int32_t resolve_cp_rank(const ParallelArgs& parallel_args) {
+  const int32_t cp_size = std::max(1, parallel_args.cp_size());
+  if (cp_size <= 1) {
+    return 0;
+  }
+  const int32_t dp_size = std::max(1, parallel_args.dp_size());
+  const int32_t tp_size =
+      std::max(1, parallel_args.world_size() / (dp_size * cp_size));
+  return (parallel_args.rank() / tp_size) % cp_size;
+}
+
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
@@ -122,9 +135,9 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
 
   // first worker is the driver
   driver_ = parallel_args.rank() == 0;
-  int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size();
+  int32_t tp_size = parallel_args.world_size() / (parallel_args.dp_size() * parallel_args.cp_size());
   dp_driver_ =
-      parallel_args.dp_size() > 1 && parallel_args.rank() % tp_size == 0;
+      parallel_args.dp_size() > 1 && parallel_args.rank() % (tp_size * parallel_args.cp_size()) == 0;
 
   device_.set_device();
   device_.init_device_context();
@@ -514,8 +527,28 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 #endif
   c10::StreamGuard streamGuard = prepare_stream_->set_stream_guard();
+  cp_check::XLLM_CPCHK_CHECK_PARALLEL_ROLE(
+      "WorkerImpl::prepare_work_before_execute",
+      parallel_args_.rank(),
+      parallel_args_.world_size(),
+      parallel_args_.dp_size(),
+      parallel_args_.cp_size());
 
-  processed_input = input.to(device_, dtype_);
+  ForwardInput partitioned_input = input;
+  if (parallel_args_.cp_size() > 1 &&
+      input.input_params.batch_forward_type.is_prefill()) {
+    const int32_t cp_rank = resolve_cp_rank(parallel_args_);
+    cp_check::XLLM_CPCHK_CHECK_CP_RANK(
+        "WorkerImpl::prepare_work_before_execute",
+        cp_rank,
+        parallel_args_.rank(),
+        parallel_args_.world_size(),
+        parallel_args_.dp_size(),
+        parallel_args_.cp_size());
+    partitioned_input = input.cp_partition(cp_rank, parallel_args_.cp_size());
+  }
+
+  processed_input = partitioned_input.to(device_, dtype_);
   auto& input_params = processed_input.input_params;
 #if defined(USE_NPU)
   if (input_params.swap_blocks.size() > 0 && !FLAGS_enable_block_copy_kernel) {
