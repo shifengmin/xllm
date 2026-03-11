@@ -19,7 +19,6 @@ cc_library(
     attention_metadata.h
     attention_metadata_builder.h
     dp_utils.h
-    cp_utils.h
     add_matmul.h
   SRCS
     qwen2_attention.cpp
@@ -36,7 +35,6 @@ cc_library(
     activation.cpp
     attention_metadata_builder.cpp
     dp_utils.cpp
-    cp_utils.cpp
     add_matmul.cpp
   DEPS
     "-Wl,--whole-archive"
@@ -57,6 +55,17 @@ cc_library(
     $<$<BOOL:${USE_ILU}>:ilu_layers>
     $<$<BOOL:${USE_NPU}>:npu_torch_layers>
     $<$<BOOL:${USE_MUSA}>:musa_layers>
+)
+
+cc_library(
+  NAME
+    cp_utils
+  HDRS
+    cp_utils.h
+  SRCS
+    cp_utils.cpp
+  DEPS
+    torch
 )
 
 if(USE_MLU)

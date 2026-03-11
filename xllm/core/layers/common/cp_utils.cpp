@@ -1,323 +1,341 @@
 #include "cp_utils.h"
-// #include <torch/npu/guard.h> // 适配NPU（华为昇腾），CPU/GPU场景可替换为torch::DeviceGuard
+
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
 
 namespace xllm {
-    namespace layer {
+namespace layer {
+namespace {
 
-        // 生成负载均衡输入索引
-        torch::Tensor generate_cp_load_balance_idx(const torch::Tensor& input_lengths) {
-            TORCH_CHECK(input_lengths.dtype() == torch::kInt32, "input_lengths must be int32 tensor");
-            TORCH_CHECK(input_lengths.dim() == 1, "input_lengths must be 1D tensor");
+constexpr int64_t kInt32Max = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+constexpr int64_t kInt32Min = static_cast<int64_t>(std::numeric_limits<int32_t>::min());
 
-            std::vector<int> lengths_vec;
-            int* lengths_ptr = input_lengths.data_ptr<int>();
-            int64_t n = input_lengths.numel();
-            for (int64_t i = 0; i < n; ++i) {
-                lengths_vec.push_back(lengths_ptr[i]);
-            }
+int32_t CheckedToInt32(int64_t value, const char* name) {
+  TORCH_CHECK(value >= kInt32Min && value <= kInt32Max,
+              name,
+              " out of int32 range: ",
+              value);
+  return static_cast<int32_t>(value);
+}
 
-            std::vector<int> cp_load_balance_idx_first, cp_load_balance_idx_last;
-            int base = 0;
-            for (int length : lengths_vec) {
-                std::vector<int> length_range(length);
-                std::iota(length_range.begin(), length_range.end(), base); // 生成连续整数序列
-                int divider = length / 2;
-                // 前半段
-                cp_load_balance_idx_first.insert(
-                    cp_load_balance_idx_first.end(),
-                    length_range.begin(),
-                    length_range.begin() + divider);
-                // 后半段
-                cp_load_balance_idx_last.insert(
-                    cp_load_balance_idx_last.end(),
-                    length_range.begin() + divider,
-                    length_range.end());
-                base += length;
-            }
+std::vector<int32_t> ToCPUInt32Vector(const torch::Tensor& tensor,
+                                      const char* name) {
+  TORCH_CHECK(tensor.defined(), name, " must be defined");
+  TORCH_CHECK(tensor.dim() == 1, name, " must be 1D tensor");
+  const auto dtype = tensor.scalar_type();
+  TORCH_CHECK(dtype == torch::kInt32 || dtype == torch::kInt64 ||
+                  dtype == torch::kLong,
+              name,
+              " must be int32/int64 tensor");
 
-            // 合并前半段+后半段
-            cp_load_balance_idx_first.insert(
-                cp_load_balance_idx_first.end(),
-                cp_load_balance_idx_last.begin(),
-                cp_load_balance_idx_last.end());
+  auto cpu = tensor.to(torch::kCPU).to(torch::kInt32).contiguous();
+  const auto* ptr = cpu.data_ptr<int32_t>();
+  return std::vector<int32_t>(ptr, ptr + cpu.numel());
+}
 
-            // 转换为torch张量（NPU设备）
-            auto tensor = torch::tensor(cp_load_balance_idx_first, torch::dtype(torch::kInt32).device(torch::kCPU));
-            return tensor;
-        }
+torch::Tensor MakeInt32Tensor(const std::vector<int32_t>& values,
+                              const torch::Device& device) {
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  if (values.empty()) {
+    return torch::empty({0}, options);
+  }
+  return torch::tensor(values, options);
+}
 
-        // 生成输出结果恢复索引
-        torch::Tensor generate_cp_o_recover_idx(const std::vector<int>& chunk_lengths) {
-            std::vector<int> cp_o_recover_idx;
-            int base = 0;
-            int chunk_lengths_sum = std::accumulate(chunk_lengths.begin(), chunk_lengths.end(), 0);
+}  // namespace
 
-            for (int chunk_len : chunk_lengths) {
-                std::vector<int> length_range(chunk_len);
-                std::iota(length_range.begin(), length_range.end(), base);
-                // 前半段
-                cp_o_recover_idx.insert(cp_o_recover_idx.end(), length_range.begin(), length_range.end());
-                // 后半段（偏移chunk_lengths_sum）
-                std::vector<int> last_part(length_range.size());
-                std::transform(
-                    length_range.begin(), length_range.end(),
-                    last_part.begin(),
-                    [chunk_lengths_sum](int x) { return x + chunk_lengths_sum; });
-                cp_o_recover_idx.insert(cp_o_recover_idx.end(), last_part.begin(), last_part.end());
-                base += chunk_len;
-            }
+torch::Tensor generate_cp_load_balance_idx(const torch::Tensor& input_lengths) {
+  std::vector<int32_t> lengths = ToCPUInt32Vector(input_lengths, "input_lengths");
 
-            return torch::tensor(cp_o_recover_idx, torch::dtype(torch::kInt32).device(torch::kCPU));
-        }
+  std::vector<int32_t> cp_load_balance_idx_first;
+  std::vector<int32_t> cp_load_balance_idx_last;
+  cp_load_balance_idx_first.reserve(input_lengths.numel());
+  cp_load_balance_idx_last.reserve(input_lengths.numel());
 
-        // 生成KV缓存恢复索引
-        torch::Tensor generate_cp_kv_recover_idx(int cp_size, int input_ids_size, const std::vector<int>& chunk_lengths) {
-            std::vector<int> cp_kv_recover_idx;
-            int req_offset = 0;
+  int64_t base = 0;
+  for (int32_t length : lengths) {
+    TORCH_CHECK(length >= 0, "input_lengths contains negative value: ", length);
+    const int32_t divider = length / 2;
+    for (int32_t i = 0; i < divider; ++i) {
+      cp_load_balance_idx_first.push_back(CheckedToInt32(base + i,
+                                                         "cp_load_balance_idx_first"));
+    }
+    for (int32_t i = divider; i < length; ++i) {
+      cp_load_balance_idx_last.push_back(CheckedToInt32(base + i,
+                                                        "cp_load_balance_idx_last"));
+    }
+    base += length;
+  }
 
-            for (int req_chunk_len : chunk_lengths) {
-                std::vector<std::vector<int>> gather_idx_per_chunk(cp_size * 2);
-                for (int cp_rank_id = 0; cp_rank_id < cp_size; ++cp_rank_id) {
-                    int rank_offset = cp_rank_id * input_ids_size;
-                    // 前半段索引
-                    std::vector<int> first_part(req_chunk_len);
-                    std::iota(first_part.begin(), first_part.end(), rank_offset + req_offset);
-                    gather_idx_per_chunk[cp_rank_id] = first_part;
+  cp_load_balance_idx_first.insert(cp_load_balance_idx_first.end(),
+                                   cp_load_balance_idx_last.begin(),
+                                   cp_load_balance_idx_last.end());
+  return MakeInt32Tensor(cp_load_balance_idx_first, input_lengths.device());
+}
 
-                    // 后半段索引（反向分配）
-                    std::vector<int> last_part(req_chunk_len);
-                    std::iota(last_part.begin(), last_part.end(), rank_offset + req_offset + req_chunk_len);
-                    gather_idx_per_chunk[cp_size * 2 - 1 - cp_rank_id] = last_part;
-                }
+torch::Tensor generate_cp_o_recover_idx(const std::vector<int32_t>& chunk_lengths,
+                                        const torch::Device& device) {
+  std::vector<int32_t> cp_o_recover_idx;
 
-                // 展平并添加到总索引
-                for (const auto& vec : gather_idx_per_chunk) {
-                    cp_kv_recover_idx.insert(cp_kv_recover_idx.end(), vec.begin(), vec.end());
-                }
-                req_offset += req_chunk_len * 2;
-            }
+  int64_t base = 0;
+  int64_t chunk_lengths_sum =
+      std::accumulate(chunk_lengths.begin(), chunk_lengths.end(), int64_t{0});
 
-            return torch::tensor(cp_kv_recover_idx, torch::dtype(torch::kInt32).device(torch::kCPU));
-        }
+  for (int32_t chunk_len : chunk_lengths) {
+    TORCH_CHECK(chunk_len >= 0, "chunk_lengths contains negative value: ", chunk_len);
+    for (int32_t idx = 0; idx < chunk_len; ++idx) {
+      cp_o_recover_idx.push_back(CheckedToInt32(base + idx, "cp_o_recover_idx"));
+    }
+    for (int32_t idx = 0; idx < chunk_len; ++idx) {
+      cp_o_recover_idx.push_back(
+          CheckedToInt32(base + idx + chunk_lengths_sum, "cp_o_recover_idx"));
+    }
+    base += chunk_len;
+  }
 
-        // 计算长度累积的前后段值
-        std::pair<torch::Tensor, torch::Tensor> compute_input_lengths_cumsum_cp(
-            const torch::Tensor& input_lengths_cumsum) {
-            TORCH_CHECK(input_lengths_cumsum.dtype() == torch::kInt32, "input_lengths_cumsum must be int32 tensor");
-            TORCH_CHECK(input_lengths_cumsum.dim() == 1, "input_lengths_cumsum must be 1D tensor");
+  return MakeInt32Tensor(cp_o_recover_idx, device);
+}
 
-            int64_t n = input_lengths_cumsum.numel();
-            auto input_lengths_cumsum_cp_prev = torch::zeros({n}, torch::dtype(torch::kInt32).device(torch::kCPU));
-            auto input_lengths_cumsum_cp_next = torch::zeros({n}, torch::dtype(torch::kInt32).device(torch::kCPU));
+torch::Tensor generate_cp_kv_recover_idx(int32_t cp_size,
+                                         int64_t input_ids_size,
+                                         const std::vector<int32_t>& chunk_lengths,
+                                         const torch::Device& device) {
+  TORCH_CHECK(cp_size > 0, "cp_size must be positive");
+  TORCH_CHECK(input_ids_size >= 0, "input_ids_size must be non-negative");
 
-            int offset = 0;
-            auto cumsum_data = input_lengths_cumsum.data_ptr<int>();
-            auto prev_data = input_lengths_cumsum_cp_prev.data_ptr<int>();
-            auto next_data = input_lengths_cumsum_cp_next.data_ptr<int>();
+  std::vector<int32_t> cp_kv_recover_idx;
+  int64_t req_offset = 0;
 
-            for (int64_t i = 0; i < n; ++i) {
-                prev_data[i] = offset + (cumsum_data[i] - offset) / 2;
-                next_data[i] = cumsum_data[i];
-                offset = cumsum_data[i];
-            }
+  for (int32_t req_chunk_len : chunk_lengths) {
+    TORCH_CHECK(req_chunk_len >= 0,
+                "chunk_lengths contains negative value: ",
+                req_chunk_len);
+    std::vector<std::vector<int32_t>> gather_idx_per_chunk(cp_size * 2);
+    for (int32_t cp_rank_id = 0; cp_rank_id < cp_size; ++cp_rank_id) {
+      const int64_t rank_offset = static_cast<int64_t>(cp_rank_id) * input_ids_size;
+      for (int32_t idx = 0; idx < req_chunk_len; ++idx) {
+        gather_idx_per_chunk[cp_rank_id].push_back(
+            CheckedToInt32(rank_offset + req_offset + idx, "cp_kv_recover_idx"));
+      }
+      for (int32_t idx = req_chunk_len; idx < req_chunk_len * 2; ++idx) {
+        gather_idx_per_chunk[cp_size * 2 - 1 - cp_rank_id].push_back(
+            CheckedToInt32(rank_offset + req_offset + idx, "cp_kv_recover_idx"));
+      }
+    }
 
-            return {input_lengths_cumsum_cp_prev, input_lengths_cumsum_cp_next};
-        }
+    for (const auto& chunk : gather_idx_per_chunk) {
+      cp_kv_recover_idx.insert(cp_kv_recover_idx.end(), chunk.begin(), chunk.end());
+    }
+    req_offset += static_cast<int64_t>(req_chunk_len) * 2;
+  }
 
-        // 生成KV gather索引
-        std::pair<torch::Tensor, torch::Tensor> generate_k_gather_index(
-            const torch::Tensor& actual_seq_lengths_kv_cp_prev,
-            const torch::Tensor& actual_seq_lengths_kv_cp_next,
-            const torch::Tensor& input_lengths,
-            int cp_size) {
-            TORCH_CHECK(actual_seq_lengths_kv_cp_prev.dim() == 1, "actual_seq_lengths_kv_cp_prev must be 1D");
-            TORCH_CHECK(actual_seq_lengths_kv_cp_next.dim() == 1, "actual_seq_lengths_kv_cp_next must be 1D");
-            TORCH_CHECK(input_lengths.dim() == 1, "input_lengths must be 1D");
+  return MakeInt32Tensor(cp_kv_recover_idx, device);
+}
 
-            std::vector<int> k_gather_index_prev, k_gather_index_next;
-            int k_offset = 0;
-            int64_t n = input_lengths.numel();
+std::pair<torch::Tensor, torch::Tensor> compute_input_lengths_cumsum_cp(
+    const torch::Tensor& input_lengths_cumsum) {
+  std::vector<int32_t> cumsum =
+      ToCPUInt32Vector(input_lengths_cumsum, "input_lengths_cumsum");
 
-            auto prev_len_data = actual_seq_lengths_kv_cp_prev.data_ptr<int>();
-            auto next_len_data = actual_seq_lengths_kv_cp_next.data_ptr<int>();
-            auto input_len_data = input_lengths.data_ptr<int>();
+  std::vector<int32_t> prev(cumsum.size(), 0);
+  std::vector<int32_t> next(cumsum.size(), 0);
 
-            for (int64_t i = 0; i < n; ++i) {
-                // 前半段索引
-                std::vector<int> prev_range(prev_len_data[i]);
-                std::iota(prev_range.begin(), prev_range.end(), k_offset);
-                k_gather_index_prev.insert(k_gather_index_prev.end(), prev_range.begin(), prev_range.end());
+  int32_t offset = 0;
+  for (size_t i = 0; i < cumsum.size(); ++i) {
+    TORCH_CHECK(cumsum[i] >= offset,
+                "input_lengths_cumsum must be non-decreasing");
+    prev[i] = offset + (cumsum[i] - offset) / 2;
+    next[i] = cumsum[i];
+    offset = cumsum[i];
+  }
 
-                // 完整段索引
-                std::vector<int> next_range(next_len_data[i]);
-                std::iota(next_range.begin(), next_range.end(), k_offset);
-                k_gather_index_next.insert(k_gather_index_next.end(), next_range.begin(), next_range.end());
+  return {MakeInt32Tensor(prev, input_lengths_cumsum.device()),
+          MakeInt32Tensor(next, input_lengths_cumsum.device())};
+}
 
-                k_offset += input_len_data[i] * cp_size;
-            }
+std::pair<torch::Tensor, torch::Tensor> generate_k_gather_index(
+    const torch::Tensor& actual_seq_lengths_kv_cp_prev,
+    const torch::Tensor& actual_seq_lengths_kv_cp_next,
+    const torch::Tensor& input_lengths,
+    int32_t cp_size) {
+  TORCH_CHECK(cp_size > 0, "cp_size must be positive");
 
-            auto prev_tensor = torch::tensor(k_gather_index_prev, torch::dtype(torch::kInt32).device(torch::kCPU));
-            auto next_tensor = torch::tensor(k_gather_index_next, torch::dtype(torch::kInt32).device(torch::kCPU));
-            return {prev_tensor, next_tensor};
-        }
+  std::vector<int32_t> prev_lens =
+      ToCPUInt32Vector(actual_seq_lengths_kv_cp_prev, "actual_seq_lengths_kv_cp_prev");
+  std::vector<int32_t> next_lens =
+      ToCPUInt32Vector(actual_seq_lengths_kv_cp_next, "actual_seq_lengths_kv_cp_next");
+  std::vector<int32_t> input_lens = ToCPUInt32Vector(input_lengths, "input_lengths");
 
-        // 核心函数：CP预填充输入预处理
-        CPInputDict prepare_cp_prefill_inputs(
-            int cp_size,
-            const torch::Tensor& input_ids,
-            const torch::Tensor& position_ids,
-            const torch::Tensor& input_lengths_cumsum,
-            const torch::Tensor& input_lengths) {
-            // 输入合法性检查
-            TORCH_CHECK(cp_size > 0, "cp_size must be positive");
-            // TORCH_CHECK(input_ids.device().type() == torch::kCPU, "input_ids must be on NPU");
-            // TORCH_CHECK(position_ids.device().type() == torch::kCPU, "position_ids must be on NPU");
-            // TORCH_CHECK(input_lengths_cumsum.device().type() == torch::kCPU, "input_lengths_cumsum must be on NPU");
-            // TORCH_CHECK(input_lengths.device().type() == torch::kCPU, "input_lengths must be on NPU");
+  TORCH_CHECK(prev_lens.size() == next_lens.size() &&
+                  prev_lens.size() == input_lens.size(),
+              "length mismatch among kv lens and input lengths");
 
-            CPInputDict cp_input_dict;
+  std::vector<int32_t> k_gather_index_prev;
+  std::vector<int32_t> k_gather_index_next;
 
-            // 1. 计算分片长度
-            std::vector<int> chunk_lengths;
-            auto input_len_data = input_lengths.data_ptr<int>();
-            for (int64_t i = 0; i < input_lengths.numel(); ++i) {
-                chunk_lengths.push_back(input_len_data[i] / 2);
-            }
+  int64_t k_offset = 0;
+  for (size_t i = 0; i < input_lens.size(); ++i) {
+    TORCH_CHECK(prev_lens[i] >= 0 && next_lens[i] >= 0 && input_lens[i] >= 0,
+                "negative sequence length is not allowed");
 
-            // 2. 生成负载均衡输入索引
-            cp_input_dict.cp_load_balance_idx = generate_cp_load_balance_idx(input_lengths);
+    for (int32_t idx = 0; idx < prev_lens[i]; ++idx) {
+      k_gather_index_prev.push_back(
+          CheckedToInt32(k_offset + idx, "k_gather_index_prev"));
+    }
+    for (int32_t idx = 0; idx < next_lens[i]; ++idx) {
+      k_gather_index_next.push_back(
+          CheckedToInt32(k_offset + idx, "k_gather_index_next"));
+    }
 
-            // 3. 生成输出结果恢复索引
-            cp_input_dict.cp_o_recover_idx = generate_cp_o_recover_idx(chunk_lengths);
+    k_offset += static_cast<int64_t>(input_lens[i]) * cp_size;
+  }
 
-            // 4. 生成KV缓存恢复索引
-            cp_input_dict.cp_kv_recover_idx = generate_cp_kv_recover_idx(cp_size, input_ids.numel(), chunk_lengths);
+  return {MakeInt32Tensor(k_gather_index_prev, input_lengths.device()),
+          MakeInt32Tensor(k_gather_index_next, input_lengths.device())};
+}
 
-            // 5. 计算长度累积的前后段值
-            auto [input_lengths_cumsum_cp_prev, input_lengths_cumsum_cp_next] =
-                compute_input_lengths_cumsum_cp(input_lengths_cumsum);
+CPInputDict prepare_cp_prefill_inputs(int32_t cp_size,
+                                      const torch::Tensor& input_ids,
+                                      const torch::Tensor& position_ids,
+                                      const torch::Tensor& input_lengths_cumsum,
+                                      const torch::Tensor& input_lengths) {
+  TORCH_CHECK(cp_size > 0, "cp_size must be positive");
+  TORCH_CHECK(position_ids.defined(), "position_ids must be defined");
+  TORCH_CHECK(position_ids.dim() == 1,
+              "position_ids must be 1D in prepare_cp_prefill_inputs");
 
-            // 6. 计算KV实际长度
-            auto position_ids_prev = position_ids.index({input_lengths_cumsum_cp_prev - 1}) + 1;
-            auto position_ids_next = position_ids.index({input_lengths_cumsum_cp_next - 1}) + 1;
-            auto actual_seq_lengths_kv_cp_prev = position_ids_prev.to(torch::kInt32);
-            auto actual_seq_lengths_kv_cp_next = position_ids_next.to(torch::kInt32);
+  CPInputDict cp_input_dict;
 
-            // 7. 生成KV gather索引
-            cp_input_dict.k_gather_index = generate_k_gather_index(
-                actual_seq_lengths_kv_cp_prev,
-                actual_seq_lengths_kv_cp_next,
-                input_lengths,
-                cp_size);
+  std::vector<int32_t> lengths = ToCPUInt32Vector(input_lengths, "input_lengths");
+  std::vector<int32_t> cumsum =
+      ToCPUInt32Vector(input_lengths_cumsum, "input_lengths_cumsum");
+  TORCH_CHECK(lengths.size() == cumsum.size(),
+              "input_lengths and input_lengths_cumsum size mismatch");
 
-            // 8. 计算KV长度累积值
-            auto actual_seq_lengths_kv_cp_prev_cumsum = torch::cumsum(actual_seq_lengths_kv_cp_prev, 0, torch::kInt32);
-            auto actual_seq_lengths_kv_cp_next_cumsum = torch::cumsum(actual_seq_lengths_kv_cp_next, 0, torch::kInt32);
-            cp_input_dict.actual_seq_lengths_key = {actual_seq_lengths_kv_cp_prev_cumsum, actual_seq_lengths_kv_cp_next_cumsum};
+  int64_t sum_lengths = std::accumulate(lengths.begin(), lengths.end(), int64_t{0});
+  TORCH_CHECK(sum_lengths == input_ids.numel(),
+              "sum(input_lengths) must equal input_ids.numel(), got ",
+              sum_lengths,
+              " vs ",
+              input_ids.numel());
 
-            // 9. 计算Query长度累积值
-            auto input_lengths_cumsum_half = input_lengths_cumsum / 2;
-            cp_input_dict.actual_seq_lengths_query = {input_lengths_cumsum_half, input_lengths_cumsum_half};
+  std::vector<int32_t> chunk_lengths;
+  chunk_lengths.reserve(lengths.size());
+  for (int32_t len : lengths) {
+    TORCH_CHECK(len >= 0, "input_lengths contains negative value: ", len);
+    chunk_lengths.push_back(len / 2);
+  }
 
-            return cp_input_dict;
-        }
+  cp_input_dict.cp_load_balance_idx = generate_cp_load_balance_idx(input_lengths);
+  cp_input_dict.cp_o_recover_idx =
+      generate_cp_o_recover_idx(chunk_lengths, input_lengths.device());
+  cp_input_dict.cp_kv_recover_idx = generate_cp_kv_recover_idx(
+      cp_size, input_ids.numel(), chunk_lengths, input_lengths.device());
 
-        // bool verify_vector(const std::vector<int>& actual, const std::vector<int>& expected, const std::string& test_name) {
-        //     if (actual.size() != expected.size()) {
-        //         std::cerr << "[FAIL] " << test_name << ": Size mismatch! Actual=" << actual.size() << ", Expected=" << expected.size() << std::endl;
-        //         return false;
-        //     }
-        //     for (size_t i = 0; i < actual.size(); ++i) {
-        //         if (actual[i] != expected[i]) {
-        //             std::cerr << "[FAIL] " << test_name << ": Index " << i << " mismatch! Actual=" << actual[i] << ", Expected=" << expected[i] << std::endl;
-        //             return false;
-        //         }
-        //     }
-        //     std::cout << "[PASS] " << test_name << std::endl;
-        //     return true;
-        // }
-        //
-        // std::vector<int> tensor_to_vector(const torch::Tensor& tensor) {
-        //     // 修复：CPU tensor无需再转换设备
-        //     int* data_ptr = tensor.data_ptr<int>();
-        //     int64_t n = tensor.numel();
-        //     std::vector<int> vec(n);
-        //     for (int64_t i = 0; i < n; ++i) {
-        //         vec[i] = data_ptr[i];
-        //     }
-        //     return vec;
-        // }
+  auto [input_lengths_cumsum_cp_prev, input_lengths_cumsum_cp_next] =
+      compute_input_lengths_cumsum_cp(input_lengths_cumsum);
 
-        // int main() {
-        //     std::cout << "===== Start Testing =====" << std::endl;
-        //     int pass_count = 0;
-        //     int total_count = 0;
-        //
-        //     // 测试用例1
-        //     total_count++;
-        //     std::cout << "\nTest 1: generate_cp_load_balance_idx" << std::endl;
-        //     auto input_lengths = torch::tensor({4, 6}, torch::dtype(torch::kInt32).device(torch::kCPU));
-        //     std::vector<int> expected_load_balance = {0,1,4,5,6,2,3,7,8,9};
-        //     auto result_load_balance = generate_cp_load_balance_idx(input_lengths);
-        //     std::vector<int> actual_load_balance = tensor_to_vector(result_load_balance);
-        //     if (verify_vector(actual_load_balance, expected_load_balance, "generate_cp_load_balance_idx")) {
-        //         pass_count++;
-        //     }
-        //
-        //     // 测试用例2
-        //     total_count++;
-        //     std::cout << "\nTest 2: generate_cp_o_recover_idx" << std::endl;
-        //     std::vector<int> chunk_lengths = {2, 3};
-        //     std::vector<int> expected_o_recover = {0,1,5,6,2,3,4,7,8,9};
-        //     auto result_o_recover = generate_cp_o_recover_idx(chunk_lengths);
-        //     std::vector<int> actual_o_recover = tensor_to_vector(result_o_recover);
-        //     if (verify_vector(actual_o_recover, expected_o_recover, "generate_cp_o_recover_idx")) {
-        //         pass_count++;
-        //     }
-        //
-        //     // 测试用例3
-        //     total_count++;
-        //     std::cout << "\nTest 3: prepare_cp_prefill_inputs (full logic)" << std::endl;
-        //     int cp_size = 2;
-        //     auto input_ids = torch::tensor({101,102,103,104,201,202,203,204,205,206}, torch::dtype(torch::kInt32).device(torch::kCPU));
-        //     auto position_ids = torch::tensor({0,1,2,3,0,1,2,3,4,5}, torch::dtype(torch::kInt32).device(torch::kCPU));
-        //     auto input_lengths_cumsum = torch::tensor({4,10}, torch::dtype(torch::kInt32).device(torch::kCPU));
-        //
-        //     auto cp_input_dict = prepare_cp_prefill_inputs(cp_size, input_ids, position_ids, input_lengths_cumsum, input_lengths);
-        //
-        //     bool full_test_pass = true;
-        //     auto key_prev_vec = tensor_to_vector(cp_input_dict.actual_seq_lengths_key.first);
-        //     if (key_prev_vec[0] != 2 || key_prev_vec[1] != 5) {
-        //         std::cerr << "[FAIL] prepare_cp_prefill_inputs: actual_seq_lengths_key.first mismatch! Actual=[" << key_prev_vec[0] << "," << key_prev_vec[1] << "], Expected=[2,5]" << std::endl;
-        //         full_test_pass = false;
-        //     }
-        //     auto key_next_vec = tensor_to_vector(cp_input_dict.actual_seq_lengths_key.second);
-        //     if (key_next_vec[0] != 4 || key_next_vec[1] != 10) {
-        //         std::cerr << "[FAIL] prepare_cp_prefill_inputs: actual_seq_lengths_key.second mismatch! Actual=[" << key_next_vec[0] << "," << key_next_vec[1] << "], Expected=[4,10]" << std::endl;
-        //         full_test_pass = false;
-        //     }
-        //     auto full_load_balance_vec = tensor_to_vector(cp_input_dict.cp_load_balance_idx);
-        //     if (!verify_vector(full_load_balance_vec, expected_load_balance, "prepare_cp_prefill_inputs (load_balance_idx)")) {
-        //         full_test_pass = false;
-        //     }
-        //     if (full_test_pass) {
-        //         std::cout << "[PASS] prepare_cp_prefill_inputs (full logic)" << std::endl;
-        //         pass_count++;
-        //     } else {
-        //         std::cerr << "[FAIL] prepare_cp_prefill_inputs (full logic)" << std::endl;
-        //     }
-        //
-        //     std::cout << "\n===== Test Summary =====" << std::endl;
-        //     std::cout << "Total Tests: " << total_count << std::endl;
-        //     std::cout << "Passed Tests: " << pass_count << std::endl;
-        //     std::cout << "Failed Tests: " << (total_count - pass_count) << std::endl;
-        //
-        //     return (total_count == pass_count) ? 0 : 1;
-        // }
-        //
-    } // namespace layer
-} // namespace xllm
-//
-// int main() {
-//     return context_parallel_forward_input::main();
-// }
+  auto pos_cpu = position_ids.to(torch::kCPU).to(torch::kInt32).contiguous();
+  const int32_t* pos_ptr = pos_cpu.data_ptr<int32_t>();
+  const int64_t pos_numel = pos_cpu.numel();
+
+  auto prev_idx_cpu =
+      input_lengths_cumsum_cp_prev.to(torch::kCPU).to(torch::kInt32).contiguous();
+  auto next_idx_cpu =
+      input_lengths_cumsum_cp_next.to(torch::kCPU).to(torch::kInt32).contiguous();
+
+  std::vector<int32_t> actual_prev;
+  std::vector<int32_t> actual_next;
+  actual_prev.reserve(lengths.size());
+  actual_next.reserve(lengths.size());
+
+  const int32_t* prev_ptr = prev_idx_cpu.data_ptr<int32_t>();
+  const int32_t* next_ptr = next_idx_cpu.data_ptr<int32_t>();
+
+  for (size_t i = 0; i < lengths.size(); ++i) {
+    TORCH_CHECK(prev_ptr[i] > 0 && next_ptr[i] > 0,
+                "input_lengths_cumsum values must be > 0");
+    const int64_t prev_index = static_cast<int64_t>(prev_ptr[i]) - 1;
+    const int64_t next_index = static_cast<int64_t>(next_ptr[i]) - 1;
+    TORCH_CHECK(prev_index >= 0 && prev_index < pos_numel,
+                "prev position index out of range: ",
+                prev_index,
+                ", pos_numel: ",
+                pos_numel);
+    TORCH_CHECK(next_index >= 0 && next_index < pos_numel,
+                "next position index out of range: ",
+                next_index,
+                ", pos_numel: ",
+                pos_numel);
+    actual_prev.push_back(pos_ptr[prev_index] + 1);
+    actual_next.push_back(pos_ptr[next_index] + 1);
+  }
+
+  auto actual_seq_lengths_kv_cp_prev =
+      MakeInt32Tensor(actual_prev, input_lengths.device());
+  auto actual_seq_lengths_kv_cp_next =
+      MakeInt32Tensor(actual_next, input_lengths.device());
+
+  cp_input_dict.k_gather_index = generate_k_gather_index(
+      actual_seq_lengths_kv_cp_prev,
+      actual_seq_lengths_kv_cp_next,
+      input_lengths,
+      cp_size);
+
+  cp_input_dict.actual_seq_lengths_key = {
+      torch::cumsum(actual_seq_lengths_kv_cp_prev, 0, torch::kInt32),
+      torch::cumsum(actual_seq_lengths_kv_cp_next, 0, torch::kInt32)};
+
+  auto input_lengths_cumsum_half =
+      torch::floor_divide(input_lengths_cumsum.to(torch::kInt32), 2).contiguous();
+  cp_input_dict.actual_seq_lengths_query = {input_lengths_cumsum_half,
+                                            input_lengths_cumsum_half.clone()};
+
+  return cp_input_dict;
+}
+
+CPPrefillATBInputs prepare_cp_prefill_atb_inputs(int32_t cp_size,
+                                                 const torch::Tensor& input_lengths) {
+  TORCH_CHECK(cp_size > 0, "cp_size must be positive");
+
+  std::vector<int32_t> lengths = ToCPUInt32Vector(input_lengths, "input_lengths");
+  std::vector<int32_t> chunk_lengths;
+  chunk_lengths.reserve(lengths.size());
+
+  int64_t local_token_num = 0;
+  for (int32_t len : lengths) {
+    TORCH_CHECK(len >= 0, "input_lengths contains negative value: ", len);
+    chunk_lengths.push_back(len / 2);
+    local_token_num += len;
+  }
+
+  CPPrefillATBInputs outputs;
+  outputs.seq_len_cp = MakeInt32Tensor(chunk_lengths, input_lengths.device());
+
+  auto cp_load_balance_idx = generate_cp_load_balance_idx(input_lengths);
+  const int64_t first_numel =
+      std::accumulate(chunk_lengths.begin(), chunk_lengths.end(), int64_t{0});
+  TORCH_CHECK(first_numel >= 0 && first_numel <= cp_load_balance_idx.numel(),
+              "invalid first_numel for cp_load_balance_idx split");
+  outputs.cp_load_balance_idx_first =
+      cp_load_balance_idx.narrow(/*dim=*/0, /*start=*/0, /*length=*/first_numel)
+          .contiguous();
+  outputs.cp_load_balance_idx_last =
+      cp_load_balance_idx
+          .narrow(/*dim=*/0,
+                  /*start=*/first_numel,
+                  /*length=*/cp_load_balance_idx.numel() - first_numel)
+          .contiguous();
+
+  outputs.cp_o_recover_idx =
+      generate_cp_o_recover_idx(chunk_lengths, input_lengths.device());
+  outputs.cp_kv_recover_idx = generate_cp_kv_recover_idx(
+      cp_size, local_token_num, chunk_lengths, input_lengths.device());
+
+  return outputs;
+}
+
+}  // namespace layer
+}  // namespace xllm

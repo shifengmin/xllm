@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "common/cp_runtime_check.h"
 #include "common/global_flags.h"
+#include "layers/common/cp_utils.h"
 #include "layers/common/rotary_embedding_util.h"
 
 namespace xllm {
@@ -33,122 +34,50 @@ namespace layer {
 
 namespace {
 
-struct CpPrefillInputs {
-  torch::Tensor seq_len_cp;
-  torch::Tensor cp_load_balance_idx_first;
-  torch::Tensor cp_load_balance_idx_last;
-  torch::Tensor cp_o_recover_idx;
-  torch::Tensor cp_kv_recover_idx;
-};
-
-std::vector<int32_t> get_seq_lens_for_cp_prefill(const ModelInputParams& input_params) {
-  std::vector<int32_t> seq_lens;
-  if (input_params.q_seq_lens_vec.empty()) {
-    return seq_lens;
-  }
-
-  const bool is_cumsum = input_params.q_seq_lens_vec.size() ==
-                             static_cast<size_t>(input_params.num_sequences + 1) &&
-                         input_params.q_seq_lens_vec.front() == 0;
-  if (is_cumsum) {
-    seq_lens.reserve(input_params.num_sequences);
-    for (int32_t i = 0; i < input_params.num_sequences; ++i) {
-      seq_lens.push_back(static_cast<int32_t>(
-          input_params.q_seq_lens_vec[i + 1] - input_params.q_seq_lens_vec[i]));
-    }
-    return seq_lens;
-  }
-
-  seq_lens.reserve(input_params.q_seq_lens_vec.size());
-  for (int q_len : input_params.q_seq_lens_vec) {
-    seq_lens.push_back(static_cast<int32_t>(q_len));
-  }
-  return seq_lens;
-}
-
-// TODO(shifengmin.3): replace this mock with real prepare_cp_prefill_inputs.
-CpPrefillInputs prepare_cp_prefill_inputs(const ModelInputParams& input_params,
-                                          int32_t cp_size) {
-  CpPrefillInputs outputs;
-
-  torch::TensorOptions options = torch::TensorOptions().dtype(torch::kInt32);
+torch::Tensor get_cp_prefill_input_lengths(const ModelInputParams& input_params) {
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
   if (input_params.q_seq_lens.defined()) {
     options = options.device(input_params.q_seq_lens.device());
   }
 
-  const std::vector<int32_t> seq_lens = get_seq_lens_for_cp_prefill(input_params);
-  const int32_t token_num =
-      std::accumulate(seq_lens.begin(), seq_lens.end(), static_cast<int32_t>(0));
-
-  std::vector<int32_t> chunk_lengths;
-  chunk_lengths.reserve(seq_lens.size());
-  std::vector<int32_t> cp_load_balance_idx_first;
-  std::vector<int32_t> cp_load_balance_idx_last;
-  cp_load_balance_idx_first.reserve(std::max(token_num / 2, 0));
-  cp_load_balance_idx_last.reserve(std::max(token_num / 2, 0));
-
-  int32_t base = 0;
-  for (int32_t length : seq_lens) {
-    const int32_t safe_length = std::max(length, 0);
-    const int32_t divider = safe_length / 2;
-    chunk_lengths.push_back(divider);
-
-    for (int32_t idx = 0; idx < divider; ++idx) {
-      cp_load_balance_idx_first.push_back(base + idx);
-    }
-    for (int32_t idx = divider; idx < safe_length; ++idx) {
-      cp_load_balance_idx_last.push_back(base + idx);
-    }
-    base += safe_length;
-  }
-
-  std::vector<int32_t> cp_o_recover_idx;
-  int32_t chunk_lengths_sum =
-      std::accumulate(chunk_lengths.begin(), chunk_lengths.end(), static_cast<int32_t>(0));
-  base = 0;
-  for (int32_t chunk_len : chunk_lengths) {
-    for (int32_t idx = 0; idx < chunk_len; ++idx) {
-      cp_o_recover_idx.push_back(base + idx);
-    }
-    for (int32_t idx = 0; idx < chunk_len; ++idx) {
-      cp_o_recover_idx.push_back(base + idx + chunk_lengths_sum);
-    }
-    base += chunk_len;
-  }
-
-  std::vector<int32_t> cp_kv_recover_idx;
-  if (cp_size > 0 && token_num > 0) {
-    int32_t req_offset = 0;
-    for (int32_t req_chunk_len : chunk_lengths) {
-      std::vector<std::vector<int32_t>> gather_idx_per_chunk(cp_size * 2);
-      for (int32_t cp_rank_id = 0; cp_rank_id < cp_size; ++cp_rank_id) {
-        const int32_t rank_offset = cp_rank_id * token_num;
-        for (int32_t idx = 0; idx < req_chunk_len; ++idx) {
-          gather_idx_per_chunk[cp_rank_id].push_back(rank_offset + req_offset + idx);
-          gather_idx_per_chunk[cp_size * 2 - 1 - cp_rank_id].push_back(
-              rank_offset + req_offset + req_chunk_len + idx);
-        }
+  if (!input_params.q_seq_lens_vec.empty()) {
+    const bool is_cumsum = input_params.q_seq_lens_vec.size() ==
+                               static_cast<size_t>(input_params.num_sequences + 1) &&
+                           input_params.q_seq_lens_vec.front() == 0;
+    TORCH_CHECK(is_cumsum ||
+                    input_params.q_seq_lens_vec.size() >=
+                        static_cast<size_t>(input_params.num_sequences),
+                "q_seq_lens_vec size is smaller than num_sequences");
+    std::vector<int32_t> seq_lens;
+    seq_lens.reserve(input_params.num_sequences);
+    if (is_cumsum) {
+      for (int32_t i = 0; i < input_params.num_sequences; ++i) {
+        seq_lens.push_back(static_cast<int32_t>(input_params.q_seq_lens_vec[i + 1] -
+                                                input_params.q_seq_lens_vec[i]));
       }
-      for (const auto& chunk : gather_idx_per_chunk) {
-        cp_kv_recover_idx.insert(cp_kv_recover_idx.end(), chunk.begin(), chunk.end());
+    } else {
+      for (int32_t i = 0; i < input_params.num_sequences; ++i) {
+        seq_lens.push_back(static_cast<int32_t>(input_params.q_seq_lens_vec[i]));
       }
-      req_offset += req_chunk_len * 2;
+    }
+    return torch::tensor(seq_lens, options);
+  }
+
+  if (input_params.q_seq_lens.defined() && input_params.q_seq_lens.dim() == 1) {
+    if (input_params.q_seq_lens.numel() == input_params.num_sequences) {
+      return input_params.q_seq_lens.to(torch::kInt32);
+    }
+    if (input_params.q_seq_lens.numel() == input_params.num_sequences + 1) {
+      auto q_cu = input_params.q_seq_lens.to(torch::kCPU).to(torch::kInt32).contiguous();
+      const int64_t n = q_cu.numel();
+      auto q_cu_next = q_cu.slice(/*dim=*/0, /*start=*/1, /*end=*/n);
+      auto q_cu_prev = q_cu.slice(/*dim=*/0, /*start=*/0, /*end=*/n - 1);
+      auto q_lens = (q_cu_next - q_cu_prev).contiguous();
+      return q_lens.to(options.device());
     }
   }
 
-  auto to_tensor = [&](const std::vector<int32_t>& values) {
-    if (values.empty()) {
-      return torch::zeros({1}, options);
-    }
-    return torch::tensor(values, options);
-  };
-
-  outputs.seq_len_cp = to_tensor(chunk_lengths);
-  outputs.cp_load_balance_idx_first = to_tensor(cp_load_balance_idx_first);
-  outputs.cp_load_balance_idx_last = to_tensor(cp_load_balance_idx_last);
-  outputs.cp_o_recover_idx = to_tensor(cp_o_recover_idx);
-  outputs.cp_kv_recover_idx = to_tensor(cp_kv_recover_idx);
-  return outputs;
+  return torch::empty({0}, options);
 }
 
 }  // namespace
@@ -1065,7 +994,13 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   if (cp_size_ > 1 && is_prefill) {
-    const auto cp_inputs = prepare_cp_prefill_inputs(input_params, cp_size_);
+    const auto cp_input_lengths = get_cp_prefill_input_lengths(input_params);
+    TORCH_CHECK(cp_input_lengths.defined() &&
+                    cp_input_lengths.dim() == 1 &&
+                    cp_input_lengths.numel() == input_params.num_sequences,
+                "invalid cp_input_lengths for CP prefill");
+    const auto cp_inputs =
+        prepare_cp_prefill_atb_inputs(cp_size_, cp_input_lengths);
     cp_check::XLLM_CPCHK_CHECK_CP_PREFILL_TENSOR_SHAPES(
         "NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack",
         input_params,

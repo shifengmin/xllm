@@ -118,6 +118,7 @@ cc_library(
     "-Wl,--whole-archive"
     "-Wl,--no-whole-archive"
     :attention_mask
+    :cp_utils
     :kv_cache
     :prefix_cache
     :block
