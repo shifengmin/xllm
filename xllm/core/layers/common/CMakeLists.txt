@@ -19,6 +19,7 @@ cc_library(
     attention_metadata.h
     attention_metadata_builder.h
     dp_utils.h
+    cp_utils.h
     add_matmul.h
   SRCS
     qwen2_attention.cpp
@@ -35,6 +36,7 @@ cc_library(
     activation.cpp
     attention_metadata_builder.cpp
     dp_utils.cpp
+    cp_utils.cpp
     add_matmul.cpp
   DEPS
     "-Wl,--whole-archive"
