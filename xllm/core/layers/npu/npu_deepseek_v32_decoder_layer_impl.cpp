@@ -815,8 +815,9 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
   auto& dp_ep_padding = input_params.dp_ep_padding_data;
+  auto& cp_inputs = input_params.cp_prefill_inputs;
 
-  if (dp_size_ <= 1 && ep_size_ <= 1) {
+  if (dp_size_ <= 1 && ep_size_ <= 1 || cp_size_ > 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
   }
   // set micro batch 0 input part
@@ -944,7 +945,24 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   if (cp_size_ > 1 && is_prefill) {
-    
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_o_recover_idx);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_kv_recover_idx);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.k_gather_index_prev);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.k_gather_index_next);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.actual_seq_lengths_query_prev);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.actual_seq_lengths_query_next);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.actual_seq_lengths_key_prev);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
+    atb_speed::Utils::AtTensor2Tensor(cp_inputs.actual_seq_lengths_key_next);
   }
 
   if (FLAGS_enable_eplb && layer_id_ >= layer_param_.firstKDenseReplace) {
