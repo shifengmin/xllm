@@ -26,61 +26,11 @@ limitations under the License.
 
 #include "common/cp_runtime_check.h"
 #include "common/global_flags.h"
-#include "layers/common/cp_utils.h"
+#include "framework/model/npu_cp_prepare.h"
 #include "layers/common/rotary_embedding_util.h"
 
 namespace xllm {
 namespace layer {
-
-namespace {
-
-torch::Tensor get_cp_prefill_input_lengths(const ModelInputParams& input_params) {
-  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-  if (input_params.q_seq_lens.defined()) {
-    options = options.device(input_params.q_seq_lens.device());
-  }
-
-  if (!input_params.q_seq_lens_vec.empty()) {
-    const bool is_cumsum = input_params.q_seq_lens_vec.size() ==
-                               static_cast<size_t>(input_params.num_sequences + 1) &&
-                           input_params.q_seq_lens_vec.front() == 0;
-    TORCH_CHECK(is_cumsum ||
-                    input_params.q_seq_lens_vec.size() >=
-                        static_cast<size_t>(input_params.num_sequences),
-                "q_seq_lens_vec size is smaller than num_sequences");
-    std::vector<int32_t> seq_lens;
-    seq_lens.reserve(input_params.num_sequences);
-    if (is_cumsum) {
-      for (int32_t i = 0; i < input_params.num_sequences; ++i) {
-        seq_lens.push_back(static_cast<int32_t>(input_params.q_seq_lens_vec[i + 1] -
-                                                input_params.q_seq_lens_vec[i]));
-      }
-    } else {
-      for (int32_t i = 0; i < input_params.num_sequences; ++i) {
-        seq_lens.push_back(static_cast<int32_t>(input_params.q_seq_lens_vec[i]));
-      }
-    }
-    return torch::tensor(seq_lens, options);
-  }
-
-  if (input_params.q_seq_lens.defined() && input_params.q_seq_lens.dim() == 1) {
-    if (input_params.q_seq_lens.numel() == input_params.num_sequences) {
-      return input_params.q_seq_lens.to(torch::kInt32);
-    }
-    if (input_params.q_seq_lens.numel() == input_params.num_sequences + 1) {
-      auto q_cu = input_params.q_seq_lens.to(torch::kCPU).to(torch::kInt32).contiguous();
-      const int64_t n = q_cu.numel();
-      auto q_cu_next = q_cu.slice(/*dim=*/0, /*start=*/1, /*end=*/n);
-      auto q_cu_prev = q_cu.slice(/*dim=*/0, /*start=*/0, /*end=*/n - 1);
-      auto q_lens = (q_cu_next - q_cu_prev).contiguous();
-      return q_lens.to(options.device());
-    }
-  }
-
-  return torch::empty({0}, options);
-}
-
-}  // namespace
 
 enum DecoderLayerTensorId : int {
   IN_INPUT_NORM_WEIGHT = 0,
@@ -994,32 +944,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   if (cp_size_ > 1 && is_prefill) {
-    const auto cp_input_lengths = get_cp_prefill_input_lengths(input_params);
-    TORCH_CHECK(cp_input_lengths.defined() &&
-                    cp_input_lengths.dim() == 1 &&
-                    cp_input_lengths.numel() == input_params.num_sequences,
-                "invalid cp_input_lengths for CP prefill");
-    const auto cp_inputs =
-        prepare_cp_prefill_atb_inputs(cp_size_, cp_input_lengths);
-    cp_check::XLLM_CPCHK_CHECK_CP_PREFILL_TENSOR_SHAPES(
-        "NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack",
-        input_params,
-        cp_inputs.seq_len_cp,
-        cp_inputs.cp_load_balance_idx_first,
-        cp_inputs.cp_load_balance_idx_last,
-        cp_inputs.cp_o_recover_idx,
-        cp_inputs.cp_kv_recover_idx,
-        cp_size_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.seq_len_cp);
+        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.seq_len_cp);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx_first);
+        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_load_balance_idx_first);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_load_balance_idx_last);
+        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_load_balance_idx_last);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_o_recover_idx);
+        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_o_recover_idx);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_kv_recover_idx);
+        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_kv_recover_idx);
   }
 
   if (FLAGS_enable_eplb && layer_id_ >= layer_param_.firstKDenseReplace) {

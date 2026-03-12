@@ -57,17 +57,6 @@ cc_library(
     $<$<BOOL:${USE_MUSA}>:musa_layers>
 )
 
-cc_library(
-  NAME
-    cp_utils
-  HDRS
-    cp_utils.h
-  SRCS
-    cp_utils.cpp
-  DEPS
-    torch
-)
-
 if(USE_MLU)
   add_subdirectory(tests)
 endif()
