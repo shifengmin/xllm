@@ -924,11 +924,34 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
+  std::vector<std::vector<RawForwardInput>> cp_partitioned_inputs(static_cast<size_t>(dp_size_));
+
+  if (cp_size_ > 1) {
+    for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (!raw_forward_inputs[dp_rank].batch_forward_type.is_prefill()) {
+        continue;
+      }
+      auto& inputs_per_cp = cp_partitioned_inputs[dp_rank];
+      inputs_per_cp.reserve(cp_size_);
+      for (uint32_t cp_rank = 0; cp_rank < cp_size_; ++cp_rank) {
+        inputs_per_cp.emplace_back(
+            raw_forward_inputs[dp_rank].cp_partition(cp_rank, cp_size_));
+      }
+    }
+  }
+
   // update dp related global paramters and then execute model
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
-    auto dp_rank = worker_rank / dp_local_size_;
-    futures.emplace_back(
-        worker_clients_[worker_rank]->step_async(raw_forward_inputs[dp_rank]));
+    const int32_t dp_rank = worker_rank / dp_local_size_;
+    const RawForwardInput* input_to_send = &raw_forward_inputs[dp_rank];
+    if (cp_size_ > 1 && raw_forward_inputs[dp_rank].batch_forward_type.is_prefill()) {
+      const int32_t local_rank_in_dp_group = worker_rank % dp_local_size_;
+      const int32_t cp_rank = local_rank_in_dp_group / dp_local_tp_size_;
+      CHECK_GE(cp_rank, 0);
+      CHECK_LT(cp_rank, static_cast<int32_t>(cp_size_));
+      input_to_send = &cp_partitioned_inputs[dp_rank][cp_rank];
+    }
+    futures.emplace_back(worker_clients_[worker_rank]->step_async(*input_to_send));
   }
 
   // wait for the all future to complete

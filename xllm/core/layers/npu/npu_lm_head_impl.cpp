@@ -70,6 +70,8 @@ void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
       parallelInfo.InitCommDomain(
           param.linearParallelParam.tensorParallelInfo.hcommInfo,
           param.linearParallelParam.tensorParallelInfo.commDomain);
+      param.contextParallelInfo =
+          parallel_args.mapping().Get(atb_speed::base::ATTN_CP);
     }
   }
 }

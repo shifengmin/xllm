@@ -111,17 +111,6 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
-int32_t resolve_cp_rank(const ParallelArgs& parallel_args) {
-  const int32_t cp_size = std::max(1, parallel_args.cp_size());
-  if (cp_size <= 1) {
-    return 0;
-  }
-  const int32_t dp_size = std::max(1, parallel_args.dp_size());
-  const int32_t tp_size =
-      std::max(1, parallel_args.world_size() / (dp_size * cp_size));
-  return (parallel_args.rank() / tp_size) % cp_size;
-}
-
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
@@ -527,28 +516,15 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 #endif
   c10::StreamGuard streamGuard = prepare_stream_->set_stream_guard();
-  cp_check::XLLM_CPCHK_CHECK_PARALLEL_ROLE(
-      "WorkerImpl::prepare_work_before_execute",
-      parallel_args_.rank(),
-      parallel_args_.world_size(),
-      parallel_args_.dp_size(),
-      parallel_args_.cp_size());
-
-  ForwardInput partitioned_input = input;
-  if (parallel_args_.cp_size() > 1 &&
-      input.input_params.batch_forward_type.is_prefill()) {
-    const int32_t cp_rank = resolve_cp_rank(parallel_args_);
-    cp_check::XLLM_CPCHK_CHECK_CP_RANK(
-        "WorkerImpl::prepare_work_before_execute",
-        cp_rank,
-        parallel_args_.rank(),
-        parallel_args_.world_size(),
-        parallel_args_.dp_size(),
-        parallel_args_.cp_size());
-    partitioned_input = input.cp_partition(cp_rank, parallel_args_.cp_size());
+  if (parallel_args_.cp_size() > 1) {
+    processed_input.input_params.cp_prefill_inputs = 
+      prepare_cp_prefill_inputs(
+        parallel_args_.cp_size(),
+        processed_input.token_ids,
+        processed_input.positions,
+        processed_input.input_params.q_seq_lens);
   }
-
-  processed_input = partitioned_input.to(device_, dtype_);
+  processed_input = input.to(device_, dtype_);
   auto& input_params = processed_input.input_params;
 #if defined(USE_NPU)
   if (input_params.swap_blocks.size() > 0 && !FLAGS_enable_block_copy_kernel) {
@@ -580,6 +556,8 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 
   if (!context_.get_parallel_args().mapping_data().empty() &&
+      !(context_.get_parallel_args().cp_size() > 1)
+      &&
       (context_.get_parallel_args().dp_size() > 1 ||
        context_.get_parallel_args().ep_size() > 1)) {
     torch::Tensor token_size_per_dp_group =
