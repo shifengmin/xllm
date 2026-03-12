@@ -196,15 +196,18 @@ namespace xllm {
 
         inputs.cp_kv_recover_idx = generate_cp_kv_recover_idx(cp_size, input_ids.numel(), chunk_lengths);
 
+        auto input_lengths_cumsum = torch::cumsum(input_lengths, 0, torch::kInt32);
         auto [input_lengths_cumsum_cp_prev, input_lengths_cumsum_cp_next] =
             compute_input_lengths_cumsum_cp(input_lengths_cumsum);
 
-        auto position_ids_prev = position_ids.index({input_lengths_cumsum_cp_prev - 1}) + 1;
-        auto position_ids_next = position_ids.index({input_lengths_cumsum_cp_next - 1}) + 1;
+        auto gather_index_prev = (input_lengths_cumsum_cp_prev - 1).to(torch::kLong);
+        auto gather_index_next = (input_lengths_cumsum_cp_next - 1).to(torch::kLong);
+        auto position_ids_prev = position_ids.index_select(0, gather_index_prev) + 1;
+        auto position_ids_next = position_ids.index_select(0, gather_index_next) + 1;
         auto actual_seq_lengths_kv_cp_prev = position_ids_prev.to(torch::kInt32);
         auto actual_seq_lengths_kv_cp_next = position_ids_next.to(torch::kInt32);
 
-        std::tie(inputs.k_gather_index_prev, inputs.k_gather_index_prev) = generate_k_gather_index(
+        std::tie(inputs.k_gather_index_prev, inputs.k_gather_index_next) = generate_k_gather_index(
             actual_seq_lengths_kv_cp_prev,
             actual_seq_lengths_kv_cp_next,
             input_lengths,
