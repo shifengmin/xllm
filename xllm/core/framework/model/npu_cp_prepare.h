@@ -38,7 +38,6 @@ struct CpPrefillInputs {
 CpPrefillInputs prepare_cp_prefill_inputs(int cp_size,
             const torch::Tensor& input_ids,
             const torch::Tensor& position_ids,
-            const torch::Tensor& input_lengths_cumsum,
             const torch::Tensor& input_lengths);
 
 }  // namespace xllm

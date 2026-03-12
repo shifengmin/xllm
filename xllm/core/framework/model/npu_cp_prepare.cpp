@@ -212,8 +212,8 @@ namespace xllm {
 
         auto actual_seq_lengths_kv_cp_prev_cumsum = torch::cumsum(actual_seq_lengths_kv_cp_prev, 0, torch::kInt32);
         auto actual_seq_lengths_kv_cp_next_cumsum = torch::cumsum(actual_seq_lengths_kv_cp_next, 0, torch::kInt32);
-        inputs.actual_seq_lengths_key_prev = {actual_seq_lengths_kv_cp_prev_cumsum, actual_seq_lengths_kv_cp_next_cumsum};
-        inputs.actual_seq_lengths_key_next = {actual_seq_lengths_kv_cp_prev_cumsum, actual_seq_lengths_kv_cp_next_cumsum};
+        inputs.actual_seq_lengths_key_prev = actual_seq_lengths_kv_cp_prev_cumsum;
+        inputs.actual_seq_lengths_key_next = actual_seq_lengths_kv_cp_next_cumsum;
 
         auto input_lengths_cumsum_half = input_lengths_cumsum / 2;
         inputs.actual_seq_lengths_query_prev = input_lengths_cumsum_half;

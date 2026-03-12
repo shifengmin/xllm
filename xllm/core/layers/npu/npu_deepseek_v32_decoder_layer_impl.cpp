@@ -944,16 +944,7 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   if (cp_size_ > 1 && is_prefill) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.seq_len_cp);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_load_balance_idx_first);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_load_balance_idx_last);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_o_recover_idx);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + offset++) =
-        atb_speed::Utils::AtTensor2Tensor(cp_prefill_inputs.cp_kv_recover_idx);
+    
   }
 
   if (FLAGS_enable_eplb && layer_id_ >= layer_param_.firstKDenseReplace) {

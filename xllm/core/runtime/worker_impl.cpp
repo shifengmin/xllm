@@ -516,7 +516,7 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   }
 #endif
   c10::StreamGuard streamGuard = prepare_stream_->set_stream_guard();
-  if (cparallel_args_.cp_size() > 1) {
+  if (parallel_args_.cp_size() > 1) {
     processed_input.input_params.cp_prefill_inputs = 
       prepare_cp_prefill_inputs(
         parallel_args_.cp_size(),
