@@ -102,12 +102,17 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
 std::vector<std::string> KVCacheTransfer::rotate_dst_rank(
     const std::vector<std::string>& keys,
     int32_t kv_split_rank) {
-  int32_t offset = kv_split_rank;
+  if (keys.empty()) {
+    return keys;
+  }
+  std::vector<std::string> sorted_keys = keys;
+  std::sort(sorted_keys.begin(), sorted_keys.end());
+  const size_t n = sorted_keys.size();
+  const size_t offset = static_cast<size_t>(kv_split_rank) % n;
   std::vector<std::string> rotated_keys;
-  auto sorted_keys = keys;
-  std::sort(sorted_key.begin(), sorted_keys.end());
-  for (int32_t i = 0; i < keys.size(); i++) {
-    rotated_keys.emplace_back(keys[(i + offset) % keys.size()]);
+  rotated_keys.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    rotated_keys.push_back(sorted_keys[(i + offset) % n]);
   }
   return rotated_keys;
 }
