@@ -142,6 +142,10 @@ class RemoteWorker : public WorkerClient {
   virtual folly::SemiFuture<int64_t> get_active_activation_memory_async()
       override;
 
+  void log_pd_kv_block_head3(const char* tag,
+                             const std::string& req_id,
+                             const std::vector<uint64_t>& block_ids) override;
+
   // Check if the connection to worker is healthy
   bool check_health();
 

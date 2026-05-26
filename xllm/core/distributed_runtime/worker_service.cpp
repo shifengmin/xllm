@@ -408,6 +408,21 @@ void WorkerService::PullKVCache(::google::protobuf::RpcController* controller,
   return;
 }
 
+void WorkerService::LogPDKvBlockHead3(
+    ::google::protobuf::RpcController* controller,
+    const proto::LogPDKvBlockHead3Request* req,
+    proto::Status* resp,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    std::vector<uint64_t> block_ids(req->block_ids().begin(),
+                                    req->block_ids().end());
+    worker_->log_pd_kv_block_head3(
+        req->tag().c_str(), req->req_id(), block_ids);
+    resp->set_ok(true);
+  });
+}
+
 void WorkerService::TransferBlocks(
     ::google::protobuf::RpcController* controller,
     const proto::BlockTransferInfos* req,

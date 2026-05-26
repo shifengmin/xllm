@@ -773,7 +773,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     request->sequences()[0]->append_token(first_token);
   }
 
-  // pull kv cache
+  // pull kv cache / debug log received KV blocks on worker process
   if (kv_cache_transfer_mode == "PULL") {
     const auto blocks = request->sequences()[0]->kv_state().kv_blocks();
     std::vector<uint64_t> dst_block_ids;
@@ -792,6 +792,9 @@ bool DisaggPDScheduler::decode_recv_first_generation(
                             src_block_ids,
                             dst_dp_rank,
                             dst_block_ids);
+    LOG(INFO) << "[PD_KV_TRANSFER] D trigger kv_head3 log"
+              << " req_id=" << req_id << " dp_rank=" << dst_dp_rank
+              << " mode=PULL block_count=" << dst_block_ids.size();
     engine_->log_pd_kv_block_head3(
         "D after_first_token", req_id, dst_dp_rank, dst_block_ids);
   } else if (kv_cache_transfer_mode == "PUSH") {
@@ -803,10 +806,15 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     for (size_t i = shared_num; i < blocks.size(); ++i) {
       block_ids.push_back(static_cast<uint64_t>(blocks[i].id()));
     }
-    engine_->log_pd_kv_block_head3("D after_first_token",
-                                   req_id,
-                                   request->sequences()[0]->dp_rank(),
-                                   block_ids);
+    const int32_t dst_dp_rank = request->sequences()[0]->dp_rank();
+    LOG(INFO) << "[PD_KV_TRANSFER] D trigger kv_head3 log"
+              << " req_id=" << req_id << " dp_rank=" << dst_dp_rank
+              << " mode=PUSH block_count=" << block_ids.size();
+    engine_->log_pd_kv_block_head3(
+        "D after_first_token", req_id, dst_dp_rank, block_ids);
+  } else {
+    LOG(WARNING) << "[PD_KV_TRANSFER] D skip kv_head3 log, unknown mode="
+                 << kv_cache_transfer_mode << " req_id=" << req_id;
   }
 
   request_queue_.write(request);

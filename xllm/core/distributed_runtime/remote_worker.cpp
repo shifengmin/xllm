@@ -350,6 +350,13 @@ folly::SemiFuture<int64_t> RemoteWorker::get_active_activation_memory_async() {
 
 bool RemoteWorker::check_health() { return channel_->check_health(); }
 
+void RemoteWorker::log_pd_kv_block_head3(
+    const char* tag,
+    const std::string& req_id,
+    const std::vector<uint64_t>& block_ids) {
+  channel_->log_pd_kv_block_head3(tag, req_id, block_ids);
+}
+
 folly::SemiFuture<bool> RemoteWorker::sleep_async(MasterStatus master_status) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();

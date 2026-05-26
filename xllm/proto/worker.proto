@@ -77,6 +77,12 @@ message PullKVCacheRequest {
   repeated uint64 dst_blocks = 5;
 }
 
+message LogPDKvBlockHead3Request {
+  string tag = 1;
+  string req_id = 2;
+  repeated uint64 block_ids = 3;
+}
+
 enum TransferType {
   G2H = 0;
   H2D = 1;
@@ -329,6 +335,7 @@ service DistributeWorker {
   rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
+  rpc LogPDKvBlockHead3(LogPDKvBlockHead3Request) returns (Status) {}
   rpc GetDeviceInfo(Empty) returns (DeviceInfo) {}
   rpc GetCacheInfo(Empty) returns (CacheInfo) {}
   rpc LinkCluster(ClusterInfo) returns (Status) {}

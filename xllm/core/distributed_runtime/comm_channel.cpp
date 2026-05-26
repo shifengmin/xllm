@@ -287,6 +287,26 @@ bool CommChannel::pull_kv_blocks(const uint64_t src_cluster_id,
   return !cntl.Failed() && s.ok();
 }
 
+bool CommChannel::log_pd_kv_block_head3(
+    const char* tag,
+    const std::string& req_id,
+    const std::vector<uint64_t>& block_ids) {
+  proto::LogPDKvBlockHead3Request request;
+  request.set_tag(tag != nullptr ? tag : "");
+  request.set_req_id(req_id);
+  ADD_VECTOR_TO_PROTO(request.mutable_block_ids(), block_ids);
+
+  proto::Status status;
+  brpc::Controller cntl;
+  stub_->LogPDKvBlockHead3(&cntl, &request, &status, nullptr);
+  if (cntl.Failed() || !status.ok()) {
+    LOG(ERROR) << "LogPDKvBlockHead3 failed, req_id=" << req_id
+               << ", error=" << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
 void CommChannel::execute_model_async(
     const ForwardInput& input,
     folly::Promise<std::optional<RawForwardOutput>>& promise) {

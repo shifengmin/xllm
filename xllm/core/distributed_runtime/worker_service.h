@@ -75,6 +75,11 @@ class WorkerService : public proto::DistributeWorker {
                    proto::Status* resp,
                    ::google::protobuf::Closure* done) override;
 
+  void LogPDKvBlockHead3(::google::protobuf::RpcController* controller,
+                         const proto::LogPDKvBlockHead3Request* req,
+                         proto::Status* resp,
+                         ::google::protobuf::Closure* done) override;
+
   void TransferBlocks(::google::protobuf::RpcController* controller,
                       const proto::BlockTransferInfos* req,
                       proto::TransferStatus* resp,

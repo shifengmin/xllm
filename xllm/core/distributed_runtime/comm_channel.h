@@ -83,6 +83,10 @@ class CommChannel {
                               const std::vector<uint64_t>& src_blocks,
                               const std::vector<uint64_t>& dst_blocks);
 
+  virtual bool log_pd_kv_block_head3(const char* tag,
+                                     const std::string& req_id,
+                                     const std::vector<uint64_t>& block_ids);
+
   virtual void execute_model_async(
       const ForwardInput& input,
       folly::Promise<std::optional<RawForwardOutput>>& promise);
