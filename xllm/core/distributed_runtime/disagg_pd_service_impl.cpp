@@ -17,14 +17,34 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <string>
+
 #include "common/global_flags.h"
 #include "common/types.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "distributed_runtime/llm_engine.h"
 #include "framework/request/request_output.h"
 #include "scheduler/disagg_pd_scheduler.h"
+#include "util/utils.h"
 
 namespace xllm {
+
+namespace {
+
+std::string format_block_ids(const std::vector<int32_t>& block_ids) {
+  std::string out = "[";
+  for (size_t i = 0; i < block_ids.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += std::to_string(block_ids[i]);
+  }
+  out += "]";
+  return out;
+}
+
+}  // namespace
 
 DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
                                          Engine* engine)
@@ -177,6 +197,20 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         *(resp->mutable_blocks_ids()->Add()) = block_id;
         block_ids.push_back(block_id);
       }
+      const int32_t block_size =
+          blocks.empty() ? 0 : static_cast<int32_t>(blocks[0].size());
+      const size_t prompt_tokens =
+          req.prompt_tokens().empty()
+              ? static_cast<size_t>(sequence->num_tokens())
+              : static_cast<size_t>(req.prompt_tokens().size());
+      LOG(INFO) << "[PD_KV_TRANSFER] D allocated remote blocks"
+                << " req_id=" << req.req_id() << " dp_rank=" << dp_rank
+                << " prompt_tokens=" << prompt_tokens
+                << " block_size=" << block_size
+                << " num_blocks=" << block_ids.size()
+                << " block_ids=" << format_block_ids(block_ids)
+                << " prefill_kv_split_size="
+                << util::prefill_kv_split_size_effective();
       // XTensor mode: calculate and return GlobalXTensor offsets
       if (::xllm::KVCacheConfig::get_instance().enable_xtensor() &&
           !block_ids.empty()) {

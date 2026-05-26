@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <string>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -36,6 +37,38 @@ limitations under the License.
 #endif
 
 namespace xllm {
+
+namespace {
+
+std::string format_u64_block_ids(const std::vector<uint64_t>& block_ids) {
+  std::string out = "[";
+  for (size_t i = 0; i < block_ids.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += std::to_string(block_ids[i]);
+  }
+  out += "]";
+  return out;
+}
+
+void log_pd_kv_push_blocks(const std::vector<TransferKVInfo>& kv_infos,
+                           const ParallelArgs& parallel_args,
+                           int32_t kv_split_size) {
+  for (const auto& info : kv_infos) {
+    LOG(INFO) << "[PD_KV_TRANSFER] P push_kv_blocks"
+              << " worker_rank=" << parallel_args.rank()
+              << " cp_rank=" << parallel_args.cp_rank()
+              << " kv_split_rank=" << parallel_args.kv_split_rank()
+              << " kv_split_size=" << kv_split_size
+              << " req_id=" << info.request_id
+              << " local_blocks=" << format_u64_block_ids(info.local_blocks_ids)
+              << " remote_blocks="
+              << format_u64_block_ids(info.remote_blocks_ids);
+  }
+}
+
+}  // namespace
 
 folly::SemiFuture<bool> KVCacheTransfer::pull_kv_blocks_async(
     const uint64_t src_cluster_id,
@@ -143,10 +176,17 @@ folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
           parallel_args.kv_split_rank(), kv_split_size, *kv_infos);
       kv_infos = &filtered_kv_infos;
       if (kv_infos->empty()) {
+        LOG(INFO) << "[PD_KV_TRANSFER] P push_kv_blocks skipped (empty after "
+                     "kv_split filter)"
+                  << " worker_rank=" << parallel_args.rank()
+                  << " cp_rank=" << parallel_args.cp_rank()
+                  << " kv_split_rank=" << parallel_args.kv_split_rank()
+                  << " kv_split_size=" << kv_split_size;
         promise.setValue(true);
         return;
       }
     }
+    log_pd_kv_push_blocks(*kv_infos, parallel_args, kv_split_size);
     merge_kv_blocks(merged_kv_infos, *kv_infos, parallel_args);
     bool success = true;
     if (!merged_kv_infos.empty()) {
