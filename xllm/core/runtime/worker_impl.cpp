@@ -1448,19 +1448,23 @@ void WorkerImpl::log_pd_kv_block_head3(const char* tag,
     return;
   }
   device_.synchronize_default_stream();
-  const xllm::KVCache& layer0_cache = kv_caches_.front();
-  const torch::Tensor k_cache = layer0_cache.get_k_cache();
-  const torch::Tensor v_cache = layer0_cache.get_v_cache();
-  const bool has_v_cache = v_cache.defined() && v_cache.numel() > 0;
   for (uint64_t block_id : block_ids) {
-    LOG(INFO) << "[PD_KV_TRANSFER] " << tag
-              << " worker_rank=" << parallel_args_.rank()
-              << " req_id=" << req_id << " block_id=" << block_id << " k_head3="
-              << format_kv_block_head3(k_cache, static_cast<int64_t>(block_id))
-              << " v_head3="
-              << (has_v_cache ? format_kv_block_head3(
-                                    v_cache, static_cast<int64_t>(block_id))
-                              : "n/a");
+    for (size_t layer_idx = 0; layer_idx < kv_caches_.size(); ++layer_idx) {
+      const xllm::KVCache& layer_cache = kv_caches_[layer_idx];
+      const torch::Tensor k_cache = layer_cache.get_k_cache();
+      const torch::Tensor v_cache = layer_cache.get_v_cache();
+      const bool has_v_cache = v_cache.defined() && v_cache.numel() > 0;
+      LOG(INFO) << "[PD_KV_TRANSFER] " << tag
+                << " worker_rank=" << parallel_args_.rank()
+                << " req_id=" << req_id << " block_id=" << block_id
+                << " layer=" << layer_idx << " k_head3="
+                << format_kv_block_head3(k_cache,
+                                         static_cast<int64_t>(block_id))
+                << " v_head3="
+                << (has_v_cache ? format_kv_block_head3(
+                                      v_cache, static_cast<int64_t>(block_id))
+                                : "n/a");
+    }
   }
 }
 
