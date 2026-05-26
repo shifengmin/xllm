@@ -769,6 +769,22 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
       (needs_kv_split_prep ||
        ::xllm::KVCacheConfig::get_instance().enable_prefix_cache() ||
        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill());
+  // [PD_KV_TRANSFER] Surface why slot remap may be skipped. If a DECODE batch
+  // runs with enable_kvcache_split=1 but does_remap=0, that is exactly the
+  // logical-to-physical slot mismatch path that corrupts KV cache.
+  const auto& bft = input.input_params.meta.batch_forward_type;
+  LOG_EVERY_N(INFO, 50) << "[PD_KV_TRANSFER] worker prepare gating"
+                        << " worker_rank=" << parallel_args_.rank()
+                        << " cp_size=" << parallel_args_.cp_size()
+                        << " kv_split_size_effective="
+                        << parallel_args_.kv_split_size_effective()
+                        << " enable_kvcache_split="
+                        << util::enable_kvcache_split()
+                        << " is_decode=" << bft.is_decode()
+                        << " is_prefill=" << bft.is_prefill()
+                        << " needs_cp_prefill_side=" << needs_cp_prefill_side
+                        << " does_slot_remap=" << needs_kv_split_prep
+                        << " does_in_prefix_slots=" << needs_in_prefix_slots;
 #endif
 
   auto prepare_device_on_stream = [&]() {

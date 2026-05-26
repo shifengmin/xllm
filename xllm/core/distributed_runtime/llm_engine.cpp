@@ -469,6 +469,40 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
             << ", n_layers: " << kv_cache_cap.n_layers()
             << ", kv_cache_dtype: " << options_.kv_cache_dtype();
 
+  // [PD_KV_TRANSFER] Dump per-instance PD / CP / KV-split config so the two
+  // sides can be diff'ed at a glance. Key invariants to verify across P and D:
+  //   - P.kv_split_size_effective() == D.prefill_kv_split_size_effective()
+  //   - block_size_logical = block_size_phys * kv_split_size_effective()
+  //   - On D in kv_split mode, BlockManager block_size MUST equal P's
+  //     block_size_logical, otherwise the all_remote <-> local mapping in
+  //     batch_input_builder::setup_kv_cache_info will be off by K.
+  LOG(INFO) << "[PD_KV_TRANSFER] instance config dump"
+            << " role="
+            << (options_.instance_role() == InstanceRole::PREFILL
+                    ? "PREFILL"
+                    : (options_.instance_role() == InstanceRole::DECODE
+                           ? "DECODE"
+                           : "DEFAULT"))
+            << " enable_disagg_pd=" << options_.enable_disagg_pd()
+            << " dp_size=" << ::xllm::ParallelConfig::get_instance().dp_size()
+            << " cp_size=" << ::xllm::ParallelConfig::get_instance().cp_size()
+            << " kv_split_size_raw="
+            << ::xllm::ParallelConfig::get_instance().kv_split_size()
+            << " kv_split_size_effective="
+            << ::xllm::ParallelConfig::get_instance().kv_split_size_effective()
+            << " prefill_kv_split_size_raw="
+            << ::xllm::ParallelConfig::get_instance().prefill_kv_split_size()
+            << " prefill_kv_split_size_effective="
+            << ::xllm::ParallelConfig::get_instance()
+                   .prefill_kv_split_size_effective()
+            << " enable_kvcache_split=" << util::enable_kvcache_split()
+            << " block_size_phys=" << kv_cache_cap.block_size()
+            << " n_blocks_phys=" << kv_cache_cap.n_blocks()
+            << " enable_prefix_cache="
+            << ::xllm::KVCacheConfig::get_instance().enable_prefix_cache()
+            << " enable_chunked_prefill="
+            << ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill();
+
   CHECK_GT(kv_cache_cap.n_blocks(), 0) << "no memory for kv cache";
   const int32_t block_size = static_cast<int32_t>(kv_cache_cap.block_size());
   const bool enable_gdn_attention = has_linear_attention_layers(args_);
@@ -484,10 +518,25 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // skipping the prefix AllGather.
   const int32_t kv_split_size_eff =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  const int32_t logical_block_size =
+      kv_split_size_eff > 1 ? block_size * kv_split_size_eff : block_size;
+  // [PD_KV_TRANSFER] BlockManager block_size MUST equal across P and D when
+  // running PD + KV-split, or P's per-rank stride expansion in
+  // setup_kv_cache_info will not line up with D's allocated remote_blocks_ids.
+  LOG(INFO) << "[PD_KV_TRANSFER] BlockManager config"
+            << " role="
+            << (options_.instance_role() == InstanceRole::PREFILL
+                    ? "PREFILL"
+                    : (options_.instance_role() == InstanceRole::DECODE
+                           ? "DECODE"
+                           : "DEFAULT"))
+            << " block_size_phys=" << block_size
+            << " kv_split_size_eff=" << kv_split_size_eff
+            << " block_size_logical=" << logical_block_size
+            << " n_blocks=" << kv_cache_cap.n_blocks();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
-      .block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff
-                                        : block_size)
+      .block_size(logical_block_size)
       .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
       .enable_linear_state(enable_gdn_attention)
       .enable_prefix_cache(
@@ -729,6 +778,27 @@ bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
   int32_t src_tp_size = src_cp_tp_size / src_kv_split_size;
   int32_t src_dp_worker_index = 0;
 
+  // [PD_KV_TRANSFER] What this D instance THINKS P looks like. If
+  // src_kv_split_size here is 1 but P actually has cp_size > 1 with KV-split
+  // on, each D worker will only link to 1 of K P workers per (dp_i, tp_k)
+  // tuple, and the remaining K-1 P workers' KV will never reach D.
+  LOG(INFO) << "[PD_KV_TRANSFER] D link_cluster (P topology as seen by D)"
+            << " src_world_size=" << src_world_size
+            << " src_dp_size=" << src_dp_size
+            << " src_kv_split_size=" << src_kv_split_size
+            << " src_cp_tp_size=" << src_cp_tp_size
+            << " src_tp_size=" << src_tp_size
+            << " local_worker_clients_num=" << worker_clients_num_
+            << " local_dp_local_tp_size=" << dp_local_tp_size_;
+  CHECK_GT(src_kv_split_size, 0)
+      << "src_kv_split_size must be positive (check D's "
+         "--prefill_kv_split_size).";
+  CHECK_EQ(src_cp_tp_size % src_kv_split_size, 0)
+      << "src_cp_tp_size (" << src_cp_tp_size
+      << ") must be divisible by src_kv_split_size (" << src_kv_split_size
+      << "). Likely D's --prefill_kv_split_size does not match P's "
+         "--kv_split_size.";
+
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_num_);
   for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
@@ -742,6 +812,8 @@ bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
     target_device_ips.reserve(src_dp_size * src_kv_split_size);
     target_ports.reserve(src_dp_size * src_kv_split_size);
 
+    std::vector<int32_t> linked_p_indices;
+    linked_p_indices.reserve(src_dp_size * src_kv_split_size);
     for (int32_t dp_i = 0; dp_i < src_dp_size; ++dp_i) {
       for (int32_t split_j = 0; split_j < src_kv_split_size; ++split_j) {
         int32_t p_idx =
@@ -750,7 +822,31 @@ bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
         target_addrs.emplace_back(addrs[p_idx]);
         target_device_ips.emplace_back(device_ips[p_idx]);
         target_ports.emplace_back(ports[p_idx]);
+        linked_p_indices.push_back(p_idx);
       }
+    }
+
+    // [PD_KV_TRANSFER] Per-D-worker linked P workers. With KV-split, each D
+    // worker MUST see src_kv_split_size targets per dp_i (i.e. total =
+    // src_dp_size * src_kv_split_size). If you see "src_kv_split_size=1" here
+    // while P is actually K-way split, half of P will never push to this D
+    // worker.
+    {
+      std::ostringstream linked;
+      linked << "[";
+      for (size_t k = 0; k < linked_p_indices.size(); ++k) {
+        if (k > 0) {
+          linked << ",";
+        }
+        linked << linked_p_indices[k];
+      }
+      linked << "]";
+      LOG(INFO) << "[PD_KV_TRANSFER] D link_cluster mapping"
+                << " d_worker_rank=" << worker_rank
+                << " src_dp_worker_index=" << src_dp_worker_index
+                << " num_targets=" << linked_p_indices.size()
+                << " expected_targets=" << src_dp_size * src_kv_split_size
+                << " linked_p_indices=" << linked.str();
     }
 
     src_dp_worker_index = (src_dp_worker_index + 1) % src_tp_size;

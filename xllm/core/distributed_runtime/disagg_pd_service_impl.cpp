@@ -203,14 +203,22 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
           req.prompt_tokens().empty()
               ? static_cast<size_t>(sequence->num_tokens())
               : static_cast<size_t>(req.prompt_tokens().size());
-      LOG(INFO) << "[PD_KV_TRANSFER] D allocated remote blocks"
-                << " req_id=" << req.req_id() << " dp_rank=" << dp_rank
-                << " prompt_tokens=" << prompt_tokens
-                << " block_size=" << block_size
-                << " num_blocks=" << block_ids.size()
-                << " block_ids=" << format_block_ids(block_ids)
-                << " prefill_kv_split_size="
-                << util::prefill_kv_split_size_effective();
+      // [PD_KV_TRANSFER] Cross-check with P's setup_kv_cache_info: P expects
+      // num_blocks == ceil(prompt_tokens / block_size_phys_on_P), which (when
+      // KV-split is on at P) equals ceil(prompt_tokens / phys) regardless of
+      // whether D itself runs KV-split. If "num_blocks" here != that, P's
+      // stride expansion will misalign and KV will not fully land on D.
+      LOG(INFO)
+          << "[PD_KV_TRANSFER] D allocated remote blocks"
+          << " req_id=" << req.req_id() << " dp_rank=" << dp_rank
+          << " prompt_tokens=" << prompt_tokens << " block_size=" << block_size
+          << " num_blocks=" << block_ids.size()
+          << " block_ids=" << format_block_ids(block_ids) << " local_cp_size="
+          << ::xllm::ParallelConfig::get_instance().cp_size()
+          << " local_kv_split_size_effective="
+          << ::xllm::ParallelConfig::get_instance().kv_split_size_effective()
+          << " prefill_kv_split_size="
+          << util::prefill_kv_split_size_effective();
       // XTensor mode: calculate and return GlobalXTensor offsets
       if (::xllm::KVCacheConfig::get_instance().enable_xtensor() &&
           !block_ids.empty()) {

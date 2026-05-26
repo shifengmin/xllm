@@ -133,19 +133,35 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
       continue;
     }
     const size_t n_local = kv_info.local_blocks_ids.size();
+    const size_t n_remote_in = kv_info.remote_blocks_ids.size();
     TransferKVInfo filtered = kv_info;
     filtered.remote_blocks_ids.clear();
     filtered.remote_blocks_ids.reserve(n_local);
+    bool truncated = false;
     for (size_t k = 0; k < n_local; ++k) {
       const size_t remote_idx = static_cast<size_t>(kv_split_rank) +
                                 k * static_cast<size_t>(kv_split_size);
       if (remote_idx >= kv_info.remote_blocks_ids.size()) {
+        truncated = true;
         break;
       }
       filtered.remote_blocks_ids.push_back(
           kv_info.remote_blocks_ids[remote_idx]);
     }
     filtered.local_blocks_ids.resize(filtered.remote_blocks_ids.size());
+    // [PD_KV_TRANSFER] Per-rank slicing audit. With a correctly-sized
+    // all_remote (n_remote_in == n_local * kv_split_size), every rank should
+    // keep all n_local entries. If "truncated=1" you are losing blocks; that
+    // means setup_kv_cache_info upstream over-promised remote indices the D
+    // side never sent.
+    LOG(INFO) << "[PD_KV_TRANSFER] P filter_kv_split_infos"
+              << " req_id=" << kv_info.request_id
+              << " kv_split_rank=" << kv_split_rank
+              << " kv_split_size=" << kv_split_size << " n_local_in=" << n_local
+              << " n_remote_in=" << n_remote_in
+              << " n_kept=" << filtered.remote_blocks_ids.size()
+              << " expected_kept=" << n_local
+              << " truncated=" << (truncated ? 1 : 0);
     if (!filtered.remote_blocks_ids.empty()) {
       filtered_kv_infos.push_back(std::move(filtered));
     }
@@ -257,9 +273,28 @@ void KVCacheTransfer::merge_kv_blocks(
       int32_t linked_dp_rank = i / dst_tp_size;
       linked_dp_ranks.emplace(linked_dp_rank);
     }
+    const bool linked =
+        linked_dp_ranks.find(dst_dp_rank) != linked_dp_ranks.end();
+    // [PD_KV_TRANSFER] Audit P->D rank topology. With CP-on-P + KV-split, we
+    // want: dst_tp_size == src_tp_size (post-CP-strip). If you see
+    // dst_tp_size != src_tp_size here, the P/D TP shapes are incompatible and
+    // many requests will be silently skipped via "linked=0".
+    LOG(INFO) << "[PD_KV_TRANSFER] P merge_kv_blocks dispatch"
+              << " req_id=" << info.request_id << " src_rank=" << src_rank
+              << " src_dp_size=" << src_dp_size
+              << " src_cp_size=" << src_cp_size
+              << " src_world_size=" << src_world_size
+              << " src_tp_size=" << src_tp_size
+              << " src_dp_local_tp_rank=" << src_dp_local_tp_rank
+              << " dst_dp_rank=" << dst_dp_rank
+              << " dst_dp_size=" << dst_dp_size
+              << " dst_world_size=" << dst_world_size
+              << " dst_tp_size=" << dst_tp_size
+              << " num_linked_dp_ranks=" << linked_dp_ranks.size()
+              << " linked=" << (linked ? 1 : 0);
     // If the target DP rank of the request is not linked to the current worker,
     // skip the request.
-    if (linked_dp_ranks.find(dst_dp_rank) == linked_dp_ranks.end()) {
+    if (!linked) {
       continue;
     }
     // The current worker needs to push the KV Cache to all workers in the

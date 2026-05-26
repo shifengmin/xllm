@@ -736,6 +736,22 @@ void BatchInputBuilder::setup_kv_cache_info(
     // util::kv_split_stride_for_kv_transfer).
     const uint32_t kv_split_stride =
         static_cast<uint32_t>(util::kv_split_stride_for_kv_transfer());
+    // [PD_KV_TRANSFER] If D allocated the right number of blocks for KV-split
+    // mode, we expect all_remote.size() == (cur_count - prev_pushed) *
+    // kv_split_stride. A mismatch here means either (a) D was started with the
+    // wrong kv_split_size_effective() / block_size, or (b) the protocol on D
+    // forgot to expand blocks_ids by K. Either way the inner loop below will
+    // silently truncate, leaving some logical positions un-pushed.
+    const uint64_t expected_remote_size =
+        static_cast<uint64_t>(cur_count - prev_pushed) *
+        static_cast<uint64_t>(kv_split_stride);
+    LOG(INFO) << "[PD_KV_TRANSFER] P setup_kv_cache_info"
+              << " req_id=" << transfer_kv_info.value().request_id
+              << " prev_pushed=" << prev_pushed << " cur_count=" << cur_count
+              << " kv_split_stride=" << kv_split_stride
+              << " all_remote_size=" << all_remote.size()
+              << " expected_remote_size=" << expected_remote_size
+              << " match=" << (all_remote.size() == expected_remote_size);
     for (uint32_t k = prev_pushed; k < cur_count; ++k) {
       new_local.push_back(blocks[k].id());
       for (uint32_t j = 0; j < kv_split_stride; j++) {
@@ -744,6 +760,13 @@ void BatchInputBuilder::setup_kv_cache_info(
         }
       }
     }
+    LOG(INFO) << "[PD_KV_TRANSFER] P setup_kv_cache_info built"
+              << " req_id=" << transfer_kv_info.value().request_id
+              << " new_local_size=" << new_local.size()
+              << " new_remote_size=" << new_remote.size()
+              << " full_or_truncated="
+              << (new_remote.size() == expected_remote_size ? "FULL"
+                                                            : "TRUNCATED");
 
     if (!new_local.empty()) {
       state.transfer_kv_infos.emplace_back(transfer_kv_info.value());
