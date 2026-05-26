@@ -58,6 +58,7 @@ limitations under the License.
 #include "core/distributed_runtime/master.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/npu_cp_ep_padding.h"
@@ -1438,6 +1439,29 @@ folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_with_transfer_async(
         promise.setValue(success);
       });
   return future;
+}
+
+void WorkerImpl::log_pd_kv_block_head3(const char* tag,
+                                       const std::string& req_id,
+                                       const std::vector<uint64_t>& block_ids) {
+  if (block_ids.empty() || kv_caches_.empty()) {
+    return;
+  }
+  device_.synchronize_default_stream();
+  const xllm::KVCache& layer0_cache = kv_caches_.front();
+  const torch::Tensor k_cache = layer0_cache.get_k_cache();
+  const torch::Tensor v_cache = layer0_cache.get_v_cache();
+  const bool has_v_cache = v_cache.defined() && v_cache.numel() > 0;
+  for (uint64_t block_id : block_ids) {
+    LOG(INFO) << "[PD_KV_TRANSFER] " << tag
+              << " worker_rank=" << parallel_args_.rank()
+              << " req_id=" << req_id << " block_id=" << block_id << " k_head3="
+              << format_kv_block_head3(k_cache, static_cast<int64_t>(block_id))
+              << " v_head3="
+              << (has_v_cache ? format_kv_block_head3(
+                                    v_cache, static_cast<int64_t>(block_id))
+                              : "n/a");
+  }
 }
 
 folly::SemiFuture<bool> WorkerImpl::pull_kv_blocks_async(

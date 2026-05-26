@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
+#include <sstream>
 
 #include "common/global_flags.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -248,5 +250,36 @@ aclFormat get_npu_kv_cache_format(const std::string& model_type) {
              : ACL_FORMAT_ND;
 }
 #endif
+
+std::string format_kv_block_head3(const torch::Tensor& cache,
+                                  int64_t block_id,
+                                  int32_t head_count) {
+  if (!cache.defined() || cache.numel() == 0 || block_id < 0 ||
+      cache.size(0) <= block_id || head_count <= 0) {
+    return "n/a";
+  }
+  const int64_t block_numel = cache.select(0, block_id).numel();
+  const int64_t sample_numel = std::min<int64_t>(head_count, block_numel);
+  torch::Tensor sample =
+      cache.select(0, block_id)
+          .contiguous()
+          .view({-1})
+          .slice(/*dim=*/0, /*start=*/0, /*end=*/sample_numel)
+          .to(torch::kCPU);
+  if (sample.scalar_type() == torch::kBFloat16 ||
+      sample.scalar_type() == torch::kHalf) {
+    sample = sample.to(torch::kFloat32);
+  }
+  std::ostringstream out;
+  out << "[";
+  for (int64_t i = 0; i < sample.numel(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << sample[i].item<float>();
+  }
+  out << "]";
+  return out.str();
+}
 
 }  // namespace xllm

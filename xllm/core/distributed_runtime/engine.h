@@ -176,6 +176,11 @@ class Engine {
     return false;
   };
 
+  virtual void log_pd_kv_block_head3(const char* tag,
+                                     const std::string& req_id,
+                                     int32_t dp_rank,
+                                     const std::vector<uint64_t>& block_ids) {}
+
  protected:
   // model args
   ModelArgs args_;

@@ -44,6 +44,35 @@ limitations under the License.
 #include "util/timer.h"
 
 namespace xllm {
+namespace {
+
+bool wait_push_kv_and_log_block_head3(
+    LLMWorkerImpl& worker,
+    const ForwardInput& input,
+    std::vector<folly::SemiFuture<bool>>& futures) {
+  if (futures.empty()) {
+    return true;
+  }
+  auto results =
+      folly::collectAll(futures).within(std::chrono::seconds(60)).get();
+  bool success = true;
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "kv_cache_transfer_ failed";
+      success = false;
+      break;
+    }
+  }
+  if (success) {
+    for (const TransferKVInfo& info : input.transfer_kv_infos) {
+      worker.log_pd_kv_block_head3(
+          "P after_push", info.request_id, info.local_blocks_ids);
+    }
+  }
+  return success;
+}
+
+}  // namespace
 
 LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
@@ -170,15 +199,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     // prefill/decode stage, so, to judge transfer_kv_infos.empty,
     if (options_.kv_cache_transfer_mode() == "PUSH" &&
         !input.transfer_kv_infos.empty()) {
-      auto results =
-          folly::collectAll(futures).within(std::chrono::seconds(60)).get();
-      for (const auto& result : results) {
-        // TODO: Add error handling
-        if (!result.value()) {
-          LOG(ERROR) << "kv_cache_transfer_ failed";
-          break;
-        }
-      }
+      wait_push_kv_and_log_block_head3(*this, input, futures);
     }
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       return output;
@@ -241,15 +262,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
-    auto results =
-        folly::collectAll(futures).within(std::chrono::seconds(60)).get();
-    for (const auto& result : results) {
-      // TODO: Add error handling
-      if (!result.value()) {
-        LOG(ERROR) << "kv_cache_transfer_ failed";
-        break;
-      }
-    }
+    wait_push_kv_and_log_block_head3(*this, input, futures);
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());

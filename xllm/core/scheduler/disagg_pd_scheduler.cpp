@@ -792,6 +792,21 @@ bool DisaggPDScheduler::decode_recv_first_generation(
                             src_block_ids,
                             dst_dp_rank,
                             dst_block_ids);
+    engine_->log_pd_kv_block_head3(
+        "D after_first_token", req_id, dst_dp_rank, dst_block_ids);
+  } else if (kv_cache_transfer_mode == "PUSH") {
+    const auto blocks = request->sequences()[0]->kv_state().kv_blocks();
+    const size_t shared_num =
+        request->sequences()[0]->kv_state().shared_kv_blocks_num();
+    std::vector<uint64_t> block_ids;
+    block_ids.reserve(blocks.size() - shared_num);
+    for (size_t i = shared_num; i < blocks.size(); ++i) {
+      block_ids.push_back(static_cast<uint64_t>(blocks[i].id()));
+    }
+    engine_->log_pd_kv_block_head3("D after_first_token",
+                                   req_id,
+                                   request->sequences()[0]->dp_rank(),
+                                   block_ids);
   }
 
   request_queue_.write(request);

@@ -159,4 +159,9 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
 aclFormat get_npu_kv_cache_format(const std::string& model_type);
 #endif
 
+// Sample the first `head_count` flattened elements of one paged KV block.
+std::string format_kv_block_head3(const torch::Tensor& cache,
+                                  int64_t block_id,
+                                  int32_t head_count = 3);
+
 }  // namespace xllm

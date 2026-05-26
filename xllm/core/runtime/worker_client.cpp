@@ -207,4 +207,13 @@ folly::SemiFuture<int64_t> WorkerClient::get_active_activation_memory_async() {
   return worker_->get_active_activation_memory_async();
 }
 
+void WorkerClient::log_pd_kv_block_head3(
+    const char* tag,
+    const std::string& req_id,
+    const std::vector<uint64_t>& block_ids) {
+  if (worker_ != nullptr) {
+    worker_->log_pd_kv_block_head3(tag, req_id, block_ids);
+  }
+}
+
 }  // namespace xllm

@@ -220,6 +220,12 @@ folly::SemiFuture<int64_t> Worker::get_active_activation_memory_async() {
   return future;
 }
 
+void Worker::log_pd_kv_block_head3(const char* tag,
+                                   const std::string& req_id,
+                                   const std::vector<uint64_t>& block_ids) {
+  impl_->log_pd_kv_block_head3(tag, req_id, block_ids);
+}
+
 bool Worker::sleep(MasterStatus master_status) {
   return impl_->sleep(master_status);
 }

@@ -136,6 +136,11 @@ class LLMEngine : public Engine {
       std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
           layer_offsets) override;
 
+  void log_pd_kv_block_head3(const char* tag,
+                             const std::string& req_id,
+                             int32_t dp_rank,
+                             const std::vector<uint64_t>& block_ids) override;
+
  private:
   friend class SpeculativeEngine;
   // setup workers internal

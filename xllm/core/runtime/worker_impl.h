@@ -154,6 +154,10 @@ class WorkerImpl {
       const std::vector<uint64_t>& src_blocks,
       const std::vector<uint64_t>& dst_blocks);
 
+  void log_pd_kv_block_head3(const char* tag,
+                             const std::string& req_id,
+                             const std::vector<uint64_t>& block_ids);
+
   virtual uint32_t transfer_kv_blocks(
       const uint64_t batch_id,
       const std::vector<BlockTransferInfo>& block_transfer_info);

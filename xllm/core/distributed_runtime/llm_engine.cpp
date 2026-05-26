@@ -1285,4 +1285,22 @@ bool LLMEngine::get_xtensor_offsets_for_blocks(
   return true;
 }
 
+void LLMEngine::log_pd_kv_block_head3(const char* tag,
+                                      const std::string& req_id,
+                                      int32_t dp_rank,
+                                      const std::vector<uint64_t>& block_ids) {
+  if (block_ids.empty() || dp_rank < 0 || worker_clients_.empty()) {
+    return;
+  }
+  const int32_t base_worker_rank = dp_rank * dp_local_tp_size_;
+  for (int32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
+    const int32_t worker_rank = base_worker_rank + tp_rank;
+    if (worker_rank < 0 ||
+        worker_rank >= static_cast<int32_t>(worker_clients_.size())) {
+      continue;
+    }
+    worker_clients_[worker_rank]->log_pd_kv_block_head3(tag, req_id, block_ids);
+  }
+}
+
 }  // namespace xllm

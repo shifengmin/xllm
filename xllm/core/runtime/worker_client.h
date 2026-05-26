@@ -148,6 +148,10 @@ class WorkerClient {
 
   virtual folly::SemiFuture<int64_t> get_active_activation_memory_async();
 
+  void log_pd_kv_block_head3(const char* tag,
+                             const std::string& req_id,
+                             const std::vector<uint64_t>& block_ids);
+
  private:
   Worker* worker_ = nullptr;  // not owend
 };
