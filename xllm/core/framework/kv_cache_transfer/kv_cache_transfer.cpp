@@ -145,6 +145,7 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
       filtered.remote_blocks_ids.push_back(
           kv_info.remote_blocks_ids[remote_idx]);
     }
+    filtered.local_blocks_ids.resize(filtered.remote_blocks_ids.size());
     if (!filtered.remote_blocks_ids.empty()) {
       filtered_kv_infos.push_back(std::move(filtered));
     }
