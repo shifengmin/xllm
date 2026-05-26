@@ -471,6 +471,98 @@ ForwardInput WorkerImpl::update_input_by_last_step_output(
 }
 
 #if defined(USE_NPU)
+namespace {
+
+std::string format_i32_ids(const std::vector<int32_t>& ids) {
+  std::string out = "[";
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += std::to_string(ids[i]);
+  }
+  out += "]";
+  return out;
+}
+
+std::string format_u64_ids(const std::vector<uint64_t>& ids) {
+  std::string out = "[";
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += std::to_string(ids[i]);
+  }
+  out += "]";
+  return out;
+}
+
+std::vector<int32_t> tensor_to_i32_vec(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return {};
+  }
+  torch::Tensor cpu_tensor = tensor.to(torch::kCPU);
+  std::vector<int32_t> out;
+  out.reserve(cpu_tensor.numel());
+  auto acc = cpu_tensor.accessor<int32_t, 1>();
+  for (int64_t i = 0; i < cpu_tensor.numel(); ++i) {
+    out.push_back(acc[i]);
+  }
+  return out;
+}
+
+std::vector<int32_t> unique_blocks_from_slots(const std::vector<int32_t>& slots,
+                                              int32_t block_size) {
+  if (block_size <= 0) {
+    return {};
+  }
+  std::vector<int32_t> blocks;
+  blocks.reserve(slots.size());
+  for (int32_t slot : slots) {
+    if (slot >= 0) {
+      blocks.push_back(slot / block_size);
+    }
+  }
+  std::sort(blocks.begin(), blocks.end());
+  blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+  return blocks;
+}
+
+void log_pd_kv_recomputed_cache_slots(const ForwardInput& input,
+                                      const torch::Tensor& old_cache_slots,
+                                      const torch::Tensor& new_cache_slots,
+                                      const ParallelArgs& parallel_args,
+                                      int32_t block_size) {
+  if (input.transfer_kv_infos.empty()) {
+    return;
+  }
+  const std::vector<int32_t> old_slots = tensor_to_i32_vec(old_cache_slots);
+  const std::vector<int32_t> new_slots = tensor_to_i32_vec(new_cache_slots);
+  std::vector<int32_t> active_new_slots;
+  active_new_slots.reserve(new_slots.size());
+  for (int32_t slot : new_slots) {
+    if (slot >= 0) {
+      active_new_slots.push_back(slot);
+    }
+  }
+  const std::vector<int32_t> cache_blocks =
+      unique_blocks_from_slots(active_new_slots, block_size);
+  for (const auto& info : input.transfer_kv_infos) {
+    LOG(INFO) << "[PD_KV_TRANSFER] P recomputed_cache_slots"
+              << " worker_rank=" << parallel_args.rank()
+              << " cp_rank=" << parallel_args.cp_rank()
+              << " kv_split_rank=" << parallel_args.kv_split_rank()
+              << " kv_split_size=" << parallel_args.kv_split_size_effective()
+              << " req_id=" << info.request_id << " block_size=" << block_size
+              << " old_slots=" << format_i32_ids(old_slots)
+              << " new_slots=" << format_i32_ids(active_new_slots)
+              << " cache_blocks=" << format_i32_ids(cache_blocks)
+              << " push_local=" << format_u64_ids(info.local_blocks_ids);
+  }
+}
+
+}  // namespace
+
 torch::Tensor WorkerImpl::recompute_new_cache_slots(const ForwardInput& input) {
   auto old_cache_slots = input.input_params.attention.device.new_cache_slots;
   int64_t numel = old_cache_slots.numel();
@@ -707,7 +799,14 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
     }
 
     if (needs_kv_split_prep) {
+      const torch::Tensor old_cache_slots =
+          cp_input->input_params.attention.device.new_cache_slots;
       torch::Tensor new_cache_slots = recompute_new_cache_slots(*cp_input);
+      log_pd_kv_recomputed_cache_slots(input,
+                                       old_cache_slots,
+                                       new_cache_slots,
+                                       parallel_args_,
+                                       options_.block_size());
       processed_input.input_params.attention.device.new_cache_slots =
           new_cache_slots.to(device_);
     }
