@@ -99,48 +99,17 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
   return filtered_kv_infos;
 }
 
-std::vector<KVCacheTransfer::PushStep> KVCacheTransfer::BuildPushSchedule(
-    const std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
-    int32_t kv_split_rank,
-    int32_t kv_split_size,
-    int64_t num_layers) {
-  std::vector<PushStep> schedule;
-  if (merged_kv_infos.empty() || num_layers <= 0) {
-    return schedule;
+std::vector<std::string> KVCacheTransfer::rotate_dst_rank(
+    const std::vector<std::string>& keys,
+    int32_t kv_split_rank) {
+  int32_t offset = kv_split_rank;
+  std::vector<std::string> rotated_keys;
+  auto sorted_keys = keys;
+  std::sort(sorted_key.begin(), sorted_keys.end());
+  for (int32_t i = 0; i < keys.size(); i++) {
+    rotated_keys.emplace_back(keys[(i + offset) % keys.size()]);
   }
-
-  // Sort by key for determinism; the legacy `unordered_map` traversal had
-  // nondeterministic but cross-rank-aligned order, which is exactly what
-  // caused the N-to-1 incast.
-  std::vector<const std::string*> keys;
-  keys.reserve(merged_kv_infos.size());
-  for (const auto& kv : merged_kv_infos) {
-    keys.push_back(&kv.first);
-  }
-  std::sort(keys.begin(),
-            keys.end(),
-            [](const std::string* a, const std::string* b) { return *a < *b; });
-
-  const size_t n = keys.size();
-  const int32_t cp = std::max<int32_t>(1, kv_split_size);
-  size_t offset = 0;
-  if (::xllm::DisaggPDConfig::get_instance().kv_push_dst_rotate() && cp > 1 &&
-      n > 0) {
-    // rank * n / cp gives evenly spaced starts in [0, n); when n % cp == 0
-    // (typical PD topology), each rank lands on a distinct dst.
-    offset = (static_cast<size_t>(std::max<int32_t>(0, kv_split_rank)) * n) /
-             static_cast<size_t>(cp);
-    offset %= n;
-  }
-
-  schedule.reserve(static_cast<size_t>(num_layers) * n);
-  for (int64_t layer = 0; layer < num_layers; ++layer) {
-    for (size_t dd = 0; dd < n; ++dd) {
-      const std::string* key = keys[(dd + offset) % n];
-      schedule.push_back(PushStep{layer, &merged_kv_infos.at(*key), key});
-    }
-  }
-  return schedule;
+  return rotated_keys;
 }
 
 #if defined(USE_NPU) || defined(USE_MLU)
