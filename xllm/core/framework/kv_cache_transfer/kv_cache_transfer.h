@@ -58,6 +58,8 @@ class KVCacheTransfer {
     std::string dst_addr;
     int64_t dst_k_cache_id;
     int64_t dst_v_cache_id;
+    // Index into remote InstanceInfo cluster_ids (D-side worker rank).
+    int32_t dst_worker_rank = -1;
     std::vector<uint64_t> src_blocks;
     std::vector<uint64_t> dst_blocks;
 

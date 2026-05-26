@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -65,6 +66,25 @@ void log_pd_kv_push_blocks(const std::vector<TransferKVInfo>& kv_infos,
               << " local_blocks=" << format_u64_block_ids(info.local_blocks_ids)
               << " remote_blocks="
               << format_u64_block_ids(info.remote_blocks_ids);
+  }
+}
+
+void log_pd_kv_push_targets(
+    const std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo>&
+        merged_kv_infos,
+    const ParallelArgs& parallel_args,
+    int32_t kv_split_size) {
+  for (const auto& entry : merged_kv_infos) {
+    const KVCacheTransfer::KVCacheInfo& kv_info = entry.second;
+    LOG(INFO) << "[PD_KV_TRANSFER] P push target"
+              << " src_worker_rank=" << parallel_args.rank()
+              << " dst_worker_rank=" << kv_info.dst_worker_rank
+              << " kv_split_rank=" << parallel_args.kv_split_rank()
+              << " kv_split_size=" << kv_split_size
+              << " dst_cluster_id=" << kv_info.dst_cluster_id
+              << " dst_addr=" << kv_info.dst_addr
+              << " src_blocks=" << format_u64_block_ids(kv_info.src_blocks)
+              << " dst_blocks=" << format_u64_block_ids(kv_info.dst_blocks);
   }
 }
 
@@ -188,6 +208,9 @@ folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
     }
     log_pd_kv_push_blocks(*kv_infos, parallel_args, kv_split_size);
     merge_kv_blocks(merged_kv_infos, *kv_infos, parallel_args);
+    if (!merged_kv_infos.empty()) {
+      log_pd_kv_push_targets(merged_kv_infos, parallel_args, kv_split_size);
+    }
     bool success = true;
     if (!merged_kv_infos.empty()) {
       success = this->push_kv_blocks(merged_kv_infos,
@@ -259,6 +282,7 @@ void KVCacheTransfer::merge_kv_blocks(
         kv_info.dst_addr = dst_addr;
         kv_info.dst_k_cache_id = k_cache_id;
         kv_info.dst_v_cache_id = v_cache_id;
+        kv_info.dst_worker_rank = i;
         kv_info.src_blocks.insert(kv_info.src_blocks.end(),
                                   info.local_blocks_ids.begin(),
                                   info.local_blocks_ids.end());

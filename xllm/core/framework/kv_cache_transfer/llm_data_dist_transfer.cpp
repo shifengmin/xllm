@@ -302,6 +302,13 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
         if (ret != LLM_SUCCESS) {
           LOG(ERROR) << "PushKvBlocks failed, layer = " << layer_index
                      << ", role = " << registered_cache.role.to_string()
+                     << ", dst_worker_rank = " << kv_info.dst_worker_rank
+                     << ", dst_cluster_id = " << kv_info.dst_cluster_id
+                     << ", dst_addr = " << kv_info.dst_addr
+                     << ", kv_split_rank = " << kv_split_rank << ", linked = "
+                     << (linked_cluster_ids.count(kv_info.dst_cluster_id) > 0
+                             ? "yes"
+                             : "no")
                      << ", ret = " << std::hex << ret;
           result = false;
         }

@@ -241,6 +241,7 @@ void SpecKVCacheTransfer::merge_kv_blocks(
         kv_info.dst_addr = dst_addr;
         kv_info.dst_k_cache_id = k_cache_id;
         kv_info.dst_v_cache_id = v_cache_id;
+        kv_info.dst_worker_rank = i;
         kv_info.src_blocks.insert(kv_info.src_blocks.end(),
                                   info.local_blocks_ids.begin(),
                                   info.local_blocks_ids.end());
