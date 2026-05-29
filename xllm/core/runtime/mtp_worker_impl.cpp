@@ -71,6 +71,104 @@ torch::Tensor to_cpu_int_tensor_for_read(const torch::Tensor& values) {
       .contiguous();
 }
 
+bool has_mtp_prefill_placeholder_extra_token(
+    const std::vector<int32_t>& extra_token_ids,
+    int32_t placeholder) {
+  return std::find(extra_token_ids.begin(),
+                   extra_token_ids.end(),
+                   placeholder) != extra_token_ids.end();
+}
+
+// CP partition may leave the final -1 placeholder on another rank's shard.
+// Inject target next_tokens at the local sampling index when no placeholder
+// exists in this rank's mtp_shifted slice.
+void apply_cp_mtp_prefill_target_tokens(
+    ForwardInput& input,
+    const torch::Tensor& next_tokens,
+    int32_t placeholder,
+    const torch::TensorOptions& token_options) {
+  auto& embedding = input.input_params.embedding;
+  CHECK(embedding.mtp_shifted_token_ids.defined());
+  CHECK(input.sampling_params.selected_token_idxes.defined())
+      << "selected_token_idxes required for CP MTP final-chunk draft input";
+
+  torch::Tensor shifted_cpu =
+      embedding.mtp_shifted_token_ids.device().is_cpu()
+          ? embedding.mtp_shifted_token_ids
+          : embedding.mtp_shifted_token_ids.to(torch::kCPU);
+  if (shifted_cpu.scalar_type() != torch::kInt32) {
+    shifted_cpu = shifted_cpu.to(torch::kInt32);
+  }
+  shifted_cpu = shifted_cpu.contiguous();
+
+  const auto& extra_token_ids = embedding.extra_token_ids;
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
+  torch::Tensor next_cpu = to_cpu_int_tensor_for_read(next_tokens);
+  torch::Tensor selected_cpu =
+      to_cpu_int_tensor_for_read(input.sampling_params.selected_token_idxes);
+  torch::Tensor sample_idxes_cpu;
+  if (input.sampling_params.sample_idxes.defined()) {
+    sample_idxes_cpu =
+        to_cpu_int_tensor_for_read(input.sampling_params.sample_idxes);
+    CHECK_EQ(sample_idxes_cpu.numel(), num_sequences)
+        << "sample_idxes size must match num_sequences";
+  }
+
+  input.device_tensors_ready = false;
+  input.token_ids_host = shifted_cpu.clone();
+  int32_t* host_tokens = input.token_ids_host.data_ptr<int32_t>();
+  const int64_t num_tokens = input.token_ids_host.numel();
+
+  int32_t next_seq_idx = 0;
+  int32_t placeholder_replaced = 0;
+  int32_t selected_injected = 0;
+  for (int32_t seq = 0; seq < num_sequences; ++seq) {
+    if (seq >= static_cast<int32_t>(extra_token_ids.size()) ||
+        extra_token_ids[seq] != placeholder) {
+      continue;
+    }
+    CHECK_LT(next_seq_idx, next_cpu.numel());
+    int32_t selected_pos = next_seq_idx;
+    if (sample_idxes_cpu.defined()) {
+      selected_pos = sample_idxes_cpu.data_ptr<int32_t>()[seq];
+    }
+    CHECK_GE(selected_pos, 0);
+    CHECK_LT(selected_pos, selected_cpu.numel());
+    const int32_t next_token = next_cpu.data_ptr<int32_t>()[next_seq_idx];
+    const int32_t local_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
+    CHECK_GE(local_idx, 0);
+    CHECK_LT(local_idx, num_tokens);
+
+    bool replaced = false;
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      if (host_tokens[i] != placeholder) {
+        continue;
+      }
+      host_tokens[i] = next_token;
+      replaced = true;
+      ++placeholder_replaced;
+      break;
+    }
+    if (!replaced) {
+      host_tokens[local_idx] = next_token;
+      ++selected_injected;
+    }
+    ++next_seq_idx;
+  }
+  CHECK_EQ(next_seq_idx, next_cpu.numel())
+      << "unused target next_tokens for CP MTP prefill";
+
+  LOG(INFO) << "[MTP_CP_DEBUG] apply_cp_mtp_prefill_target_tokens"
+            << " num_sequences=" << num_sequences
+            << " next_tokens_numel=" << next_cpu.numel()
+            << " placeholder_replaced=" << placeholder_replaced
+            << " selected_injected=" << selected_injected;
+
+  input.token_ids = safe_to(input.token_ids_host, token_options, true);
+  embedding.mtp_shifted_token_ids = input.token_ids;
+  input.device_tensors_ready = true;
+}
+
 std::string format_extra_token_ids_for_log(
     const std::vector<int32_t>& extra_token_ids) {
   std::ostringstream oss;
@@ -567,12 +665,24 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     prefill_input.input_params.embedding.input_embedding = embeddings.clone();
   }
   if (output.sample_output.next_tokens.defined()) {
-    LOG(INFO) << "[MTP_CP_DEBUG] step_prefill before replace_host_token_"
-                 "placeholders";
-    replace_host_token_placeholders(prefill_input,
-                                    -1,
-                                    output.sample_output.next_tokens,
-                                    prefill_input.token_ids.options());
+    const auto& extra_token_ids =
+        prefill_input.input_params.embedding.extra_token_ids;
+    if (options_.cp_size() > 1 &&
+        has_mtp_prefill_placeholder_extra_token(extra_token_ids, -1)) {
+      LOG(INFO) << "[MTP_CP_DEBUG] step_prefill before "
+                   "apply_cp_mtp_prefill_target_tokens";
+      apply_cp_mtp_prefill_target_tokens(prefill_input,
+                                         output.sample_output.next_tokens,
+                                         -1,
+                                         prefill_input.token_ids.options());
+    } else {
+      LOG(INFO) << "[MTP_CP_DEBUG] step_prefill before replace_host_token_"
+                   "placeholders";
+      replace_host_token_placeholders(prefill_input,
+                                      -1,
+                                      output.sample_output.next_tokens,
+                                      prefill_input.token_ids.options());
+    }
     log_mtp_prefill_forward_input("step_prefill after replace", prefill_input);
   }
   // generate kv cache for draft model
@@ -634,6 +744,13 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
                       ? prefill_input.token_ids_host.numel()
                       : 0);
     prefill_input.token_ids = input_params.embedding.mtp_shifted_token_ids;
+    torch::Tensor shifted_cpu = prefill_input.token_ids.device().is_cpu()
+                                    ? prefill_input.token_ids
+                                    : prefill_input.token_ids.to(torch::kCPU);
+    if (shifted_cpu.scalar_type() != torch::kInt32) {
+      shifted_cpu = shifted_cpu.to(torch::kInt32);
+    }
+    prefill_input.token_ids_host = shifted_cpu.contiguous();
     return;
   }
 
