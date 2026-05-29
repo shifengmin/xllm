@@ -137,6 +137,13 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
   if (!model_output.hidden_states.defined()) {
+    LOG(ERROR)
+        << "[MTP_CP_DEBUG] LLMWorkerImpl forward returned no hidden_states"
+        << " is_spec_draft=" << is_spec_draft_
+        << " cp_size=" << options_.cp_size()
+        << " batch=" << input.input_params.meta.batch_forward_type.to_string()
+        << " token_numel="
+        << (input.token_ids.defined() ? input.token_ids.numel() : 0);
     return std::nullopt;
   }
 
@@ -225,6 +232,17 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       output.sample_output.embeddings = embeddings;
     } else if (sampling_params.selected_token_idxes.defined()) {
       if (options_.cp_size() > 1) {
+        LOG(INFO) << "[MTP_CP_DEBUG] LLMWorkerImpl embeddings path"
+                  << " is_spec_draft=" << is_spec_draft_ << " is_decode="
+                  << input.input_params.meta.batch_forward_type.is_decode()
+                  << " batch="
+                  << input.input_params.meta.batch_forward_type.to_string()
+                  << " selected_hidden_defined="
+                  << selected_hidden_from_lm_head.defined()
+                  << " input_embedding_defined="
+                  << input.input_params.embedding.input_embedding.defined()
+                  << " hidden_states_numel="
+                  << (embeddings.defined() ? embeddings.numel() : 0);
         CHECK(selected_hidden_from_lm_head.defined())
             << "selected_hidden_from_lm_head must be defined when "
                "selected_token_idxes is defined.";

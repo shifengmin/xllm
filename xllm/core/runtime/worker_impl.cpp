@@ -32,6 +32,7 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -964,44 +965,77 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
-    if (hierarchy_kv_cache_transfer_ != nullptr) {
-      hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
-    }
-
-    // run the model on the given input in working thread
-    if (!enable_schedule_overlap()) {
-      const auto output = this->step(input);
-      promise.setValue(output);
-    } else {
-      if (last_step_output_valid_ && input.token_ids.numel() > 0 &&
-          input.input_params.meta.batch_forward_type.has_decode()) {
-        // replace step i model input with true output of step i-1
-        input = update_input_by_last_step_output(input);
+    const auto log_step_async_context = [this, &input](const char* where) {
+      LOG(INFO) << "[MTP_CP_DEBUG] WorkerImpl::step_async " << where
+                << " is_spec_draft=" << is_spec_draft_
+                << " cp_size=" << options_.cp_size()
+                << " cp_rank=" << parallel_args_.cp_rank()
+                << " rank=" << parallel_args_.rank() << " batch="
+                << input.input_params.meta.batch_forward_type.to_string()
+                << " token_numel="
+                << (input.token_ids.defined() ? input.token_ids.numel() : 0)
+                << " cp_partitioned=" << input.cp_partitioned;
+    };
+    try {
+      log_step_async_context("begin");
+      if (hierarchy_kv_cache_transfer_ != nullptr) {
+        hierarchy_kv_cache_transfer_->set_layer_synchronizer(
+            input.input_params);
       }
 
-      const auto output = this->step(input);
-      if (output.has_value()) {
-        if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
-          std::unique_lock<std::mutex> lock(mtx_);
-          cv_.wait(lock, [this] { return !is_recorded_; });
-          update_last_step_output(output);
-          is_recorded_ = true;
-          cv_.notify_one();
-        } else {
-          update_last_step_output(output);
-        }
+      // run the model on the given input in working thread
+      if (!enable_schedule_overlap()) {
+        const auto output = this->step(input);
+        log_step_async_context("setValue");
+        promise.setValue(output);
       } else {
-        if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
-          std::unique_lock<std::mutex> lock(mtx_);
-          cv_.wait(lock, [this] { return !is_recorded_; });
-          last_step_output_valid_ = false;
-          is_recorded_ = true;
-          cv_.notify_one();
-        } else {
-          last_step_output_valid_ = false;
+        if (last_step_output_valid_ && input.token_ids.numel() > 0 &&
+            input.input_params.meta.batch_forward_type.has_decode()) {
+          // replace step i model input with true output of step i-1
+          input = update_input_by_last_step_output(input);
         }
+
+        const auto output = this->step(input);
+        if (output.has_value()) {
+          if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+            std::unique_lock<std::mutex> lock(mtx_);
+            cv_.wait(lock, [this] { return !is_recorded_; });
+            update_last_step_output(output);
+            is_recorded_ = true;
+            cv_.notify_one();
+          } else {
+            update_last_step_output(output);
+          }
+        } else {
+          if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+            std::unique_lock<std::mutex> lock(mtx_);
+            cv_.wait(lock, [this] { return !is_recorded_; });
+            last_step_output_valid_ = false;
+            is_recorded_ = true;
+            cv_.notify_one();
+          } else {
+            last_step_output_valid_ = false;
+          }
+        }
+        log_step_async_context("setValue");
+        promise.setValue(output);
       }
-      promise.setValue(output);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[MTP_CP_DEBUG] WorkerImpl::step_async std::exception: "
+                 << e.what() << " is_spec_draft=" << is_spec_draft_
+                 << " cp_size=" << options_.cp_size()
+                 << " cp_rank=" << parallel_args_.cp_rank()
+                 << " rank=" << parallel_args_.rank() << " batch="
+                 << input.input_params.meta.batch_forward_type.to_string();
+      promise.setException(std::current_exception());
+    } catch (...) {
+      LOG(ERROR) << "[MTP_CP_DEBUG] WorkerImpl::step_async unknown exception"
+                 << " is_spec_draft=" << is_spec_draft_
+                 << " cp_size=" << options_.cp_size()
+                 << " cp_rank=" << parallel_args_.cp_rank()
+                 << " rank=" << parallel_args_.rank() << " batch="
+                 << input.input_params.meta.batch_forward_type.to_string();
+      promise.setException(std::current_exception());
     }
   });
   return future;

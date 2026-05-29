@@ -15,8 +15,13 @@ limitations under the License.
 
 #include "mtp_worker_impl.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <cctype>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -66,11 +71,103 @@ torch::Tensor to_cpu_int_tensor_for_read(const torch::Tensor& values) {
       .contiguous();
 }
 
+std::string format_extra_token_ids_for_log(
+    const std::vector<int32_t>& extra_token_ids) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < extra_token_ids.size(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << extra_token_ids[i];
+  }
+  oss << "]";
+  return oss.str();
+}
+
+void log_mtp_prefill_forward_input(const char* stage,
+                                   const ForwardInput& input) {
+  const auto& params = input.input_params;
+  const int64_t token_numel =
+      input.token_ids_host.defined() ? input.token_ids_host.numel()
+      : input.token_ids.defined()    ? input.token_ids.numel()
+                                     : 0;
+  LOG(INFO) << "[MTP_CP_DEBUG] " << stage
+            << " batch=" << params.meta.batch_forward_type.to_string()
+            << " num_sequences=" << params.meta.num_sequences
+            << " token_numel=" << token_numel
+            << " cp_partitioned=" << input.cp_partitioned
+            << " device_tensors_ready=" << input.device_tensors_ready
+            << " mtp_shifted_defined="
+            << params.embedding.mtp_shifted_token_ids.defined()
+            << " mtp_shifted_numel="
+            << (params.embedding.mtp_shifted_token_ids.defined()
+                    ? params.embedding.mtp_shifted_token_ids.numel()
+                    : 0)
+            << " extra_token_ids="
+            << format_extra_token_ids_for_log(params.embedding.extra_token_ids)
+            << " input_embedding_defined="
+            << params.embedding.input_embedding.defined();
+}
+
+void log_replace_host_token_placeholders_diagnostics(
+    const ForwardInput& input,
+    int32_t placeholder,
+    const torch::Tensor& replacements) {
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
+  int32_t placeholder_count = 0;
+  if (input.token_ids_host.defined()) {
+    const int32_t* token_ids = input.token_ids_host.data_ptr<int32_t>();
+    const int64_t num_token_ids = input.token_ids_host.numel();
+    for (int64_t i = 0; i < num_token_ids; ++i) {
+      if (token_ids[i] == placeholder) {
+        ++placeholder_count;
+      }
+    }
+  }
+  const int64_t replacement_count =
+      replacements.defined() ? replacements.numel() : 0;
+  bool host_matches_shifted = false;
+  if (input.token_ids_host.defined() &&
+      input.input_params.embedding.mtp_shifted_token_ids.defined()) {
+    torch::Tensor mtp_shifted_cpu =
+        input.input_params.embedding.mtp_shifted_token_ids.device().is_cpu()
+            ? input.input_params.embedding.mtp_shifted_token_ids
+            : input.input_params.embedding.mtp_shifted_token_ids.to(
+                  torch::kCPU);
+    host_matches_shifted =
+        input.token_ids_host.sizes() == mtp_shifted_cpu.sizes() &&
+        input.token_ids_host.numel() == mtp_shifted_cpu.numel() &&
+        torch::equal(input.token_ids_host, mtp_shifted_cpu);
+  }
+  LOG(INFO) << "[MTP_CP_DEBUG] replace_host_token_placeholders diagnostics"
+            << " num_sequences=" << num_sequences
+            << " placeholder=" << placeholder
+            << " placeholder_count=" << placeholder_count
+            << " replacement_count=" << replacement_count << " extra_token_ids="
+            << format_extra_token_ids_for_log(
+                   input.input_params.embedding.extra_token_ids)
+            << " token_ids_host_numel="
+            << (input.token_ids_host.defined() ? input.token_ids_host.numel()
+                                               : 0)
+            << " host_same_as_mtp_shifted=" << host_matches_shifted;
+  if (placeholder_count != replacement_count) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] placeholder/replacement count mismatch"
+               << " placeholder_count=" << placeholder_count
+               << " replacement_count=" << replacement_count
+               << " (likely chunked-prefill intermediate chunk or CP host/"
+                  "shifted layout bug)";
+  }
+}
+
 void replace_host_token_placeholders(ForwardInput& input,
                                      int32_t placeholder,
                                      const torch::Tensor& replacements,
                                      const torch::TensorOptions& token_options,
                                      bool refresh_device = true) {
+  log_replace_host_token_placeholders_diagnostics(
+      input, placeholder, replacements);
+
   CHECK(replacements.defined())
       << "speculative replacement tokens must be defined";
   CHECK(input.token_ids_host.defined())
@@ -98,6 +195,9 @@ void replace_host_token_placeholders(ForwardInput& input,
         << "not enough speculative replacement tokens";
     token_ids[i] = replacement_ids[replacement_idx++];
   }
+  LOG(INFO) << "[MTP_CP_DEBUG] replace_host_token_placeholders applied"
+            << " replaced_count=" << replacement_idx
+            << " replacement_total=" << replacement_ids.size();
   CHECK_EQ(replacement_idx, replacement_ids.size())
       << "unused speculative replacement tokens";
 
@@ -420,15 +520,45 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
 std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     const ForwardInput& input) {
   Timer timer;
-  // run the target model to get first token and hidden states
-  auto future = impl_->step_async(input);
-  ForwardOutput output = std::move(future).get().value();
+  log_mtp_prefill_forward_input("step_prefill input", input);
+  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill begin"
+            << " cp_size=" << options_.cp_size()
+            << " rank=" << parallel_args_.rank()
+            << " cp_rank=" << parallel_args_.cp_rank();
+
+  std::optional<ForwardOutput> target_output;
+  try {
+    auto future = impl_->step_async(input);
+    target_output = std::move(future).get();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill target step_async failed: "
+               << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill target step_async failed: "
+                  "non-std exception";
+    throw;
+  }
+  if (!target_output.has_value()) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill target returned nullopt";
+    return std::nullopt;
+  }
+  ForwardOutput output = std::move(target_output.value());
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
+  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill target done"
+            << " next_tokens_defined="
+            << output.sample_output.next_tokens.defined()
+            << " embeddings_defined="
+            << output.sample_output.embeddings.defined() << " embeddings_numel="
+            << (output.sample_output.embeddings.defined()
+                    ? output.sample_output.embeddings.numel()
+                    : 0);
 
   // MTP path that depends on hidden states.
   ForwardInput prefill_input;
   prepare_prefill_inputs(input, prefill_input);
+  log_mtp_prefill_forward_input("step_prefill prefill_input", prefill_input);
 
   // prepare input for draft model
   auto& embeddings = output.sample_output.embeddings;
@@ -437,15 +567,35 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     prefill_input.input_params.embedding.input_embedding = embeddings.clone();
   }
   if (output.sample_output.next_tokens.defined()) {
+    LOG(INFO) << "[MTP_CP_DEBUG] step_prefill before replace_host_token_"
+                 "placeholders";
     replace_host_token_placeholders(prefill_input,
                                     -1,
                                     output.sample_output.next_tokens,
                                     prefill_input.token_ids.options());
+    log_mtp_prefill_forward_input("step_prefill after replace", prefill_input);
   }
   // generate kv cache for draft model
   timer.reset();
-  auto draft_future = draft_impl_->step_async(prefill_input);
-  ForwardOutput draft_output = std::move(draft_future).get().value();
+  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill before draft step_async";
+  std::optional<ForwardOutput> draft_output_opt;
+  try {
+    auto draft_future = draft_impl_->step_async(prefill_input);
+    draft_output_opt = std::move(draft_future).get();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill draft step_async failed: "
+               << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill draft step_async failed: "
+                  "non-std exception";
+    throw;
+  }
+  if (!draft_output_opt.has_value()) {
+    LOG(ERROR) << "[MTP_CP_DEBUG] step_prefill draft returned nullopt";
+    return std::nullopt;
+  }
+  ForwardOutput draft_output = std::move(draft_output_opt.value());
   process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
@@ -475,23 +625,15 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
     CHECK(input_params.embedding.mtp_shifted_token_ids.defined());
     CHECK_EQ(input_params.embedding.mtp_shifted_token_ids.numel(),
              prefill_input.token_ids.numel());
-    // Materialize shift-by-1 tokens on CPU so replace_host_token_placeholders
-    // (run after target sampling) updates the same layout that draft CP
-    // partition consumes. Using the pre-shift token_ids_host from input.to()
-    // would let refresh_device overwrite shifted device tensors.
-    torch::Tensor mtp_shifted_cpu =
-        to_cpu_int_tensor_for_read(input_params.embedding.mtp_shifted_token_ids)
-            .clone();
-    prefill_input.device_tensors_ready = false;
-    prefill_input.token_ids_host = mtp_shifted_cpu;
-    prefill_input.token_ids = safe_to(
-        prefill_input.token_ids_host, prefill_input.positions.options(), true);
-    prefill_input.input_params.embedding.mtp_shifted_token_ids =
-        prefill_input.token_ids_host;
-    prefill_input.input_params.mtp_shifted_token_ids =
-        prefill_input.token_ids_host;
-    prefill_input.device_tensors_ready = true;
-    prepare_stream_->synchronize();
+    LOG(INFO) << "[MTP_CP_DEBUG] prepare_prefill_inputs CP path"
+              << " token_ids_numel=" << prefill_input.token_ids.numel()
+              << " mtp_shifted_numel="
+              << input_params.embedding.mtp_shifted_token_ids.numel()
+              << " token_ids_host_numel="
+              << (prefill_input.token_ids_host.defined()
+                      ? prefill_input.token_ids_host.numel()
+                      : 0);
+    prefill_input.token_ids = input_params.embedding.mtp_shifted_token_ids;
     return;
   }
 
