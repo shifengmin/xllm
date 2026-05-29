@@ -475,7 +475,23 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
     CHECK(input_params.embedding.mtp_shifted_token_ids.defined());
     CHECK_EQ(input_params.embedding.mtp_shifted_token_ids.numel(),
              prefill_input.token_ids.numel());
-    prefill_input.token_ids = input_params.embedding.mtp_shifted_token_ids;
+    // Materialize shift-by-1 tokens on CPU so replace_host_token_placeholders
+    // (run after target sampling) updates the same layout that draft CP
+    // partition consumes. Using the pre-shift token_ids_host from input.to()
+    // would let refresh_device overwrite shifted device tensors.
+    torch::Tensor mtp_shifted_cpu =
+        to_cpu_int_tensor_for_read(input_params.embedding.mtp_shifted_token_ids)
+            .clone();
+    prefill_input.device_tensors_ready = false;
+    prefill_input.token_ids_host = mtp_shifted_cpu;
+    prefill_input.token_ids = safe_to(
+        prefill_input.token_ids_host, prefill_input.positions.options(), true);
+    prefill_input.input_params.embedding.mtp_shifted_token_ids =
+        prefill_input.token_ids_host;
+    prefill_input.input_params.mtp_shifted_token_ids =
+        prefill_input.token_ids_host;
+    prefill_input.device_tensors_ready = true;
+    prepare_stream_->synchronize();
     return;
   }
 
