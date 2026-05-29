@@ -16,6 +16,7 @@ limitations under the License.
 #include "worker_impl.h"
 
 #include <ATen/Parallel.h>
+#include <folly/ExceptionWrapper.h>
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
 #include <gflags/gflags.h>
@@ -1027,7 +1028,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
                  << " cp_rank=" << parallel_args_.cp_rank()
                  << " rank=" << parallel_args_.rank() << " batch="
                  << input.input_params.meta.batch_forward_type.to_string();
-      promise.setException(std::current_exception());
+      promise.setException(folly::exception_wrapper(e));
     } catch (...) {
       LOG(ERROR) << "[MTP_CP_DEBUG] WorkerImpl::step_async unknown exception"
                  << " is_spec_draft=" << is_spec_draft_
@@ -1035,7 +1036,7 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
                  << " cp_rank=" << parallel_args_.cp_rank()
                  << " rank=" << parallel_args_.rank() << " batch="
                  << input.input_params.meta.batch_forward_type.to_string();
-      promise.setException(std::current_exception());
+      promise.setException(folly::exception_wrapper(std::current_exception()));
     }
   });
   return future;
