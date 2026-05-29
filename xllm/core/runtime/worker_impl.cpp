@@ -128,6 +128,21 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
+// ForwardInput::to(device) returns early when device_tensors_ready is set.
+// Nested step_async (e.g. MTP target/draft) can then reach LmHead with CP-
+// remapped selected_token_idxes still on CPU while hidden_states are on NPU.
+void ensure_sampling_control_tensors_on_device(
+    SamplingParameters& sampling_params,
+    const torch::Device& device) {
+  auto move_if_needed = [&device](torch::Tensor& tensor) {
+    if (tensor.defined() && tensor.device() != device) {
+      tensor = tensor.to(device, /*non_blocking=*/false).contiguous();
+    }
+  };
+  move_if_needed(sampling_params.selected_token_idxes);
+  move_if_needed(sampling_params.sample_idxes);
+}
+
 #if defined(USE_NPU)
 void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   const std::vector<int32_t>& host_q_seq_lens =
@@ -716,6 +731,10 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
 
   auto prepare_device_on_stream = [&]() {
     processed_input = prep_for_device.to(device_, dtype_);
+    ensure_sampling_control_tensors_on_device(processed_input.sampling_params,
+                                              device_);
+    ensure_sampling_control_tensors_on_device(
+        processed_input.decoder_sampling_params, device_);
 
 #if defined(USE_NPU)
     CpPrefillInputs tmp_cp_inputs;
