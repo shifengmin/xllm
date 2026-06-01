@@ -135,9 +135,6 @@ void apply_cp_mtp_prefill_target_tokens(
     CHECK_GE(selected_pos, 0);
     CHECK_LT(selected_pos, selected_cpu.numel());
     const int32_t next_token = next_cpu.data_ptr<int32_t>()[next_seq_idx];
-    const int32_t local_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
-    CHECK_GE(local_idx, 0);
-    CHECK_LT(local_idx, num_tokens);
 
     bool replaced = false;
     for (int64_t i = 0; i < num_tokens; ++i) {
@@ -150,8 +147,16 @@ void apply_cp_mtp_prefill_target_tokens(
       break;
     }
     if (!replaced) {
-      host_tokens[local_idx] = next_token;
-      ++selected_injected;
+      // selected_token_idxes lives in the CP all-gather global index space, so
+      // it is a valid local row only when it falls inside this rank's shard.
+      // When the -1 placeholder and the selected token belong to another CP
+      // rank, that owning rank performs the injection and this rank skips it
+      // (the global index is intentionally out of this shard's range).
+      const int32_t local_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
+      if (local_idx >= 0 && local_idx < num_tokens) {
+        host_tokens[local_idx] = next_token;
+        ++selected_injected;
+      }
     }
     ++next_seq_idx;
   }
