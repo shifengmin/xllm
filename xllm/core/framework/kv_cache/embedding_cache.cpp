@@ -19,7 +19,6 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
-#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -54,35 +53,21 @@ void EmbeddingCache::write_prefill_target_context(
         << "prefill target embedding selection index is undefined";
     CHECK_EQ(selected_token_idxes.numel(), static_cast<int64_t>(ids.size()))
         << "prefill target embedding selection count mismatch";
-    // Validate selection indices against the LOCAL embeddings row count on the
-    // host first, so an out-of-range index fails here with concrete values
-    // instead of surfacing later as an opaque NPU gather_v3 assert. This also
-    // confirms whether the CP "Index N out of range[0 M)" crash originates from
-    // this index_select (global all-gather-space index applied to a local
-    // per-rank embeddings shard) rather than from the draft LmHead gather.
+    // Guard against indexing a local shard with global indices: callers must
+    // pass embeddings whose rows are addressable by selected_token_idxes (e.g.
+    // the LmHead-gathered per-sequence hidden under context parallelism), not a
+    // local CP token shard combined with CP all-gather-space indices.
     const int64_t num_embed_rows = target_embeddings.size(0);
     torch::Tensor selected_cpu =
         safe_to(selected_token_idxes, torch::kCPU).to(torch::kLong);
     const int64_t* selected_data = selected_cpu.data_ptr<int64_t>();
-    std::ostringstream selected_dump;
-    for (int64_t i = 0; i < selected_cpu.numel(); ++i) {
-      if (i > 0) {
-        selected_dump << ",";
-      }
-      selected_dump << selected_data[i];
-    }
-    LOG(INFO) << "[MTP_CP_DEBUG] write_prefill_target_context"
-              << " embeddings_rows=" << num_embed_rows << " ids=" << ids.size()
-              << " selected_numel=" << selected_cpu.numel() << " selected=["
-              << selected_dump.str() << "]";
     for (int64_t i = 0; i < selected_cpu.numel(); ++i) {
       CHECK_GE(selected_data[i], 0)
           << "prefill target embedding selection index is negative at " << i;
       CHECK_LT(selected_data[i], num_embed_rows)
           << "prefill target embedding selection index out of range at " << i
-          << ": " << selected_data[i] << " vs local embeddings rows "
-          << num_embed_rows
-          << " (global all-gather-space index applied to local CP shard)";
+          << ": " << selected_data[i] << " vs embeddings rows "
+          << num_embed_rows;
     }
     torch::Tensor embedding_idxes = selected_token_idxes.to(
         torch::dtype(torch::kLong).device(target_embeddings.device()));

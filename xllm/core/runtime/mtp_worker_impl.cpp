@@ -79,9 +79,10 @@ bool has_mtp_prefill_placeholder_extra_token(
                    placeholder) != extra_token_ids.end();
 }
 
-// CP partition may leave the final -1 placeholder on another rank's shard.
-// Inject target next_tokens at the local sampling index when no placeholder
-// exists in this rank's mtp_shifted slice.
+// CP partition keeps the final -1 placeholder on exactly one rank's shard.
+// The owning rank injects the target next_token at that local placeholder; non-
+// owning ranks have no placeholder and skip injection. selected_token_idxes is
+// left in the CP all-gather global space for the draft LmHead.
 void apply_cp_mtp_prefill_target_tokens(
     ForwardInput& input,
     const torch::Tensor& next_tokens,
@@ -104,96 +105,47 @@ void apply_cp_mtp_prefill_target_tokens(
   const auto& extra_token_ids = embedding.extra_token_ids;
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   torch::Tensor next_cpu = to_cpu_int_tensor_for_read(next_tokens);
-  torch::Tensor selected_cpu =
-      to_cpu_int_tensor_for_read(input.sampling_params.selected_token_idxes);
-  torch::Tensor sample_idxes_cpu;
-  if (input.sampling_params.sample_idxes.defined()) {
-    sample_idxes_cpu =
-        to_cpu_int_tensor_for_read(input.sampling_params.sample_idxes);
-    CHECK_EQ(sample_idxes_cpu.numel(), num_sequences)
-        << "sample_idxes size must match num_sequences";
-  }
 
   input.device_tensors_ready = false;
   input.token_ids_host = shifted_cpu.clone();
   int32_t* host_tokens = input.token_ids_host.data_ptr<int32_t>();
   const int64_t num_tokens = input.token_ids_host.numel();
 
-  // The draft LmHead gathers selected rows from this rank's LOCAL hidden shard
-  // (unlike the target path it does not CP all-gather first), so the draft
-  // selected_token_idxes must be LOCAL row indices, not the CP all-gather
-  // global indices carried in by the input. Remap each selected entry to the
-  // local prediction slot (the -1 placeholder position).
-  torch::Tensor selected_local = selected_cpu.clone();
-  int32_t* selected_local_data = selected_local.data_ptr<int32_t>();
-  const int64_t fallback_local_idx = num_tokens > 0 ? num_tokens - 1 : 0;
-
+  // Inject each sequence's target next_token into its -1 placeholder slot. The
+  // global prediction position is token-level gathered into exactly one CP
+  // rank's mtp_shifted shard (see cp_partition gather_token_level_tensor), so a
+  // local scan for the placeholder is the authoritative owner check: the owning
+  // rank replaces it, non-owning ranks legitimately have no placeholder and
+  // skip injection. selected_token_idxes is intentionally left unchanged: the
+  // draft LmHead CP all-gathers hidden before gathering selected rows (same as
+  // the target path, which yields a valid selected_hidden_from_lm_head), so the
+  // indices must stay in the CP all-gather global space, not local rows.
   int32_t next_seq_idx = 0;
   int32_t placeholder_replaced = 0;
-  int32_t selected_injected = 0;
   for (int32_t seq = 0; seq < num_sequences; ++seq) {
     if (seq >= static_cast<int32_t>(extra_token_ids.size()) ||
         extra_token_ids[seq] != placeholder) {
       continue;
     }
     CHECK_LT(next_seq_idx, next_cpu.numel());
-    int32_t selected_pos = next_seq_idx;
-    if (sample_idxes_cpu.defined()) {
-      selected_pos = sample_idxes_cpu.data_ptr<int32_t>()[seq];
-    }
-    CHECK_GE(selected_pos, 0);
-    CHECK_LT(selected_pos, selected_cpu.numel());
     const int32_t next_token = next_cpu.data_ptr<int32_t>()[next_seq_idx];
-
-    int64_t pred_local_idx = -1;
     for (int64_t i = 0; i < num_tokens; ++i) {
       if (host_tokens[i] != placeholder) {
         continue;
       }
       host_tokens[i] = next_token;
-      pred_local_idx = i;
       ++placeholder_replaced;
       break;
     }
-    if (pred_local_idx < 0) {
-      // No -1 placeholder in this rank's shard: the selected token belongs to
-      // another CP rank. Only inject when the incoming index happens to fall
-      // inside this shard; otherwise the owning rank performs the injection.
-      const int32_t global_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
-      if (global_idx >= 0 && global_idx < num_tokens) {
-        host_tokens[global_idx] = next_token;
-        pred_local_idx = global_idx;
-        ++selected_injected;
-      }
-    }
-    // Clamp to a valid local row when this rank does not own the prediction
-    // slot; its draft logits for this sequence are unused (the owning rank
-    // produces them), and a valid index keeps the LmHead gather in range.
-    selected_local_data[selected_pos] = static_cast<int32_t>(
-        pred_local_idx >= 0 ? pred_local_idx : fallback_local_idx);
     ++next_seq_idx;
   }
   CHECK_EQ(next_seq_idx, next_cpu.numel())
       << "unused target next_tokens for CP MTP prefill";
 
-  // Defensively clamp any remaining global indices into the local range.
-  for (int64_t i = 0; i < selected_local.numel(); ++i) {
-    if (selected_local_data[i] < 0 || selected_local_data[i] >= num_tokens) {
-      selected_local_data[i] = static_cast<int32_t>(fallback_local_idx);
-    }
-  }
-  input.sampling_params.selected_token_idxes =
-      safe_to(selected_local,
-              torch::TensorOptions()
-                  .dtype(torch::kInt32)
-                  .device(token_options.device()),
-              true);
-
   LOG(INFO) << "[MTP_CP_DEBUG] apply_cp_mtp_prefill_target_tokens"
             << " num_sequences=" << num_sequences
             << " next_tokens_numel=" << next_cpu.numel()
-            << " placeholder_replaced=" << placeholder_replaced
-            << " selected_injected=" << selected_injected;
+            << " placeholder_replaced=" << placeholder_replaced;
 
   input.token_ids = safe_to(input.token_ids_host, token_options, true);
   embedding.mtp_shifted_token_ids = input.token_ids;
@@ -740,28 +692,26 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
-  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill draft done, before "
-               "write_prefill_target_context"
-            << " embeddings_defined=" << embeddings.defined()
-            << " embeddings_rows="
-            << (embeddings.defined() ? embeddings.size(0) : -1)
-            << " selected_defined="
-            << input.sampling_params.selected_token_idxes.defined()
-            << " selected_numel="
-            << (input.sampling_params.selected_token_idxes.defined()
-                    ? input.sampling_params.selected_token_idxes.numel()
-                    : 0);
 
   if (input.sampling_params.selected_token_idxes.defined()) {
+    // Under CP the target prefill `embeddings` is the full local token shard,
+    // which cannot be indexed by the CP all-gather-space selected indices.
+    // Prefer the LmHead-gathered per-sequence hidden when present so the cache
+    // stores it directly; fall back to the full hidden for the non-CP path,
+    // where index_select on the complete local sequence is valid.
+    const torch::Tensor& target_hidden =
+        output.sample_output.selected_embeddings.defined()
+            ? output.sample_output.selected_embeddings
+            : embeddings;
     embedding_cache_->write_prefill_target_context(
         input.input_params.embedding.embedding_ids,
         input.input_params.embedding.request_ids,
         output.sample_output.next_tokens,
-        embeddings,
+        target_hidden,
         input.sampling_params.selected_token_idxes);
   }
-  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill after write_prefill_target_context";
   output.sample_output.embeddings = torch::Tensor();
+  output.sample_output.selected_embeddings = torch::Tensor();
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     return std::nullopt;

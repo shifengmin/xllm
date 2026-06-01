@@ -23,7 +23,6 @@ limitations under the License.
 
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <utility>
 
 #include "common/device_monitor.h"
@@ -41,7 +40,6 @@ limitations under the License.
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
 #include "models/model_registry.h"
-#include "util/tensor_helper.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -238,60 +236,18 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     }
     if (!input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_) {
-      if (options_.cp_size() > 1) {
-        // Verification probe for the CP target-prefill embeddings path. The
-        // stored `embeddings` here is the FULL LOCAL hidden shard (rows = local
-        // token count), while sampling selected_token_idxes are in the CP
-        // all-gather global space. write_prefill_target_context later
-        // index_selects this local shard with those global indices, which is
-        // the suspected source of "Index N out of range[0 M)". Compare against
-        // selected_hidden_from_lm_head, which is already gathered in the
-        // all-gather space (rows = num sequences).
-        const int64_t local_rows =
-            embeddings.defined() ? embeddings.size(0) : -1;
-        const int64_t selected_numel =
-            sampling_params.selected_token_idxes.defined()
-                ? sampling_params.selected_token_idxes.numel()
-                : -1;
-        std::ostringstream selected_dump;
-        if (sampling_params.selected_token_idxes.defined()) {
-          torch::Tensor sel_cpu =
-              safe_to(sampling_params.selected_token_idxes, torch::kCPU)
-                  .to(torch::kInt64);
-          const int64_t* sel_data = sel_cpu.data_ptr<int64_t>();
-          for (int64_t i = 0; i < sel_cpu.numel(); ++i) {
-            if (i > 0) {
-              selected_dump << ",";
-            }
-            selected_dump << sel_data[i];
-          }
-        }
-        LOG(INFO)
-            << "[MTP_CP_DEBUG] LLMWorkerImpl target-prefill embeddings path"
-            << " local_hidden_rows=" << local_rows
-            << " selected_numel=" << selected_numel << " selected=["
-            << selected_dump.str() << "]"
-            << " selected_hidden_defined="
-            << selected_hidden_from_lm_head.defined()
-            << " selected_hidden_rows="
-            << (selected_hidden_from_lm_head.defined()
-                    ? selected_hidden_from_lm_head.size(0)
-                    : -1);
-      }
+      // Target prefill keeps the full hidden in `embeddings` for the draft
+      // input_embedding. Under CP this is the LOCAL token shard, whose rows
+      // cannot be indexed by the CP all-gather-space selected_token_idxes.
+      // Expose the LmHead-gathered per-sequence hidden (rows = num_seq)
+      // separately so the embedding cache stores it without re-selecting on
+      // the local shard.
       output.sample_output.embeddings = embeddings;
+      if (options_.cp_size() > 1 && selected_hidden_from_lm_head.defined()) {
+        output.sample_output.selected_embeddings = selected_hidden_from_lm_head;
+      }
     } else if (sampling_params.selected_token_idxes.defined()) {
       if (options_.cp_size() > 1) {
-        LOG(INFO) << "[MTP_CP_DEBUG] LLMWorkerImpl embeddings path"
-                  << " is_spec_draft=" << is_spec_draft_ << " is_decode="
-                  << input.input_params.meta.batch_forward_type.is_decode()
-                  << " batch="
-                  << input.input_params.meta.batch_forward_type.to_string()
-                  << " selected_hidden_defined="
-                  << selected_hidden_from_lm_head.defined()
-                  << " input_embedding_defined="
-                  << input.input_params.embedding.input_embedding.defined()
-                  << " hidden_states_numel="
-                  << (embeddings.defined() ? embeddings.numel() : 0);
         CHECK(selected_hidden_from_lm_head.defined())
             << "selected_hidden_from_lm_head must be defined when "
                "selected_token_idxes is defined.";
