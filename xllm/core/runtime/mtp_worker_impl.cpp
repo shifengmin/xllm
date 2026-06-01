@@ -119,6 +119,15 @@ void apply_cp_mtp_prefill_target_tokens(
   int32_t* host_tokens = input.token_ids_host.data_ptr<int32_t>();
   const int64_t num_tokens = input.token_ids_host.numel();
 
+  // The draft LmHead gathers selected rows from this rank's LOCAL hidden shard
+  // (unlike the target path it does not CP all-gather first), so the draft
+  // selected_token_idxes must be LOCAL row indices, not the CP all-gather
+  // global indices carried in by the input. Remap each selected entry to the
+  // local prediction slot (the -1 placeholder position).
+  torch::Tensor selected_local = selected_cpu.clone();
+  int32_t* selected_local_data = selected_local.data_ptr<int32_t>();
+  const int64_t fallback_local_idx = num_tokens > 0 ? num_tokens - 1 : 0;
+
   int32_t next_seq_idx = 0;
   int32_t placeholder_replaced = 0;
   int32_t selected_injected = 0;
@@ -136,32 +145,49 @@ void apply_cp_mtp_prefill_target_tokens(
     CHECK_LT(selected_pos, selected_cpu.numel());
     const int32_t next_token = next_cpu.data_ptr<int32_t>()[next_seq_idx];
 
-    bool replaced = false;
+    int64_t pred_local_idx = -1;
     for (int64_t i = 0; i < num_tokens; ++i) {
       if (host_tokens[i] != placeholder) {
         continue;
       }
       host_tokens[i] = next_token;
-      replaced = true;
+      pred_local_idx = i;
       ++placeholder_replaced;
       break;
     }
-    if (!replaced) {
-      // selected_token_idxes lives in the CP all-gather global index space, so
-      // it is a valid local row only when it falls inside this rank's shard.
-      // When the -1 placeholder and the selected token belong to another CP
-      // rank, that owning rank performs the injection and this rank skips it
-      // (the global index is intentionally out of this shard's range).
-      const int32_t local_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
-      if (local_idx >= 0 && local_idx < num_tokens) {
-        host_tokens[local_idx] = next_token;
+    if (pred_local_idx < 0) {
+      // No -1 placeholder in this rank's shard: the selected token belongs to
+      // another CP rank. Only inject when the incoming index happens to fall
+      // inside this shard; otherwise the owning rank performs the injection.
+      const int32_t global_idx = selected_cpu.data_ptr<int32_t>()[selected_pos];
+      if (global_idx >= 0 && global_idx < num_tokens) {
+        host_tokens[global_idx] = next_token;
+        pred_local_idx = global_idx;
         ++selected_injected;
       }
     }
+    // Clamp to a valid local row when this rank does not own the prediction
+    // slot; its draft logits for this sequence are unused (the owning rank
+    // produces them), and a valid index keeps the LmHead gather in range.
+    selected_local_data[selected_pos] = static_cast<int32_t>(
+        pred_local_idx >= 0 ? pred_local_idx : fallback_local_idx);
     ++next_seq_idx;
   }
   CHECK_EQ(next_seq_idx, next_cpu.numel())
       << "unused target next_tokens for CP MTP prefill";
+
+  // Defensively clamp any remaining global indices into the local range.
+  for (int64_t i = 0; i < selected_local.numel(); ++i) {
+    if (selected_local_data[i] < 0 || selected_local_data[i] >= num_tokens) {
+      selected_local_data[i] = static_cast<int32_t>(fallback_local_idx);
+    }
+  }
+  input.sampling_params.selected_token_idxes =
+      safe_to(selected_local,
+              torch::TensorOptions()
+                  .dtype(torch::kInt32)
+                  .device(token_options.device()),
+              true);
 
   LOG(INFO) << "[MTP_CP_DEBUG] apply_cp_mtp_prefill_target_tokens"
             << " num_sequences=" << num_sequences
@@ -714,6 +740,17 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
+  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill draft done, before "
+               "write_prefill_target_context"
+            << " embeddings_defined=" << embeddings.defined()
+            << " embeddings_rows="
+            << (embeddings.defined() ? embeddings.size(0) : -1)
+            << " selected_defined="
+            << input.sampling_params.selected_token_idxes.defined()
+            << " selected_numel="
+            << (input.sampling_params.selected_token_idxes.defined()
+                    ? input.sampling_params.selected_token_idxes.numel()
+                    : 0);
 
   if (input.sampling_params.selected_token_idxes.defined()) {
     embedding_cache_->write_prefill_target_context(
@@ -723,6 +760,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
         embeddings,
         input.sampling_params.selected_token_idxes);
   }
+  LOG(INFO) << "[MTP_CP_DEBUG] step_prefill after write_prefill_target_context";
   output.sample_output.embeddings = torch::Tensor();
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
