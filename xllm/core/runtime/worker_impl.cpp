@@ -735,10 +735,21 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
       needs_cp_prefill_side ? *cp_input : input;
 
 #if defined(USE_NPU)
-  const bool needs_kv_split_prep =
-      needs_cp_prefill_side && util::enable_kvcache_split();
+  // recompute_new_cache_slots / compute_in_prefix_slots are CP prefill-side
+  // prepares that must run EXACTLY ONCE, on the first (outer) pass that owns
+  // the partition. They both remap slots from the BlockManager logical space
+  // (stride block_size * kv_split_size) into this rank's local physical space,
+  // an operation that is NOT idempotent for kv_split_size > 1. Nested MTP
+  // target/draft sub-workers re-enter prepare_work_before_execute on the
+  // already-partitioned input (cp_partitioned == true) whose new_cache_slots
+  // were already remapped by the outer pass; recomputing again would double
+  // remap and corrupt the KV slots. Gate on !input.cp_partitioned just like
+  // prepare_cp_prefill_inputs below.
+  const bool needs_kv_split_prep = needs_cp_prefill_side &&
+                                   !input.cp_partitioned &&
+                                   util::enable_kvcache_split();
   const bool have_prefix_slots =
-      needs_cp_prefill_side &&
+      needs_cp_prefill_side && !input.cp_partitioned &&
       (::xllm::KVCacheConfig::get_instance().enable_prefix_cache() ||
        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill());
 #endif
