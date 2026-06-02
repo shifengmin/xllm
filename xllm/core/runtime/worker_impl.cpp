@@ -69,6 +69,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
+#include "util/env_var.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
@@ -131,6 +132,10 @@ void move_tensor_to_device_if_needed(torch::Tensor& tensor,
   if (tensor.defined() && tensor.device() != device) {
     tensor = tensor.to(device, /*non_blocking=*/false).contiguous();
   }
+}
+
+bool enable_cp_prefill_stage_timing() {
+  return util::get_bool_env("XLLM_DEBUG_CP_PREFILL_STAGE_TIMING", false);
 }
 
 // ForwardInput::to(device) returns early when device_tensors_ready is set.
@@ -681,6 +686,20 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   const bool needs_cp_prefill_side =
       parallel_args_.cp_size() > 1 &&
       !input.input_params.meta.batch_forward_type.is_decode();
+  const bool trace_cp_prefill_timing =
+      needs_cp_prefill_side && enable_cp_prefill_stage_timing();
+  Timer cp_stage_timer;
+  auto log_cp_prepare_stage = [&](const char* stage_name) {
+    if (!trace_cp_prefill_timing) {
+      return;
+    }
+    LOG(INFO) << "[CP_PREFILL_TIMING] stage=" << stage_name
+              << " cp_rank=" << parallel_args_.cp_rank()
+              << " cp_size=" << parallel_args_.cp_size()
+              << " cp_partitioned=" << input.cp_partitioned
+              << " elapsed_us=" << cp_stage_timer.elapsed_microseconds();
+    cp_stage_timer.reset();
+  };
   const bool needs_cp_partition =
       needs_cp_prefill_side && !input.cp_partitioned;
   std::optional<ForwardInput> cp_input;
@@ -701,6 +720,7 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
         unpacked.cp_partitioned = cp_working.cp_partitioned;
         cp_working = std::move(unpacked);
         cp_working.input_host_buffer_has_layout = false;
+        log_cp_prepare_stage("cp_unpack_host_buffer");
       } else {
         LOG(ERROR) << "[CP_PREP] unpack_from_input_host_buffer failed before "
                       "cp_partition (cp_rank="
@@ -728,6 +748,7 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                  << " host_buffer_has_layout="
                  << cp_working.input_host_buffer_has_layout << ")";
     }
+    log_cp_prepare_stage("cp_partition");
   }
   const ForwardInput& prep_for_device =
       needs_cp_prefill_side ? *cp_input : input;
@@ -752,9 +773,22 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill());
 #endif
 
+  auto sync_prepare_stream_for_timing = [&]() {
+    if (!trace_cp_prefill_timing) {
+      return;
+    }
+    if (use_default_stream) {
+      device_.synchronize_default_stream();
+    } else {
+      prepare_stream_->synchronize();
+    }
+  };
+
   auto prepare_device_on_stream = [&]() {
     processed_input = prep_for_device.to(device_, dtype_);
     ensure_forward_input_device_tensors(processed_input, device_);
+    sync_prepare_stream_for_timing();
+    log_cp_prepare_stage("cp_h2d_and_ensure_tensors");
 
 #if defined(USE_NPU)
     CpPrefillInputs tmp_cp_inputs;
@@ -779,6 +813,7 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
                                 /*is_prefill=*/needs_cp_prefill_side);
       processed_input.input_params.parallel.cp_ep_padding_data =
           cp_ep_padding.build();
+      log_cp_prepare_stage("cp_prefill_tensors_and_ep_padding");
     }
 
     if (needs_kv_split_prep) {
@@ -790,6 +825,10 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
       torch::Tensor in_prefix_slots = compute_in_prefix_slots(*cp_input);
       processed_input.input_params.attention.device.in_prefix_slots =
           in_prefix_slots.to(device_);
+    }
+    if (needs_kv_split_prep || have_prefix_slots) {
+      sync_prepare_stream_for_timing();
+      log_cp_prepare_stage("cp_kv_slots_remap");
     }
 #endif
 
@@ -822,6 +861,8 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
     }
 
     apply_kv_block_swaps(input_params);
+    sync_prepare_stream_for_timing();
+    log_cp_prepare_stage("kv_block_swaps");
 
 #if defined(USE_NPU)
     if (context_.get_model_args().enable_mla() &&
@@ -871,6 +912,7 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
   if (!use_default_stream) {
     prepare_stream_->synchronize();
   }
+  log_cp_prepare_stage("cp_input_prepare_total");
 }
 
 void WorkerImpl::apply_kv_block_swaps(const ModelInputParams& input_params) {
@@ -998,7 +1040,19 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
     const ForwardInput& input) {
   ForwardInput input_on_device;
 
+  const bool trace_cp_prefill_timing =
+      parallel_args_.cp_size() > 1 &&
+      !input.input_params.meta.batch_forward_type.is_decode() &&
+      enable_cp_prefill_stage_timing();
+  Timer prepare_timer;
   prepare_work_before_execute(input, input_on_device);
+  if (trace_cp_prefill_timing) {
+    LOG(INFO) << "[CP_PREFILL_TIMING] stage=step_async_prepare_work"
+              << " cp_rank=" << parallel_args_.cp_rank()
+              << " cp_size=" << parallel_args_.cp_size()
+              << " cp_partitioned=" << input.cp_partitioned
+              << " elapsed_us=" << prepare_timer.elapsed_microseconds();
+  }
 
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();

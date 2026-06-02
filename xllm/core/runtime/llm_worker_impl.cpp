@@ -40,6 +40,7 @@ limitations under the License.
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
 #include "models/model_registry.h"
+#include "util/env_var.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -103,6 +104,23 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   MULTI_MODEL_STEP_LOCK(::xllm::KVCacheConfig::get_instance().enable_xtensor());
 
   Timer timer;
+  const bool trace_cp_prefill_timing =
+      options_.cp_size() > 1 &&
+      !input.input_params.meta.batch_forward_type.is_decode() &&
+      util::get_bool_env("XLLM_DEBUG_CP_PREFILL_STAGE_TIMING", false);
+  Timer cp_stage_timer;
+  auto log_cp_step_stage = [&](const char* stage_name) {
+    if (!trace_cp_prefill_timing) {
+      return;
+    }
+    device_.synchronize_default_stream();
+    LOG(INFO) << "[CP_PREFILL_TIMING] stage=" << stage_name
+              << " cp_rank=" << context_.get_parallel_args().cp_rank()
+              << " cp_size=" << options_.cp_size()
+              << " cp_partitioned=" << input.cp_partitioned
+              << " elapsed_us=" << cp_stage_timer.elapsed_microseconds();
+    cp_stage_timer.reset();
+  };
   auto& sampling_params = input.sampling_params;
 
   std::vector<folly::SemiFuture<bool>> futures;
@@ -136,6 +154,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
+  log_cp_step_stage("model_forward");
   if (!model_output.hidden_states.defined()) {
     return std::nullopt;
   }
@@ -158,6 +177,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     } else {
       logits = model_->logits(model_output.hidden_states, selected_token_idxes);
     }
+    log_cp_step_stage("logits");
   }
 
   ForwardOutput output;
@@ -173,12 +193,21 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       !options_.enable_speculative_decode()) {
     MULTI_MODEL_STEP_UNLOCK();
     auto ret = device_.synchronize_default_stream();
+    log_cp_step_stage("device_sync");
     // in p-d disaggregation scene, all micro batches should be in same
     // prefill/decode stage, so, to judge transfer_kv_infos.empty,
     if (options_.kv_cache_transfer_mode() == "PUSH" &&
         !input.transfer_kv_infos.empty()) {
+      Timer kv_transfer_timer;
       auto results =
           folly::collectAll(futures).within(std::chrono::seconds(60)).get();
+      if (trace_cp_prefill_timing) {
+        LOG(INFO) << "[CP_PREFILL_TIMING] stage=kv_transfer_wait"
+                  << " cp_rank=" << context_.get_parallel_args().cp_rank()
+                  << " cp_size=" << options_.cp_size()
+                  << " cp_partitioned=" << input.cp_partitioned
+                  << " elapsed_us=" << kv_transfer_timer.elapsed_microseconds();
+      }
       for (const auto& result : results) {
         // TODO: Add error handling
         if (!result.value()) {
@@ -186,6 +215,13 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
           break;
         }
       }
+    }
+    if (trace_cp_prefill_timing) {
+      LOG(INFO) << "[CP_PREFILL_TIMING] stage=step_total"
+                << " cp_rank=" << context_.get_parallel_args().cp_rank()
+                << " cp_size=" << options_.cp_size()
+                << " cp_partitioned=" << input.cp_partitioned
+                << " elapsed_us=" << timer.elapsed_microseconds();
     }
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       return output;
@@ -218,6 +254,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       // set beam search output to output
       output.beam_search_output = beam_search_output;
     }
+    log_cp_step_stage("sampling");
   }
 
   if (options_.enable_speculative_decode()) {
@@ -254,11 +291,20 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
   MULTI_MODEL_STEP_UNLOCK();
   auto ret = device_.synchronize_default_stream();
+  log_cp_step_stage("device_sync");
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
+    Timer kv_transfer_timer;
     auto results =
         folly::collectAll(futures).within(std::chrono::seconds(60)).get();
+    if (trace_cp_prefill_timing) {
+      LOG(INFO) << "[CP_PREFILL_TIMING] stage=kv_transfer_wait"
+                << " cp_rank=" << context_.get_parallel_args().cp_rank()
+                << " cp_size=" << options_.cp_size()
+                << " cp_partitioned=" << input.cp_partitioned
+                << " elapsed_us=" << kv_transfer_timer.elapsed_microseconds();
+    }
     for (const auto& result : results) {
       // TODO: Add error handling
       if (!result.value()) {
@@ -266,6 +312,14 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         break;
       }
     }
+  }
+
+  if (trace_cp_prefill_timing) {
+    LOG(INFO) << "[CP_PREFILL_TIMING] stage=step_total"
+              << " cp_rank=" << context_.get_parallel_args().cp_rank()
+              << " cp_size=" << options_.cp_size()
+              << " cp_partitioned=" << input.cp_partitioned
+              << " elapsed_us=" << timer.elapsed_microseconds();
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
