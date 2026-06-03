@@ -15,6 +15,7 @@ cc_library(
     options.h
     rate_limiter.h
     types.h
+    embedding_types.h
     device_monitor.h
     version_singleton.h
   SRCS
