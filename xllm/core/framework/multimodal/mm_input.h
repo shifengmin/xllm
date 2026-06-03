@@ -20,6 +20,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/common/embedding_types.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
 #include "mm_type.h"

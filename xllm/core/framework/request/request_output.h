@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/common/embedding_types.h"
 #include "core/common/types.h"
 
 namespace xllm {

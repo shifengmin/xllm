@@ -30,6 +30,7 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "core/common/embedding_types.h"
 #include "core/common/global_flags.h"
 #include "core/common/metrics.h"
 #include "core/framework/config/disagg_pd_config.h"
