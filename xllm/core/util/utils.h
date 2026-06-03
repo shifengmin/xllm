@@ -28,6 +28,7 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "core/common/types.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/util/json_reader.h"
@@ -217,10 +218,25 @@ inline int32_t prefill_kv_split_size_effective(void) {
   return ParallelConfig::get_instance().prefill_kv_split_size_effective();
 }
 
-// PD KV transfer: P uses local kv_split; D uses prefill_kv_split_size only.
-inline int32_t kv_split_stride_for_kv_transfer() {
+// KV-split width for a remote instance from etcd/xllm-service. Falls back to
+// the deprecated prefill_kv_split_size flag when the field is unset (0).
+inline int32_t remote_kv_split_size_effective(
+    const InstanceInfo& remote_instance) {
+  if (remote_instance.kv_split_size > 0) {
+    return remote_instance.kv_split_size;
+  }
+  return prefill_kv_split_size_effective();
+}
+
+// PD KV transfer: P uses local kv_split; D uses remote prefill kv_split when
+// known (TransferKVInfo.remote_instance_info or link metadata).
+inline int32_t kv_split_stride_for_kv_transfer(
+    const InstanceInfo* remote_instance = nullptr) {
   if (DisaggPDConfig::get_instance().enable_disagg_pd() &&
       DisaggPDConfig::get_instance().instance_role() == "DECODE") {
+    if (remote_instance != nullptr) {
+      return remote_kv_split_size_effective(*remote_instance);
+    }
     return prefill_kv_split_size_effective();
   }
   return kv_split_size_effective();

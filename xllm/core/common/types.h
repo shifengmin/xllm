@@ -226,7 +226,9 @@ struct InstanceInfo {
   // remote kv cache info
   std::vector<uint64_t> cluster_ids;
   std::vector<std::string> addrs;
-  int32_t dp_size;
+  int32_t dp_size = 0;
+  // Effective KV-split width registered to etcd (0 = legacy / unset).
+  int32_t kv_split_size = 0;
   // transfer listen ports
   std::vector<uint16_t> ports;
   // ttft profiling data
@@ -265,6 +267,7 @@ struct InstanceInfo {
     json_val["cluster_ids"] = cluster_ids;
     json_val["addrs"] = addrs;
     json_val["dp_size"] = dp_size;
+    json_val["kv_split_size"] = kv_split_size;
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;

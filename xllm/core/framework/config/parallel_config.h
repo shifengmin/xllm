@@ -65,8 +65,9 @@ class ParallelConfig final {
   // 0 means follow cp_size (legacy KV-split width).
   PROPERTY(int32_t, kv_split_size) = 0;
 
-  // KV-split width of the remote prefill instance (decode-side PD only).
-  // 0 falls back to local cp_size when unset.
+  // Deprecated decode-side override; prefer etcd kv_split_size from prefill.
+  // When > 0, overrides remote metadata for KV transfer stride and
+  // link_cluster.
   PROPERTY(int32_t, prefill_kv_split_size) = 0;
 
   PROPERTY(int64_t, tp_size) = 1;

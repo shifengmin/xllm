@@ -129,6 +129,8 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name,
   engine->get_cache_info(
       instance_info_.cluster_ids, instance_info_.addrs, instance_info_.ports);
   instance_info_.dp_size = options_.dp_size();
+  instance_info_.kv_split_size =
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
 
   // Get total physical pages per worker (for etcd registration)
 #if defined(USE_NPU)
@@ -885,19 +887,20 @@ bool DisaggPDScheduler::link_instance(const std::string& instance_name,
                                       const std::vector<uint64_t>& cluster_ids,
                                       const std::vector<std::string>& addrs,
                                       const std::vector<uint16_t>& ports,
-                                      const int32_t dp_size) {
+                                      const int32_t dp_size,
+                                      const int32_t src_kv_split_size) {
+  InstanceInfo remote_info;
+  remote_info.kv_split_size = src_kv_split_size;
+  const int32_t effective_kv_split =
+      util::remote_kv_split_size_effective(remote_info);
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);
-  if (!engine_->link_cluster(cluster_ids,
-                             addrs,
-                             ports,
-                             dp_size,
-                             util::prefill_kv_split_size_effective())) {
+  if (!engine_->link_cluster(
+          cluster_ids, addrs, ports, dp_size, effective_kv_split)) {
     LOG(ERROR) << "Link instance failed, instance_name: " << instance_name;
     return false;
   }
   LOG(INFO) << "Successfully linked instance, instance_name: " << instance_name
-            << ", prefill_kv_split_size: "
-            << util::prefill_kv_split_size_effective();
+            << ", prefill_kv_split_size: " << effective_kv_split;
   linked_instance_.emplace(instance_name);
   return true;
 }
@@ -907,7 +910,12 @@ bool DisaggPDScheduler::unlink_instance(
     const std::vector<uint64_t>& cluster_ids,
     const std::vector<std::string>& addrs,
     const std::vector<uint16_t>& ports,
-    const int32_t dp_size) {
+    const int32_t dp_size,
+    const int32_t src_kv_split_size) {
+  InstanceInfo remote_info;
+  remote_info.kv_split_size = src_kv_split_size;
+  const int32_t effective_kv_split =
+      util::remote_kv_split_size_effective(remote_info);
   // Clear received requests from this instance
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
@@ -922,11 +930,8 @@ bool DisaggPDScheduler::unlink_instance(
   }
 
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);
-  if (!engine_->unlink_cluster(cluster_ids,
-                               addrs,
-                               ports,
-                               dp_size,
-                               util::prefill_kv_split_size_effective())) {
+  if (!engine_->unlink_cluster(
+          cluster_ids, addrs, ports, dp_size, effective_kv_split)) {
     LOG(ERROR) << "Unlink instance failed, instance_name: " << instance_name;
     return false;
   }

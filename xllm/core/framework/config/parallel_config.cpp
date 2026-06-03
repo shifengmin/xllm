@@ -32,11 +32,12 @@ DEFINE_int32(kv_split_size,
              "across K ranks while token-CP still uses cp_size.");
 
 DEFINE_int32(prefill_kv_split_size,
-             1,
-             "KV-cache split width of the remote prefill instance. Set on "
-             "decode nodes in PD mode so D can match P logical block layout "
-             "(link_cluster stride and remote_blocks_ids expansion). 0 falls "
-             "back to local cp_size.");
+             0,
+             "Deprecated override for remote prefill KV-split width on decode "
+             "nodes. Prefer automatic discovery via etcd (kv_split_size in "
+             "instance metadata). When > 0, overrides etcd for decode-side "
+             "KV transfer stride and link_cluster. 0 uses etcd or local "
+             "cp_size.");
 
 DEFINE_int64(tp_size, 1, "Tensor parallelism size, only used for DiT model.");
 

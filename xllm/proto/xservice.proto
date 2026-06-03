@@ -30,6 +30,8 @@ message InstanceMetaInfo {
   optional InstanceType type = 3;
   repeated uint64 cluster_ids = 4;
   int32 dp_size = 7;
+  // Effective KV-split width (kv_split_size if set, else cp_size).
+  int32 kv_split_size = 13;
   repeated string addrs = 8;
   repeated uint32 ports = 10;
   string incarnation_id = 11;
