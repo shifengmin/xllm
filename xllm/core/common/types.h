@@ -363,7 +363,9 @@ class MasterStatus {
   };
 
   constexpr MasterStatus(Value v) : value_(v) {}
-  constexpr MasterStatus(const xllm::proto::MasterStatus& status) {
+
+  explicit MasterStatus(const xllm::proto::MasterStatus& status)
+      : value_(WAKEUP) {
     switch (status) {
       case xllm::proto::MasterStatus::WAKEUP:
         value_ = WAKEUP;
@@ -376,7 +378,6 @@ class MasterStatus {
         break;
       default:
         LOG(FATAL) << "Unsupported master status: " << status;
-        value_ = WAKEUP;  // unreachable, suppress warning
         break;
     }
   }
@@ -391,7 +392,7 @@ class MasterStatus {
   bool operator==(Value rhs) const { return value_ == rhs; }
   bool operator!=(Value rhs) const { return value_ != rhs; }
 
-  constexpr xllm::proto::MasterStatus to_proto() const {
+  xllm::proto::MasterStatus to_proto() const {
     switch (value_) {
       case WAKEUP:
         return xllm::proto::MasterStatus::WAKEUP;
