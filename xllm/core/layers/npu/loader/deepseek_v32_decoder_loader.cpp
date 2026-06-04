@@ -14,7 +14,10 @@ limitations under the License.
 ==============================================================================*/
 #include "deepseek_v32_decoder_loader.h"
 
+#include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
+
+#include <sstream>
 
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -24,6 +27,26 @@ namespace xllm {
 namespace layer {
 
 using namespace deepseek_v32_decoder_constants;
+
+namespace {
+
+std::string tensor_shape_str(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "(undefined)";
+  }
+  std::ostringstream oss;
+  oss << "[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << tensor.size(i);
+  }
+  oss << "]";
+  return oss.str();
+}
+
+}  // namespace
 
 DeekseekV32DecoderLoader::DeekseekV32DecoderLoader(
     uint64_t weight_count,
@@ -808,24 +831,44 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
 }
 
 void DeekseekV32DecoderLoader::shard_oproj_for_cp() {
-  if (!::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard() ||
-      cp_size_ <= 1) {
+  const bool enabled =
+      ::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard();
+  if (!enabled || cp_size_ <= 1) {
+    if (layer_id_ == 0) {
+      LOG(INFO) << "[oproj_cp_shard] skip layer=" << layer_id_
+                << " enable_oproj_cp_shard=" << enabled
+                << " cp_size=" << cp_size_;
+    }
     return;
   }
+
   auto& t = working_tensors();
   // o_proj.weight is [hidden(out), in_local(contraction)]; deq_scale/quant_bias
   // are per-output-channel (length hidden). All three are sharded along dim0
   // (hidden) so the ATB-side AllGather can simply concat along the rank axis.
   auto shard_dim0 = [this](torch::Tensor& tensor, const char* name) {
     if (!tensor.defined() || tensor.numel() == 0) {
+      LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_
+                << " cp_rank=" << cp_rank_ << "/" << cp_size_ << " " << name
+                << " empty, skip";
       return;
     }
     const int64_t dim0 = tensor.size(0);
     CHECK_EQ(dim0 % cp_size_, 0)
         << "o_proj cp-shard requires dim0 divisible by cp_size: " << name
         << " dim0=" << dim0 << " cp_size=" << cp_size_;
+    const std::string shape_before = tensor_shape_str(tensor);
+    const int64_t nbytes_before = tensor.nbytes();
     tensor = tensor.chunk(cp_size_, /*dim=*/0)[cp_rank_].contiguous();
+    LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_
+              << " cp_rank=" << cp_rank_ << "/" << cp_size_ << " " << name
+              << " shape " << shape_before << " -> " << tensor_shape_str(tensor)
+              << " nbytes " << nbytes_before << " -> " << tensor.nbytes();
   };
+
+  LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_ << " cp_rank=" << cp_rank_
+            << "/" << cp_size_ << " dp_local_tp_rank=" << dp_local_tp_rank_
+            << " dp_local_tp_size=" << dp_local_tp_size_ << " start";
   shard_dim0(t[IN_ATTENTION_OUT_WEIGHT], "IN_ATTENTION_OUT_WEIGHT");
   shard_dim0(t[IN_ATTENTION_OUT_DESCALE], "IN_ATTENTION_OUT_DESCALE");
   shard_dim0(t[IN_ATTENTION_OUT_BIAS], "IN_ATTENTION_OUT_BIAS");
