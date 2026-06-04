@@ -61,6 +61,7 @@ BaseLoader::BaseLoader(uint64_t weight_count,
   CHECK_EQ(parallel_args_.world_size(),
            dp_size_ * dp_local_tp_size_ * cp_size_);
   dp_local_tp_rank_ = parallel_args_.rank() % dp_local_tp_size_;
+  cp_rank_ = parallel_args_.cp_rank();
 
   at_weight_tensors_.resize(weight_count_);
   if (mode_ == LoadMode::kManual) {

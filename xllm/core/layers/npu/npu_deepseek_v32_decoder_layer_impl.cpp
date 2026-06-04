@@ -488,6 +488,12 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_parallel_parameters(
   param.enableGatherPreNorm = true;
   param.enableExtraOprojTp = false;  // TODO
   param.isMlpFullTP = false;         // TODO
+  // o_proj CP-sharding (FSDP). The ATB graph only actually AllGathers when the
+  // CP group is enabled (prefill with cp_size > 1); on degraded decode it falls
+  // back to the full (unsharded) weight, matching the loader which only shards
+  // when cp_size > 1.
+  param.enableOprojCpShard =
+      ::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard();
   param.mapping = parallel_args.mapping();
   // Decode node should not use CP-specific graph branches.
   if (!param.isPrefill) {

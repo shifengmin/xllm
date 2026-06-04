@@ -115,6 +115,8 @@ DECLARE_int32(micro_batch_num);
 
 DECLARE_bool(enable_dp_balance);
 
+DECLARE_bool(enable_oproj_cp_shard);
+
 // --- ep load balance config ---
 DECLARE_bool(enable_eplb);
 

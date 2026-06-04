@@ -259,6 +259,7 @@ class BaseLoader {
   int32_t dp_rank_;
   int32_t dp_local_tp_rank_;
   int32_t cp_size_;
+  int32_t cp_rank_;
 
   LoadMode mode_ = LoadMode::kEager;
 

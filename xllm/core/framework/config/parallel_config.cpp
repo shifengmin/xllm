@@ -69,6 +69,14 @@ DEFINE_bool(
     "Whether to enable dp load balance, if true, sequences within a single "
     "dp batch will be shuffled.");
 
+DEFINE_bool(
+    enable_oproj_cp_shard,
+    false,
+    "Whether to FSDP-shard the attention o_proj weight across the CP group. "
+    "Each rank stores only 1/cp of o_proj (and deq_scale/quant_bias) and "
+    "AllGathers the full weight before the o_proj matmul. Only effective on "
+    "prefill instances with cp_size > 1.");
+
 namespace xllm {
 
 void ParallelConfig::from_flags() {
@@ -85,6 +93,7 @@ void ParallelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dp_balance);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_oproj_cp_shard);
 }
 
 void ParallelConfig::from_json(const JsonReader& json) {
@@ -100,6 +109,7 @@ void ParallelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(micro_batch_num);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dp_balance);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_oproj_cp_shard);
 }
 
 void ParallelConfig::append_config_json(
@@ -124,6 +134,8 @@ void ParallelConfig::append_config_json(
       config_json, default_config, micro_batch_num);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dp_balance);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_oproj_cp_shard);
 }
 
 ParallelConfig& ParallelConfig::get_instance() {

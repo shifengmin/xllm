@@ -52,7 +52,8 @@ class ParallelConfig final {
          "enable_mm_encoder_dp",
          "enable_multi_stream_parallel",
          "micro_batch_num",
-         "enable_dp_balance"}};
+         "enable_dp_balance",
+         "enable_oproj_cp_shard"}};
     return kOptionCategory;
   }
 
@@ -82,6 +83,13 @@ class ParallelConfig final {
   PROPERTY(int32_t, micro_batch_num) = 1;
 
   PROPERTY(bool, enable_dp_balance) = false;
+
+  // FSDP-style sharding of o_proj weight across the CP group: each rank stores
+  // only 1/cp of o_proj (and its deq_scale/quant_bias) and reconstructs the
+  // full weight via an AllGather before the o_proj matmul. Only effective on
+  // prefill instances with cp_size > 1 (PD-disaggregation). Used to save
+  // memory.
+  PROPERTY(bool, enable_oproj_cp_shard) = false;
 
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;

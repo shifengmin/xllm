@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "deepseek_decoder_loader_constants.h"
 
 namespace xllm {
@@ -802,6 +803,32 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
           t[IN_MLP_DOWN_SCALE_EXPERT].to(torch::kFloat32);
     }
   }
+
+  shard_oproj_for_cp();
+}
+
+void DeekseekV32DecoderLoader::shard_oproj_for_cp() {
+  if (!::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard() ||
+      cp_size_ <= 1) {
+    return;
+  }
+  auto& t = working_tensors();
+  // o_proj.weight is [hidden(out), in_local(contraction)]; deq_scale/quant_bias
+  // are per-output-channel (length hidden). All three are sharded along dim0
+  // (hidden) so the ATB-side AllGather can simply concat along the rank axis.
+  auto shard_dim0 = [this](torch::Tensor& tensor, const char* name) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+      return;
+    }
+    const int64_t dim0 = tensor.size(0);
+    CHECK_EQ(dim0 % cp_size_, 0)
+        << "o_proj cp-shard requires dim0 divisible by cp_size: " << name
+        << " dim0=" << dim0 << " cp_size=" << cp_size_;
+    tensor = tensor.chunk(cp_size_, /*dim=*/0)[cp_rank_].contiguous();
+  };
+  shard_dim0(t[IN_ATTENTION_OUT_WEIGHT], "IN_ATTENTION_OUT_WEIGHT");
+  shard_dim0(t[IN_ATTENTION_OUT_DESCALE], "IN_ATTENTION_OUT_DESCALE");
+  shard_dim0(t[IN_ATTENTION_OUT_BIAS], "IN_ATTENTION_OUT_BIAS");
 }
 
 }  // namespace layer
