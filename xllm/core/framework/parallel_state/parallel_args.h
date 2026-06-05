@@ -152,7 +152,7 @@ struct ParallelArgs {
     if (kv <= 1) {
       return 0;
     }
-    return cp_rank() % kv;
+    return rank / (world_size_ / kv);
   }
 
   // tp size
