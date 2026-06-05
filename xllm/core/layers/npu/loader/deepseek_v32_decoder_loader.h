@@ -98,11 +98,12 @@ class DeekseekV32DecoderLoader : public BaseLoader {
 
   void handle_device_specific_bias();
 
-  // FSDP-style shard of o_proj across the CP group: keep only 1/cp of
-  // IN_ATTENTION_OUT_{WEIGHT,DESCALE,BIAS} along dim0 (hidden). No-op unless
-  // ParallelConfig::enable_oproj_cp_shard() and cp_size_ > 1. The ATB graph
-  // reconstructs the full weight via an AllGather before the o_proj matmul.
-  void shard_oproj_for_cp();
+  bool oproj_cp_shard_enabled() const;
+
+  // FSDP-style shard of one o_proj tensor across the CP group (dim0). Called
+  // from load_state_dict via process_general_weights. No-op unless
+  // ParallelConfig::enable_oproj_cp_shard() and cp_size_ > 1.
+  void maybe_shard_oproj_tensor(torch::Tensor& tensor, const char* name);
 
   void merge_shared_experts_weights();
 

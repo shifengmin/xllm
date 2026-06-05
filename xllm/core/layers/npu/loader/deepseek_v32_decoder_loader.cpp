@@ -17,6 +17,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
+#include <cstring>
 #include <sstream>
 
 #include "core/framework/config/eplb_config.h"
@@ -350,17 +351,37 @@ void DeekseekV32DecoderLoader::process_general_weights(
     return;
   }
   const bool is_sharded = WEIGHT_SHARD_W8A8.count(index);
-  torch::Tensor tmp_tensor;
+  const bool is_oproj_for_cp =
+      absl::EndsWith(name, "self_attn.o_proj.weight") ||
+      absl::EndsWith(name, "self_attn.o_proj.quant_bias") ||
+      absl::EndsWith(name, "self_attn.o_proj.deq_scale");
 
-  tmp_tensor = is_sharded ? get_sharded_tensor(state_dict,
-                                               name,
-                                               WEIGHT_SHARD_W8A8.at(index),
-                                               dp_local_tp_rank_,
-                                               dp_local_tp_size_)
-                                .to(target_device())
-                          : tensor.to(target_device());
+  torch::Tensor tmp_tensor =
+      is_sharded ? get_sharded_tensor(state_dict,
+                                      name,
+                                      WEIGHT_SHARD_W8A8.at(index),
+                                      dp_local_tp_rank_,
+                                      dp_local_tp_size_)
+                 : tensor;
+
+  // o_proj: TP shard on host, CP shard, then H2D. Other weights: H2D first.
+  if (!is_oproj_for_cp) {
+    tmp_tensor = tmp_tensor.to(target_device());
+  }
 
   correct_tensor_dtype(tmp_tensor, name);
+
+  if (is_oproj_for_cp) {
+    const char* slot_name = "IN_ATTENTION_OUT_WEIGHT";
+    if (absl::EndsWith(name, "self_attn.o_proj.quant_bias")) {
+      slot_name = "IN_ATTENTION_OUT_BIAS";
+    } else if (absl::EndsWith(name, "self_attn.o_proj.deq_scale")) {
+      slot_name = "IN_ATTENTION_OUT_DESCALE";
+    }
+    maybe_shard_oproj_tensor(tmp_tensor, slot_name);
+    tmp_tensor = tmp_tensor.contiguous().to(target_device());
+  }
+
   auto& t = working_tensors();
   t[index] = tmp_tensor;
   if (absl::StartsWith(name, "self_attn.q_a_proj")) {
@@ -826,52 +847,43 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
           t[IN_MLP_DOWN_SCALE_EXPERT].to(torch::kFloat32);
     }
   }
-
-  shard_oproj_for_cp();
 }
 
-void DeekseekV32DecoderLoader::shard_oproj_for_cp() {
-  const bool enabled =
-      ::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard();
-  if (!enabled || cp_size_ <= 1) {
-    if (layer_id_ == 0) {
-      LOG(INFO) << "[oproj_cp_shard] skip layer=" << layer_id_
-                << " enable_oproj_cp_shard=" << enabled
-                << " cp_size=" << cp_size_;
+bool DeekseekV32DecoderLoader::oproj_cp_shard_enabled() const {
+  return ::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard() &&
+         cp_size_ > 1;
+}
+
+void DeekseekV32DecoderLoader::maybe_shard_oproj_tensor(torch::Tensor& tensor,
+                                                        const char* name) {
+  if (!oproj_cp_shard_enabled()) {
+    if (layer_id_ == 0 && std::strcmp(name, "IN_ATTENTION_OUT_WEIGHT") == 0) {
+      LOG(INFO)
+          << "[oproj_cp_shard] skip layer=" << layer_id_
+          << " enable_oproj_cp_shard="
+          << ::xllm::ParallelConfig::get_instance().enable_oproj_cp_shard()
+          << " cp_size=" << cp_size_;
     }
     return;
   }
 
-  auto& t = working_tensors();
-  // o_proj.weight is [hidden(out), in_local(contraction)]; deq_scale/quant_bias
-  // are per-output-channel (length hidden). All three are sharded along dim0
-  // (hidden) so the ATB-side AllGather can simply concat along the rank axis.
-  auto shard_dim0 = [this](torch::Tensor& tensor, const char* name) {
-    if (!tensor.defined() || tensor.numel() == 0) {
-      LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_
-                << " cp_rank=" << cp_rank_ << "/" << cp_size_ << " " << name
-                << " empty, skip";
-      return;
-    }
-    const int64_t dim0 = tensor.size(0);
-    CHECK_EQ(dim0 % cp_size_, 0)
-        << "o_proj cp-shard requires dim0 divisible by cp_size: " << name
-        << " dim0=" << dim0 << " cp_size=" << cp_size_;
-    const std::string shape_before = tensor_shape_str(tensor);
-    const int64_t nbytes_before = tensor.nbytes();
-    tensor = tensor.chunk(cp_size_, /*dim=*/0)[cp_rank_].contiguous();
+  if (!tensor.defined() || tensor.numel() == 0) {
     LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_
               << " cp_rank=" << cp_rank_ << "/" << cp_size_ << " " << name
-              << " shape " << shape_before << " -> " << tensor_shape_str(tensor)
-              << " nbytes " << nbytes_before << " -> " << tensor.nbytes();
-  };
-
+              << " empty, skip";
+    return;
+  }
+  const int64_t dim0 = tensor.size(0);
+  CHECK_EQ(dim0 % cp_size_, 0)
+      << "o_proj cp-shard requires dim0 divisible by cp_size: " << name
+      << " dim0=" << dim0 << " cp_size=" << cp_size_;
+  const std::string shape_before = tensor_shape_str(tensor);
+  const int64_t nbytes_before = tensor.nbytes();
+  tensor = tensor.chunk(cp_size_, /*dim=*/0)[cp_rank_].contiguous();
   LOG(INFO) << "[oproj_cp_shard] layer=" << layer_id_ << " cp_rank=" << cp_rank_
-            << "/" << cp_size_ << " dp_local_tp_rank=" << dp_local_tp_rank_
-            << " dp_local_tp_size=" << dp_local_tp_size_ << " start";
-  shard_dim0(t[IN_ATTENTION_OUT_WEIGHT], "IN_ATTENTION_OUT_WEIGHT");
-  shard_dim0(t[IN_ATTENTION_OUT_DESCALE], "IN_ATTENTION_OUT_DESCALE");
-  shard_dim0(t[IN_ATTENTION_OUT_BIAS], "IN_ATTENTION_OUT_BIAS");
+            << "/" << cp_size_ << " " << name << " shape " << shape_before
+            << " -> " << tensor_shape_str(tensor) << " nbytes " << nbytes_before
+            << " -> " << tensor.nbytes();
 }
 
 }  // namespace layer
