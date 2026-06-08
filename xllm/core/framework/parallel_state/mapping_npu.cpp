@@ -211,8 +211,9 @@ void MappingNPU::parse_parallel_info() {
 
   const int32_t cp_group_size =
       attn_cp_.group_size() > 0 ? attn_cp_.group_size() : 1;
+  // Unset (-1) follows cp_size for legacy parity; explicit 1 means "no split".
   const int32_t kv_split_group_size =
-      options_.kv_split_size() > 0 ? options_.kv_split_size() : 1;
+      options_.kv_split_size() > 0 ? options_.kv_split_size() : cp_group_size;
   attn_kv_split_.group_size(kv_split_group_size);
   attn_kv_split_.backend("hccl");
 

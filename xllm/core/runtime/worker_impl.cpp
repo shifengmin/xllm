@@ -574,7 +574,13 @@ torch::Tensor WorkerImpl::recompute_new_cache_slots(const ForwardInput& input) {
         old_cache_slots.index_select(0, valid_indices_on_device)
             .to(torch::kInt);
     torch::Tensor block_id = torch::floor_divide(old_slotid, block_size_total);
-    torch::Tensor block_offset_mod = old_slotid % options_.block_size();
+    // `old_slotid` is in BlockManager logical space (stride block_size_total).
+    // The offset within this rank's KV shard is the sub-block slice, not
+    // `old_slotid % block_size` which breaks once logical_offset >= block_size
+    // (kv_split_size < cp_size, multiple CP ranks share one shard).
+    torch::Tensor logical_offset_in_block = old_slotid % block_size_total;
+    torch::Tensor block_offset_mod =
+        logical_offset_in_block % options_.block_size();
     torch::Tensor new_slotid =
         block_id * options_.block_size() + block_offset_mod;
     new_cache_slots.index_put_({valid_indices_on_device},

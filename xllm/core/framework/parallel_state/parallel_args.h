@@ -141,15 +141,28 @@ struct ParallelArgs {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
   }
 
-  // KV-split rank: global rank block index over world_size / kv_split_size.
-  // Aligns with MappingNPU::get_kv_split_group (get_dp_group stride) and ATB
-  // kvSplitInfo.rankIds ordering used by the prefix AllGather.
+  // KV-shard id for slot remapping / prefix geometry. When cp_size is a
+  // multiple of kv_split_size, each shard owns cp_size/kv_split_size CP ranks.
+  // This matches MappingNPU::get_kv_split_group AllGather order (tp lane picks
+  // ranks 0,4,8,12 as local ranks 0..3 = shards 0..3).
   [[nodiscard]] int32_t kv_split_rank() const noexcept {
     const int32_t kv = kv_split_size_effective();
     if (kv <= 1) {
       return 0;
     }
-    return rank_ / (world_size_ / kv);
+#if defined(USE_NPU)
+    if (mapping_.Has(atb_speed::base::ATTN_KV_SPLIT)) {
+      const auto& kv_info = mapping_.Get(atb_speed::base::ATTN_KV_SPLIT);
+      if (kv_info.rankIds.size() > 1) {
+        return static_cast<int32_t>(kv_info.rank);
+      }
+    }
+#endif
+    if (cp_size_ > 1 && cp_size_ % kv == 0) {
+      return (cp_rank() * kv) / cp_size_;
+    }
+    const int32_t shards = world_size_ / kv;
+    return shards > 0 ? rank_ / shards : 0;
   }
 
   // tp size
