@@ -21,14 +21,8 @@ limitations under the License.
 #include <initializer_list>
 #include <sstream>
 #include <string>
-#include <utility>
 
 #include "util/env_var.h"
-
-#if defined(USE_NPU)
-#include <acl/acl.h>
-#include <torch_npu/csrc/core/npu/NPUStream.h>
-#endif
 
 namespace xllm {
 namespace util {
@@ -43,21 +37,7 @@ inline bool npu_scatter_trace_enabled() {
   return enabled;
 }
 
-inline void npu_scatter_trace_sync() {
-#if defined(USE_NPU)
-  if (!npu_scatter_trace_enabled()) {
-    return;
-  }
-  const auto stream = c10_npu::getCurrentNPUStream();
-  const aclError ret = aclrtSynchronizeStream(stream.stream());
-  if (ret != ACL_SUCCESS) {
-    LOG(WARNING) << "[NPU_SCATTER_TRACE] aclrtSynchronizeStream failed, ret="
-                 << ret;
-  }
-#else
-  (void)0;
-#endif
-}
+void npu_scatter_trace_sync();
 
 inline std::string npu_scatter_trace_describe_tensor(
     const torch::Tensor& tensor) {

@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/state_dict/utils.h"
+#include "core/util/npu_scatter_trace.h"
 #include "core/util/utils.h"
 #include "llm_model_base.h"
 
@@ -296,9 +297,14 @@ class MtpModelImplBase : public torch::nn::Module {
     // Mask out embeddings where positions == 0 (for MTP not needed at pos 0)
     auto mask = (positions == 0);  // bool tensor
     if (mask.any().item<bool>()) {
-      // set masked rows to zero
-      hidden_states.index_put_({mask},
-                               torch::zeros_like(hidden_states.index({mask})));
+      auto masked_values = torch::zeros_like(hidden_states.index({mask}));
+      util::log_npu_scatter_before("mtp_model_base::forward",
+                                   "index_put_",
+                                   {{"hidden_states", hidden_states},
+                                    {"mask", mask},
+                                    {"src", masked_values}});
+      hidden_states.index_put_({mask}, masked_values);
+      util::log_npu_scatter_after("mtp_model_base::forward", "index_put_");
     }
 
     std::optional<torch::Tensor> residual;

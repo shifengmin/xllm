@@ -52,6 +52,7 @@ cc_library(
     utils.cpp
     uuid.cpp
     shared_memory_manager.cpp
+    $<$<BOOL:${USE_NPU}>:npu_scatter_trace.cpp>
   DEPS
     Folly::folly
     torch
@@ -63,6 +64,7 @@ cc_library(
     glog::glog
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
+    $<$<BOOL:${USE_NPU}>:ascendcl>
     $<$<BOOL:${USE_NPU}>:ms_tools_ext>
     Boost::serialization
     absl::synchronization
