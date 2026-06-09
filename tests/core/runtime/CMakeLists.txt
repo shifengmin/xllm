@@ -40,6 +40,7 @@ cc_test(
     spec_input_builder_test.cpp
     "${PROJECT_SOURCE_DIR}/xllm/core/runtime/spec_input_builder.cpp"
   DEPS
+    :util
     torch
     glog::glog
     proto::xllm_proto
