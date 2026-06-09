@@ -129,6 +129,7 @@ cc_library(
     :parallel_state
     :state_dict
     :model
+    :util
     glog::glog
     gflags::gflags
     spdlog::spdlog

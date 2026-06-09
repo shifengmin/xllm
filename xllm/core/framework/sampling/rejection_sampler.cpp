@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "kernels/ops_api.h"
 #include "sampler.h"
+#include "util/npu_scatter_trace.h"
 
 namespace xllm {
 
@@ -217,11 +218,17 @@ std::tuple<torch::Tensor, torch::Tensor> RejectionSampler::random_sample(
   // construct recovered probs
   auto recovered_probs = target_probs.clone();
   if (use_selected_only_draft_probs) {
-    recovered_probs.scatter_(/*dim=*/-1,
-                             draft_token_ids.unsqueeze(-1),
-                             torch::zeros_like(selected_draft_probs)
-                                 .unsqueeze(-1)
-                                 .to(recovered_probs.dtype()));
+    auto scatter_index = draft_token_ids.unsqueeze(-1);
+    auto scatter_src = torch::zeros_like(selected_draft_probs)
+                           .unsqueeze(-1)
+                           .to(recovered_probs.dtype());
+    util::log_npu_scatter_before("rejection_sampler::sample",
+                                 "scatter_",
+                                 {{"recovered_probs", recovered_probs},
+                                  {"index", scatter_index},
+                                  {"src", scatter_src}});
+    recovered_probs.scatter_(/*dim=*/-1, scatter_index, scatter_src);
+    util::log_npu_scatter_after("rejection_sampler::sample", "scatter_");
   } else {
     recovered_probs.sub_(draft_probs).clamp_min_(0);
   }

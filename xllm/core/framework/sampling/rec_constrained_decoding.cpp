@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "framework/state_dict/rec_vocab_dict.h"
+#include "util/npu_scatter_trace.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
 
@@ -190,7 +191,16 @@ torch::Tensor RecConstrainedDecoding::generate_decode_mask(
         torch::tensor(global_batch_vocab_indices, torch::kInt64);
     token_indices = safe_to(token_indices, device_, true);
     vocab_indices = safe_to(vocab_indices, device_, true);
-    mask.index_put_({token_indices, vocab_indices}, 0.0f);
+    auto fill_value = torch::tensor(0.0f, mask.options());
+    util::log_npu_scatter_before("rec_constrained_decoding::build_mask",
+                                 "index_put_",
+                                 {{"mask", mask},
+                                  {"token_indices", token_indices},
+                                  {"vocab_indices", vocab_indices},
+                                  {"src", fill_value}});
+    mask.index_put_({token_indices, vocab_indices}, fill_value);
+    util::log_npu_scatter_after("rec_constrained_decoding::build_mask",
+                                "index_put_");
   }
 
   return mask;

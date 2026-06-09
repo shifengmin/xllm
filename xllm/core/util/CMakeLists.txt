@@ -18,6 +18,7 @@ cc_library(
     model_config_utils.h
     lightweightsemaphore.h
     net.h
+    npu_scatter_trace.h
     pretty_print.h
     rec_model_utils.h
     scope_guard.h

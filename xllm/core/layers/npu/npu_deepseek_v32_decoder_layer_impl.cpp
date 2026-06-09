@@ -33,6 +33,7 @@ limitations under the License.
 #include "framework/parallel_state/npu_cp_prepare.h"
 #include "layers/common/rotary_embedding_util.h"
 #include "loader/deepseek_v32_decoder_loader.h"
+#include "util/npu_scatter_trace.h"
 
 namespace xllm {
 namespace layer {
@@ -591,7 +592,13 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::build_expert_routing_map(
 
   auto index_tensor = torch::tensor(keys, torch::kInt64);
   auto value_tensor = torch::tensor(values, torch::kInt32);
+  util::log_npu_scatter_before(
+      "npu_deepseek_v32::build_expert_routing_map",
+      "scatter",
+      {{"input", input}, {"index", index_tensor}, {"src", value_tensor}});
   auto result = input.scatter(0, index_tensor, value_tensor).to(device_);
+  util::log_npu_scatter_after("npu_deepseek_v32::build_expert_routing_map",
+                              "scatter");
   // result = result.reshape({ep_size_,result.size(0)/ep_size_}).contiguous();
   return result;
 }

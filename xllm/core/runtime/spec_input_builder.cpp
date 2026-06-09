@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "framework/model/model_input_params.h"
 #include "runtime/forward_params.h"
+#include "util/npu_scatter_trace.h"
 #include "util/tensor_helper.h"
 
 namespace xllm::specBuilder {
@@ -493,10 +494,16 @@ std::pair<torch::Tensor, torch::Tensor> build_validate_tensors(
     } else {
       auto dense_probs =
           torch::zeros({batch_size, 1, vocab_size}, selected_probs.options());
-      dense_probs.scatter_(
-          /*dim=*/-1,
-          draft_token_ids.unsqueeze(-1),
-          selected_probs.unsqueeze(-1));
+      auto scatter_index = draft_token_ids.unsqueeze(-1);
+      auto scatter_src = selected_probs.unsqueeze(-1);
+      util::log_npu_scatter_before("spec_input_builder::build_draft_probs",
+                                   "scatter_",
+                                   {{"dense_probs", dense_probs},
+                                    {"index", scatter_index},
+                                    {"src", scatter_src}});
+      dense_probs.scatter_(/*dim=*/-1, scatter_index, scatter_src);
+      util::log_npu_scatter_after("spec_input_builder::build_draft_probs",
+                                  "scatter_");
       probs_vec.emplace_back(dense_probs);
     }
   }

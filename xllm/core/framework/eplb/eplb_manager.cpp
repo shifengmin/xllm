@@ -29,6 +29,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
+#include "util/npu_scatter_trace.h"
 
 namespace xllm {
 
@@ -130,7 +131,15 @@ void EplbManager::aggregate_multi_layer_expert_loads(
     }
     torch::Tensor all_ids = torch::cat(layer_ids);
     torch::Tensor all_loads = torch::cat(layer_loads);
+    util::log_npu_scatter_before(
+        "eplb_manager::aggregate_multi_layer_expert_loads",
+        "scatter_add_",
+        {{"expert_load", expert_load[layer]},
+         {"index", all_ids},
+         {"src", all_loads}});
     expert_load[layer].scatter_add_(0, all_ids, all_loads);
+    util::log_npu_scatter_after(
+        "eplb_manager::aggregate_multi_layer_expert_loads", "scatter_add_");
   }
 }
 

@@ -72,6 +72,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
+#include "util/npu_scatter_trace.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
@@ -577,8 +578,15 @@ torch::Tensor WorkerImpl::recompute_new_cache_slots(const ForwardInput& input) {
     torch::Tensor block_offset_mod = old_slotid % options_.block_size();
     torch::Tensor new_slotid =
         block_id * options_.block_size() + block_offset_mod;
-    new_cache_slots.index_put_({valid_indices_on_device},
-                               new_slotid.to(new_cache_slots.scalar_type()));
+    auto slot_values = new_slotid.to(new_cache_slots.scalar_type());
+    util::log_npu_scatter_before("worker_impl::recompute_new_cache_slots",
+                                 "index_put_",
+                                 {{"new_cache_slots", new_cache_slots},
+                                  {"index", valid_indices_on_device},
+                                  {"src", slot_values}});
+    new_cache_slots.index_put_({valid_indices_on_device}, slot_values);
+    util::log_npu_scatter_after("worker_impl::recompute_new_cache_slots",
+                                "index_put_");
   }
   return new_cache_slots;
 }

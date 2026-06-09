@@ -18,6 +18,9 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <memory>
+#include <utility>
+
+#include "util/npu_scatter_trace.h"
 
 namespace xllm {
 
@@ -31,7 +34,17 @@ void apply_frequency_presence_penalties(
   score.sub_(unique_token_counts * frequency_penalties.unsqueeze(1));
   score.sub_((unique_token_counts > 0) * presence_penalties.unsqueeze(1));
 
+  util::log_npu_scatter_before(
+      "logits_utils::apply_frequency_presence_penalties",
+      "scatter_",
+      {{"logits", logits},
+       {"index", unique_token_ids},
+       {"src", score},
+       {"frequency_penalties", frequency_penalties},
+       {"presence_penalties", presence_penalties}});
   logits.scatter_(/*dim=*/1, /*index=*/unique_token_ids, /*core=*/score);
+  util::log_npu_scatter_after(
+      "logits_utils::apply_frequency_presence_penalties", "scatter_");
 }
 
 void apply_repetition_penalties(torch::Tensor& logits,
@@ -39,12 +52,19 @@ void apply_repetition_penalties(torch::Tensor& logits,
                                 const torch::Tensor& penalties) {
   auto unsqueezed_penalties = penalties.unsqueeze(1);
   auto score = logits.gather(/*dim=*/1, /*index=*/unique_token_ids);
+  auto scatter_src = torch::where(
+      score < 0, score * unsqueezed_penalties, score / unsqueezed_penalties);
+  util::log_npu_scatter_before("logits_utils::apply_repetition_penalties",
+                               "scatter_",
+                               {{"logits", logits},
+                                {"index", unique_token_ids},
+                                {"src", scatter_src},
+                                {"penalties", penalties}});
   logits.scatter_(/*dim=*/1,
                   /*index=*/unique_token_ids,
-                  /*core=*/
-                  torch::where(score < 0,
-                               score * unsqueezed_penalties,
-                               score / unsqueezed_penalties));
+                  /*core=*/scatter_src);
+  util::log_npu_scatter_after("logits_utils::apply_repetition_penalties",
+                              "scatter_");
 }
 
 void apply_temperatures(torch::Tensor& logits,
@@ -77,10 +97,21 @@ void apply_top_k_top_p_torch_impl(torch::Tensor& logits,
   auto cum = probs.cumsum(-1);
   auto p_mask = cum > p;
   // at least one
+  util::log_npu_scatter_before("logits_utils::apply_top_k_top_p_torch_impl",
+                               "index_put_",
+                               {{"p_mask", p_mask}});
   p_mask.index_put_({torch::indexing::Ellipsis, 0}, false);
+  util::log_npu_scatter_after("logits_utils::apply_top_k_top_p_torch_impl",
+                              "index_put_");
   sorted.masked_fill_(p_mask, inf);
 
+  util::log_npu_scatter_before(
+      "logits_utils::apply_top_k_top_p_torch_impl",
+      "scatter_",
+      {{"logits", logits}, {"index", idx}, {"src", sorted}});
   logits.scatter_(-1, idx, sorted);
+  util::log_npu_scatter_after("logits_utils::apply_top_k_top_p_torch_impl",
+                              "scatter_");
 }
 
 void apply_top_k_top_p(torch::Tensor& logits,
@@ -148,9 +179,18 @@ void apply_top_k_top_p(torch::Tensor& logits,
 
       sorted_logits.masked_fill_(mask, filter_value);
     }
-    logits =
-        torch::empty_like(sorted_logits)
-            .scatter_(/*dim=*/-1, /*index=*/logits_idx, /*core=*/sorted_logits);
+    auto scatter_out = torch::empty_like(sorted_logits);
+    util::log_npu_scatter_before("logits_utils::apply_top_k_top_p",
+                                 "scatter_",
+                                 {{"out", scatter_out},
+                                  {"index", logits_idx},
+                                  {"src", sorted_logits},
+                                  {"logits", logits}});
+    scatter_out.scatter_(/*dim=*/-1,
+                         /*index=*/logits_idx,
+                         /*core=*/sorted_logits);
+    util::log_npu_scatter_after("logits_utils::apply_top_k_top_p", "scatter_");
+    logits = std::move(scatter_out);
   }
 }
 
