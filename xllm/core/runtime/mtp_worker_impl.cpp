@@ -1004,14 +1004,17 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                    << (i < raw_tokens.size() ? raw_tokens[i] : -999);
     }
   }
-  // Re-enabled for debugging (see check_mtp_decode_states). When
-  // --mtp_decode_debug is on it logs divergence non-fatally; otherwise it
-  // restores the original fatal validation.
-  check_mtp_decode_states(last_states,
-                          input.input_params.embedding.request_ids,
-                          input.token_ids_host,
-                          enable_schedule_overlap(),
-                          /*log_only=*/FLAGS_mtp_decode_debug);
+  // Host-side state validation only runs under --mtp_decode_debug so the
+  // default decode path stays identical to the released build: the check reads
+  // host tensors and adds host-side latency that could itself mask a timing
+  // race, which would contaminate any clone/sync A/B verification.
+  if (FLAGS_mtp_decode_debug) {
+    check_mtp_decode_states(last_states,
+                            input.input_params.embedding.request_ids,
+                            input.token_ids_host,
+                            enable_schedule_overlap(),
+                            /*log_only=*/true);
+  }
   update_decode_step_input(input, last_states);
   prepare_draft_extend_inputs(input, last_states, current_draft_input);
   draft_outputs.reserve(num_speculative_tokens);

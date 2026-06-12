@@ -44,9 +44,12 @@ class EmbeddingCache final {
     // current real position from this offset.
     int32_t token_id = -1;
     int32_t position_offset = 0;
-    // Store detached views into target outputs instead of cloning. The views
-    // keep their storage alive until replaced, trading short-lived HBM
-    // retention for avoiding per-step embedding copies.
+    // Owns an independent clone of the target output embedding. A detached view
+    // into the forward output is NOT safe here: in the fully-async worker
+    // pipeline the producing forward and the next-step consumer run on
+    // different streams without a host-side barrier, so a view can be read
+    // before/while its backing buffer is still being written or reused,
+    // corrupting the draft/validate input.
     torch::Tensor embedding;
 
     // Previous accepted target token. Its position is derived as
