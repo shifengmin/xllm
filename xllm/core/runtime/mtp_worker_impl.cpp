@@ -55,6 +55,21 @@ DEFINE_int32(
     8,
     "Number of MTP decode steps to log when --mtp_decode_debug is on.");
 
+// Diagnostic: restore the pre-async-refactor (commit 18b896f4) synchronous MTP
+// decode behavior by host-synchronizing the prepare/compute/default streams at
+// each decode sub-step boundary. 18b896f4 moved prepare work onto
+// prepare_stream and made the draft/validate forwards fully async with event
+// ordering, but some producers (e.g. the bootstrap / target embedding clones)
+// still run on the default stream. On a cold pipeline (first request, no graph
+// warmup) the cross-stream window is widest and a consumer can read before the
+// producer finishes. Enable this to confirm whether residual first-request
+// garble is a stream race; it trades the async perf win for correctness.
+DEFINE_bool(mtp_decode_sync_streams,
+            false,
+            "Force synchronous MTP decode by draining prepare/compute/default "
+            "streams at each sub-step boundary (diagnoses cold-pipeline stream "
+            "races introduced by the async worker refactor).");
+
 namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
@@ -180,7 +195,15 @@ std::optional<ForwardOutput> run_llm_no_sync_impl(LLMWorkerImpl& worker,
   ForwardInput processed_input;
   worker.prepare_work_before_execute_on_stream(
       input, processed_input, prepare_stream);
-  return worker.execute_no_sync_on_stream(processed_input, compute_stream);
+  std::optional<ForwardOutput> output =
+      worker.execute_no_sync_on_stream(processed_input, compute_stream);
+  if (FLAGS_mtp_decode_sync_streams) {
+    // Diagnostic: serialize this sub-step so its outputs are fully materialized
+    // before the host reads/consumes them on a different stream next.
+    prepare_stream.synchronize();
+    compute_stream.synchronize();
+  }
+  return output;
 }
 
 torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
@@ -1016,6 +1039,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                             /*log_only=*/true);
   }
   update_decode_step_input(input, last_states);
+  if (FLAGS_mtp_decode_sync_streams) {
+    // The bootstrap/target embedding clones stored in EmbeddingCache run on the
+    // default stream, but prepare_draft_extend_inputs reads them (torch::stack)
+    // on prepare_stream_. Drain the default stream first so the consumer never
+    // races the producer on a cold pipeline.
+    device_.synchronize_default_stream();
+  }
   prepare_draft_extend_inputs(input, last_states, current_draft_input);
   draft_outputs.reserve(num_speculative_tokens);
   const bool reuse_mtp_topk_indices =
