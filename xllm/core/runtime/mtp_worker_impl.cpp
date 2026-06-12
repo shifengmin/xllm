@@ -18,8 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <memory>
+#include <sstream>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -41,10 +43,40 @@ limitations under the License.
 #include "util/timer.h"
 #include "util/utils.h"
 
+// Debug-only: log per-sequence MTP decode bootstrap / position / slot
+// diagnostics for the first N decode steps. Used to localize PD+CP+MTP garble
+// (token vs position vs slot). Remove once the root cause is fixed.
+DEFINE_bool(mtp_decode_debug,
+            false,
+            "Log per-sequence MTP decode diagnostics for the first "
+            "--mtp_decode_debug_max_steps decode steps.");
+DEFINE_int32(
+    mtp_decode_debug_max_steps,
+    8,
+    "Number of MTP decode steps to log when --mtp_decode_debug is on.");
+
 namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
+
+// Debug gate shared across the synchronous step_decode -> update/prepare chain
+// (all run on the same thread, so thread_local is safe and avoids spam).
+std::atomic<int64_t> g_mtp_decode_dbg_calls{0};
+thread_local bool t_mtp_decode_dbg = false;
+thread_local int64_t t_mtp_decode_dbg_call = -1;
+
+// Accepts std::vector<int32_t> too via Slice's implicit conversion.
+std::string mtp_dbg_join(Slice<int32_t> values, size_t max_n = 64) {
+  std::ostringstream os;
+  const size_t n = std::min<size_t>(values.size(), max_n);
+  for (size_t i = 0; i < n; ++i) {
+    if (i) os << ",";
+    os << values[i];
+  }
+  if (values.size() > n) os << ",...(" << values.size() << ")";
+  return os.str();
+}
 
 int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
   const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
@@ -205,38 +237,69 @@ void check_mtp_decode_states(
     const std::vector<EmbeddingCache::DecodeState>& states,
     const std::vector<std::string>& request_ids,
     const torch::Tensor& token_ids_host,
-    bool allow_overlap_fake_token) {
-  CHECK(!request_ids.empty())
-      << "MTP decode requires request ids for bootstrap state validation";
-  CHECK_EQ(states.size(), request_ids.size())
-      << "MTP decode request/state count mismatch";
-  CHECK_GE(token_ids_host.numel(), static_cast<int64_t>(states.size()))
-      << "MTP decode token/state count mismatch";
+    bool allow_overlap_fake_token,
+    bool log_only) {
+  // When log_only is set we report mismatches via LOG(ERROR) and keep running,
+  // so a single debug run can surface token/position/slot divergence together
+  // instead of aborting on the first failed CHECK. The message is built lazily
+  // (only on failure) so the re-enabled check stays cheap on the decode path.
+  auto report = [&](bool ok, auto&& make_msg) {
+    if (ok) return;
+    if (log_only) {
+      LOG(ERROR) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                 << "] CHECK FAILED: " << make_msg();
+    } else {
+      LOG(FATAL) << make_msg();
+    }
+  };
+
+  report(!request_ids.empty(), [] {
+    return "MTP decode requires request ids for bootstrap state validation";
+  });
+  report(states.size() == request_ids.size(),
+         [] { return "MTP decode request/state count mismatch"; });
+  report(token_ids_host.numel() >= static_cast<int64_t>(states.size()),
+         [] { return "MTP decode token/state count mismatch"; });
+  if (request_ids.empty() || states.size() != request_ids.size() ||
+      token_ids_host.numel() < static_cast<int64_t>(states.size())) {
+    return;
+  }
 
   Slice<int32_t> token_ids = {token_ids_host.data_ptr<int32_t>(),
                               static_cast<size_t>(token_ids_host.numel())};
   for (int32_t i = 0; i < static_cast<int32_t>(states.size()); ++i) {
     const EmbeddingCache::DecodeState& state = states[i];
     const int32_t token_id = token_ids[i];
-    CHECK(state.valid) << "MTP decode missing target state, request_id="
-                       << request_ids[i];
-    CHECK_EQ(state.request_id, request_ids[i])
-        << "MTP decode target state request mismatch";
-    CHECK(state.embedding.defined())
-        << "MTP decode target state embedding is undefined, request_id="
-        << request_ids[i];
+    report(state.valid, [&] {
+      return "MTP decode missing target state, request_id=" + request_ids[i];
+    });
+    report(state.request_id == request_ids[i], [&] {
+      return "MTP decode target state request mismatch, request_id=" +
+             request_ids[i] + " cached_req=" + state.request_id;
+    });
+    report(state.embedding.defined(), [&] {
+      return "MTP decode target state embedding is undefined, request_id=" +
+             request_ids[i];
+    });
     if (token_id < 0) {
-      CHECK(allow_overlap_fake_token)
-          << "MTP decode fake token is only allowed with schedule overlap, "
-          << "request_id=" << request_ids[i];
-      CHECK_GE(state.token_id, 0)
-          << "MTP decode fake token requires a valid cached target token, "
-          << "request_id=" << request_ids[i];
+      report(allow_overlap_fake_token, [&] {
+        return "MTP decode fake token is only allowed with schedule overlap, "
+               "request_id=" +
+               request_ids[i];
+      });
+      report(state.token_id >= 0, [&] {
+        return "MTP decode fake token requires a valid cached target token, "
+               "request_id=" +
+               request_ids[i];
+      });
       continue;
     }
-    CHECK_EQ(state.token_id, token_id)
-        << "MTP decode target state token mismatch, request_id="
-        << request_ids[i];
+    report(state.token_id == token_id, [&] {
+      return "MTP decode target state token mismatch, request_id=" +
+             request_ids[i] +
+             " cached_token=" + std::to_string(state.token_id) +
+             " input_token=" + std::to_string(token_id);
+    });
   }
 }
 
@@ -853,6 +916,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
 
+  t_mtp_decode_dbg = false;
+  t_mtp_decode_dbg_call = -1;
+  if (FLAGS_mtp_decode_debug) {
+    t_mtp_decode_dbg_call = g_mtp_decode_dbg_calls.fetch_add(1);
+    t_mtp_decode_dbg = t_mtp_decode_dbg_call < FLAGS_mtp_decode_debug_max_steps;
+  }
+
   std::vector<ForwardOutput> draft_outputs;
   ForwardInput current_draft_input, validate_input, next_step_input;
   Timer timer;
@@ -905,13 +975,43 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   CHECK_EQ(last_states.size(),
            input.input_params.embedding.embedding_ids.size())
       << "decode target state count mismatch";
-  // TODO: Revisit bootstrap state validation for graph mode. The check was
-  // disabled because cached target tokens may diverge from the scheduler's
-  // decode input when schedule overlap or graph replay is active.
-  // check_mtp_decode_states(last_states,
-  //                         input.input_params.embedding.request_ids,
-  //                         input.token_ids_host,
-  //                         enable_schedule_overlap());
+  if (t_mtp_decode_dbg) {
+    const auto& emb = input.input_params.embedding;
+    const bool has_bootstrap = emb.mtp_bootstrap_embeddings.defined();
+    Slice<int32_t> raw_tokens = {
+        input.token_ids_host.data_ptr<int32_t>(),
+        static_cast<size_t>(input.token_ids_host.numel())};
+    LOG(WARNING) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                 << "][read_states] num_seq="
+                 << input.input_params.meta.num_sequences
+                 << " has_bootstrap=" << has_bootstrap
+                 << " bootstrap_rows=" << emb.mtp_bootstrap_row_idxes.size()
+                 << " overlap=" << enable_schedule_overlap()
+                 << " raw_input_tokens=[" << mtp_dbg_join(raw_tokens) << "]";
+    for (size_t i = 0; i < last_states.size(); ++i) {
+      const auto& st = last_states[i];
+      LOG(WARNING) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                   << "][read_states] seq=" << i << " emb_id="
+                   << (i < emb.embedding_ids.size() ? emb.embedding_ids[i] : -1)
+                   << " req="
+                   << (i < emb.request_ids.size() ? emb.request_ids[i]
+                                                  : std::string("?"))
+                   << " state.valid=" << st.valid
+                   << " state.token_id=" << st.token_id
+                   << " state.pos_off=" << st.position_offset
+                   << " state.emb_def=" << st.embedding.defined()
+                   << " raw_input_token="
+                   << (i < raw_tokens.size() ? raw_tokens[i] : -999);
+    }
+  }
+  // Re-enabled for debugging (see check_mtp_decode_states). When
+  // --mtp_decode_debug is on it logs divergence non-fatally; otherwise it
+  // restores the original fatal validation.
+  check_mtp_decode_states(last_states,
+                          input.input_params.embedding.request_ids,
+                          input.token_ids_host,
+                          enable_schedule_overlap(),
+                          /*log_only=*/FLAGS_mtp_decode_debug);
   update_decode_step_input(input, last_states);
   prepare_draft_extend_inputs(input, last_states, current_draft_input);
   draft_outputs.reserve(num_speculative_tokens);
@@ -1166,9 +1266,25 @@ void MTPWorkerImpl::update_decode_step_input(
         << ", current_position=" << current_position
         << ", current_kv_len=" << current_kv_len;
 
-    token_ids_vec.emplace_back((use_cache_correction || use_fake_context)
-                                   ? state.token_id
-                                   : input_token_id);
+    const int32_t chosen_token = (use_cache_correction || use_fake_context)
+                                     ? state.token_id
+                                     : input_token_id;
+    if (t_mtp_decode_dbg) {
+      LOG(WARNING) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                   << "][update_decode] seq=" << seq_id
+                   << " input_token=" << input_token_id
+                   << " input_pos=" << input_positions[seq_id]
+                   << " state.valid=" << state.valid
+                   << " state.token_id=" << state.token_id
+                   << " use_cache_correction=" << use_cache_correction
+                   << " use_fake_context=" << use_fake_context
+                   << " position_offset=" << position_offset
+                   << " -> chosen_token=" << chosen_token
+                   << " current_position=" << current_position
+                   << " current_kv_len=" << current_kv_len
+                   << " expected_kv_len=" << expected_kv_len;
+    }
+    token_ids_vec.emplace_back(chosen_token);
     positions_vec.emplace_back(current_position);
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
@@ -1255,6 +1371,16 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
       << "validate kv slots/tokens mismatch";
   CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
+  if (t_mtp_decode_dbg) {
+    LOG(WARNING) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                 << "][validate] num_val_tokens=" << num_val_tokens
+                 << " tokens=[" << mtp_dbg_join(buf.out_token_ids) << "]"
+                 << " positions=[" << mtp_dbg_join(buf.out_positions) << "]"
+                 << " new_cache_slots=["
+                 << mtp_dbg_join(buf.out_new_cache_slots) << "]"
+                 << " kv_seq_lens=[" << mtp_dbg_join(buf.out_kv_seq_lens)
+                 << "]";
+  }
 
   set_token_position_tensors(validate_input,
                              buf.out_token_ids,
@@ -1439,6 +1565,17 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       << "draft extend slots/positions mismatch";
   CHECK_EQ(expanded_embeddings.size(), buf.out_positions.size())
       << "draft extend embeddings/positions mismatch";
+  if (t_mtp_decode_dbg) {
+    LOG(WARNING) << "[mtp_decode_dbg #" << t_mtp_decode_dbg_call
+                 << "][draft_extend] tokens=["
+                 << mtp_dbg_join(buf.out_token_ids) << "]"
+                 << " positions=[" << mtp_dbg_join(buf.out_positions) << "]"
+                 << " new_cache_slots=["
+                 << mtp_dbg_join(buf.out_new_cache_slots) << "]"
+                 << " kv_seq_lens=[" << mtp_dbg_join(buf.out_kv_seq_lens) << "]"
+                 << " selected_row_idx=[" << mtp_dbg_join(selected_row_idx)
+                 << "]";
+  }
 
   set_token_position_tensors(extend_input,
                              buf.out_token_ids,
