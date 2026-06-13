@@ -70,6 +70,19 @@ DEFINE_bool(mtp_decode_sync_streams,
             "streams at each sub-step boundary (diagnoses cold-pipeline stream "
             "races introduced by the async worker refactor).");
 
+// Low-overhead probe: dumps, for the first --mtp_decode_debug_max_steps decode
+// steps, the per-sequence target seed token / position / kv_len fed into the
+// validate forward and the validate output tokens. Unlike --mtp_decode_debug,
+// the dump happens AFTER the step's compute_stream sync (so it cannot mask a
+// pre-compute timing race) and the pre-compute path only does cheap host work.
+// This answers the decisive question for the CP-prefill garble: is the target's
+// output[0] already wrong (=> target inputs/KV corrupted) or correct (=> the
+// corruption is downstream of the target)?
+DEFINE_bool(mtp_decode_probe,
+            false,
+            "Dump first-N decode-step target seed/position/kv_len and validate "
+            "output tokens after the compute sync (race-safe diagnostics).");
+
 namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
@@ -80,6 +93,46 @@ namespace {
 std::atomic<int64_t> g_mtp_decode_dbg_calls{0};
 thread_local bool t_mtp_decode_dbg = false;
 thread_local int64_t t_mtp_decode_dbg_call = -1;
+
+// Separate counter/gate for the race-safe probe (--mtp_decode_probe). Kept
+// distinct from the debug counter so the probe can run without the pre-compute
+// logging that would otherwise serialize the pipeline and hide the bug.
+std::atomic<int64_t> g_mtp_decode_probe_calls{0};
+thread_local int64_t t_mtp_decode_probe_call = -1;
+
+std::string mtp_dbg_join_i64(const torch::Tensor& tensor, size_t max_n = 64) {
+  if (!tensor.defined()) {
+    return "<undef>";
+  }
+  torch::Tensor cpu = tensor.to(torch::kCPU).contiguous().to(torch::kLong);
+  const int64_t* data = cpu.const_data_ptr<int64_t>();
+  const size_t total = static_cast<size_t>(cpu.numel());
+  const size_t n = std::min<size_t>(total, max_n);
+  std::ostringstream os;
+  for (size_t i = 0; i < n; ++i) {
+    if (i) os << ",";
+    os << data[i];
+  }
+  if (total > n) os << ",...(" << total << ")";
+  return os.str();
+}
+
+std::string mtp_dbg_join_host_i32(const torch::Tensor& tensor,
+                                  size_t max_n = 64) {
+  if (!tensor.defined() || !tensor.device().is_cpu()) {
+    return "<undef>";
+  }
+  torch::Tensor t = tensor.to(torch::kInt).contiguous();
+  Slice<int32_t> s = {t.data_ptr<int32_t>(), static_cast<size_t>(t.numel())};
+  std::ostringstream os;
+  const size_t n = std::min<size_t>(s.size(), max_n);
+  for (size_t i = 0; i < n; ++i) {
+    if (i) os << ",";
+    os << s[i];
+  }
+  if (s.size() > n) os << ",...(" << s.size() << ")";
+  return os.str();
+}
 
 // Accepts std::vector<int32_t> too via Slice's implicit conversion.
 std::string mtp_dbg_join(Slice<int32_t> values, size_t max_n = 64) {
@@ -945,6 +998,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     t_mtp_decode_dbg_call = g_mtp_decode_dbg_calls.fetch_add(1);
     t_mtp_decode_dbg = t_mtp_decode_dbg_call < FLAGS_mtp_decode_debug_max_steps;
   }
+  t_mtp_decode_probe_call = -1;
+  if (FLAGS_mtp_decode_probe) {
+    t_mtp_decode_probe_call = g_mtp_decode_probe_calls.fetch_add(1);
+  }
 
   std::vector<ForwardOutput> draft_outputs;
   ForwardInput current_draft_input, validate_input, next_step_input;
@@ -1158,6 +1215,27 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
 
   compute_stream_->synchronize();
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+  if (FLAGS_mtp_decode_probe && t_mtp_decode_probe_call >= 0 &&
+      t_mtp_decode_probe_call < FLAGS_mtp_decode_debug_max_steps) {
+    // Dumped after the compute sync above, so it reflects the value the target
+    // actually produced this step and cannot perturb this step's timing. The
+    // first column of `out` is output[0] (always target-decided): if it is
+    // already a wrong/garbage token id, the target's inputs (prompt KV / seed /
+    // positions) are corrupted; if it is correct, look downstream.
+    const auto& emb = input.input_params.embedding;
+    LOG(WARNING) << "[mtp_decode_probe #" << t_mtp_decode_probe_call << "]"
+                 << " num_seq=" << input.input_params.meta.num_sequences
+                 << " has_bootstrap=" << emb.mtp_bootstrap_embeddings.defined()
+                 << " target_seed=["
+                 << mtp_dbg_join_host_i32(input.token_ids_host) << "]"
+                 << " target_pos=["
+                 << mtp_dbg_join_host_i32(input.positions_host) << "]"
+                 << " target_kv_len=["
+                 << mtp_dbg_join(input.input_params.attention.host.kv_seq_lens)
+                 << "]"
+                 << " out_shape=" << val_output.next_tokens.sizes() << " out=["
+                 << mtp_dbg_join_i64(val_output.next_tokens) << "]";
+  }
   write_target_context_to_cache(input, val_output);
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {

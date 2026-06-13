@@ -280,12 +280,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !options_.enable_speculative_decode()) {
     MULTI_MODEL_STEP_UNLOCK();
-    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-      return std::nullopt;
-    }
-    auto ret = device_.synchronize_default_stream();
-    // in p-d disaggregation scene, all micro batches should be in same
-    // prefill/decode stage, so, to judge transfer_kv_infos.empty,
+    // A PD prefill that PUSHes KV must wait for the cross-node transfer to land
+    // before returning, otherwise decode may start reading prompt KV that is
+    // still in flight. This must run even on the NO_SYNC path (decode steps
+    // carry empty transfer_kv_infos, so it is a no-op there).
     if (options_.kv_cache_transfer_mode() == "PUSH" &&
         !input.transfer_kv_infos.empty()) {
       auto results =
@@ -298,6 +296,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         }
       }
     }
+    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+      return std::nullopt;
+    }
+    auto ret = device_.synchronize_default_stream();
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       return output;
     }
@@ -365,6 +367,27 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
   MULTI_MODEL_STEP_UNLOCK();
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+    // Even on the async (NO_SYNC) path a PD prefill that PUSHes KV must wait
+    // for the cross-node transfer to land before the engine sends the first
+    // generation token to the decode instance. The push runs on the transfer
+    // engine (gated by the layer synchronizer), not on compute_stream_, so a
+    // plain stream sync is not enough; only awaiting the push futures
+    // guarantees completion. Skipping this (the async MTP refactor returned
+    // here before the await below) lets decode start reading prompt KV that is
+    // still in flight, which corrupts the target's view and garbles output.
+    // Decode steps carry empty transfer_kv_infos, so this is a no-op there, and
+    // PULL mode is skipped entirely.
+    if (options_.kv_cache_transfer_mode() == "PUSH" &&
+        !input.transfer_kv_infos.empty()) {
+      auto results =
+          folly::collectAll(futures).within(std::chrono::seconds(60)).get();
+      for (const auto& result : results) {
+        if (!result.value()) {
+          LOG(ERROR) << "kv_cache_transfer_ failed";
+          break;
+        }
+      }
+    }
     output.retained_input = std::make_shared<ForwardInput>(input);
     if (enable_schedule_overlap()) {
       output.ready_event = record_current_stream_event(device_);
