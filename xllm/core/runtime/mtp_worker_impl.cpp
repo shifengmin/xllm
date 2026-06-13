@@ -83,6 +83,25 @@ DEFINE_bool(mtp_decode_probe,
             "Dump first-N decode-step target seed/position/kv_len and validate "
             "output tokens after the compute sync (race-safe diagnostics).");
 
+// Diagnostic: serialize the MTP *prefill* target forward before its outputs are
+// consumed. step_prefill runs the target forward on compute_stream_ via
+// run_llm_no_sync_impl (no sync), then reads output.embeddings /
+// selected_embeddings on the DEFAULT stream (embeddings.clone(), bootstrap
+// index_select, write_prefill_target_context) WITHOUT waiting on the target's
+// compute event. Under CP this is the LmHead-gathered hidden that seeds the
+// decode bootstrap. On a cold first request the compute_stream is slow and the
+// default-stream consumer can win the race -> garbled first request, normal
+// afterwards. --mtp_decode_sync_streams does NOT cover this (it only syncs
+// inside run_llm_no_sync_impl). Enable this to confirm the prefill-side
+// cross-stream hazard for CP-prefill + MTP.
+DEFINE_bool(
+    mtp_prefill_sync_target,
+    false,
+    "Drain the target forward's compute/default streams in step_prefill "
+    "before its embeddings are consumed, to diagnose CP-prefill + MTP "
+    "first-request garble caused by an unsynchronized cross-stream read "
+    "of the target hidden states.");
+
 namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
@@ -853,6 +872,17 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   ForwardOutput output =
       run_llm_no_sync_impl(*impl_, input, *prepare_stream_, *compute_stream_)
           .value();
+  if (FLAGS_mtp_prefill_sync_target) {
+    // Diagnostic: the target forward above ran async on compute_stream_, but
+    // the glue below (embeddings.clone, bootstrap index_select,
+    // write_prefill_target_context) consumes its outputs on the default stream
+    // without waiting on the compute event. Drain both streams here so the
+    // consumer always reads fully-materialized target hidden states; if this
+    // removes the CP-prefill + MTP first-request garble, the root cause is that
+    // unsynchronized cross-stream read.
+    compute_stream_->synchronize();
+    device_.synchronize_default_stream();
+  }
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
