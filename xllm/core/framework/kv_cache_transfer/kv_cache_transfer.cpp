@@ -18,10 +18,24 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <sstream>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kv_cache_config.h"
+
+// Diagnostic: log the per-sequence local->remote block mapping produced by
+// filter_kv_split_infos for CP / KV-split PUSH transfers. The strided mapping
+// local_block[k] -> remote_blocks_ids[kv_split_rank + k*kv_split_size]
+// truncates local blocks whenever the strided remote index runs past the D-side
+// block list; that truncation silently drops prompt KV tail blocks and shows up
+// as decode repetition/garble. Used to localize CP-prefill + MTP garble: if the
+// non-draft (target) push truncates (mapped_local < n_local) under CP+MTP but
+// not under CP-only, the MTP block layout is breaking the kv-split reassembly.
+DEFINE_bool(kv_split_transfer_debug,
+            false,
+            "Log per-sequence local->remote block mapping and truncation in "
+            "filter_kv_split_infos for CP / KV-split PUSH transfers.");
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
@@ -65,6 +79,35 @@ folly::SemiFuture<bool> KVCacheTransfer::pull_kv_blocks_async(
   return future;
 }
 
+namespace {
+// Render the head and tail of a block-id list for compact diagnostics.
+std::string kv_split_dbg_sample(const std::vector<uint64_t>& ids,
+                                size_t head = 4,
+                                size_t tail = 4) {
+  std::ostringstream os;
+  const size_t n = ids.size();
+  os << "[";
+  if (n <= head + tail) {
+    for (size_t i = 0; i < n; ++i) {
+      if (i) os << ",";
+      os << ids[i];
+    }
+  } else {
+    for (size_t i = 0; i < head; ++i) {
+      if (i) os << ",";
+      os << ids[i];
+    }
+    os << ",...,";
+    for (size_t i = n - tail; i < n; ++i) {
+      if (i != n - tail) os << ",";
+      os << ids[i];
+    }
+  }
+  os << "]";
+  return os.str();
+}
+}  // namespace
+
 // In KV-split mode, local_blocks_ids already contains only this KV-split
 // rank's physical blocks. remote_blocks_ids holds the full D-side
 // total_blocks entries; this rank maps local_block[k] to
@@ -75,7 +118,8 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
     int32_t kv_split_size,
     const std::vector<TransferKVInfo>& kv_infos) {
   std::vector<TransferKVInfo> filtered_kv_infos;
-  for (const auto& kv_info : kv_infos) {
+  for (size_t info_idx = 0; info_idx < kv_infos.size(); ++info_idx) {
+    const auto& kv_info = kv_infos[info_idx];
     if (kv_info.local_blocks_ids.empty() &&
         kv_info.local_linear_state_ids.empty()) {
       continue;
@@ -107,6 +151,22 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
     // un-transferred KV (-> repetition). The dropped tail blocks correspond to
     // tokens beyond the prompt length, so the truncation is loss-free.
     filtered.local_blocks_ids.resize(mapped_local);
+    if (FLAGS_kv_split_transfer_debug) {
+      LOG(WARNING) << "[kv_split_dbg] seq=" << info_idx
+                   << " req=" << kv_info.request_id
+                   << " kv_split_rank=" << kv_split_rank
+                   << " kv_split_size=" << kv_split_size
+                   << " n_local=" << n_local
+                   << " remote_size=" << kv_info.remote_blocks_ids.size()
+                   << " mapped_local=" << mapped_local << " truncated="
+                   << (mapped_local < n_local ? (n_local - mapped_local) : 0)
+                   << " local_ids="
+                   << kv_split_dbg_sample(kv_info.local_blocks_ids)
+                   << " remote_full="
+                   << kv_split_dbg_sample(kv_info.remote_blocks_ids)
+                   << " remote_mapped="
+                   << kv_split_dbg_sample(filtered.remote_blocks_ids);
+    }
     if (!filtered.remote_blocks_ids.empty() ||
         !filtered.remote_linear_state_ids.empty()) {
       filtered_kv_infos.push_back(std::move(filtered));
@@ -149,6 +209,13 @@ folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
     // (each CP rank holds a full KV replica) the filter degenerates to a copy,
     // so we skip it and let each rank consume remote_blocks_ids 1:1.
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    if (FLAGS_kv_split_transfer_debug) {
+      LOG(WARNING) << "[kv_split_dbg] push begin path=base is_spec_draft="
+                   << is_spec_draft
+                   << " kv_split_rank=" << parallel_args.kv_split_rank()
+                   << " kv_split_size=" << kv_split_size
+                   << " n_infos=" << transfer_kv_infos.size();
+    }
     if (kv_split_size > 1) {
       filtered_kv_infos = filter_kv_split_infos(
           parallel_args.kv_split_rank(), kv_split_size, *kv_infos);

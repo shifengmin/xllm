@@ -15,9 +15,12 @@ limitations under the License.
 
 #include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "common/macros.h"
+
+DECLARE_bool(kv_split_transfer_debug);
 
 namespace xllm {
 SpecKVCacheTransfer::SpecKVCacheTransfer(const uint16_t listen_port,
@@ -162,6 +165,13 @@ folly::SemiFuture<bool> SpecKVCacheTransfer::push_kv_blocks_async(
     // rank's slice. When kv_split_size==1 each rank holds the full replica and
     // we keep the legacy 1:1 remote_blocks_ids mapping.
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    if (FLAGS_kv_split_transfer_debug) {
+      LOG(WARNING) << "[kv_split_dbg] push begin path=spec is_spec_draft="
+                   << is_spec_draft
+                   << " kv_split_rank=" << parallel_args.kv_split_rank()
+                   << " kv_split_size=" << kv_split_size
+                   << " n_infos=" << transfer_kv_infos.size();
+    }
     if (kv_split_size > 1) {
       filtered_kv_infos = filter_kv_split_infos(
           parallel_args.kv_split_rank(), kv_split_size, *kv_infos);
