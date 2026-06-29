@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "function_call_parser.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
@@ -41,6 +42,7 @@ const std::unordered_map<std::string, std::vector<std::string>> auto_paser_map =
         {"kimi_k2", {"kimi_k2"}},
         {"deepseekv3", {"deepseek_v3"}},
         {"deepseekv32", {"deepseek_v32"}},
+        {"glm5", {"glm_moe_dsa", "glm_moe_dsa_mtp"}},
         // GLM-4.5 and GLM-4.7 are not supported for tool call parser
         // auto-selection
         // {"glm45", {"glm4_moe"}},
