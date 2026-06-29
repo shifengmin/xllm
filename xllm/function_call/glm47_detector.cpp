@@ -140,15 +140,25 @@ std::string Glm47Detector::extract_normal_text(
     return trim_whitespace(text);
   }
 
-  std::string normal_text;
+  const std::string_view text_view(text);
+  std::vector<std::string> segments;
   size_t last_end = 0;
   const size_t bot_len = bot_token_.length();
   const size_t eot_len = eot_token_.length();
 
+  // Trim each segment individually so that excised tool-call blocks do not
+  // leave dangling/duplicated whitespace at the seams.
+  auto collect_segment = [&](size_t start, size_t count) {
+    std::string segment = trim_whitespace(text_view.substr(start, count));
+    if (!segment.empty()) {
+      segments.push_back(std::move(segment));
+    }
+  };
+
   for (const auto& range : ranges) {
     size_t block_start = range.first - bot_len;
     if (block_start > last_end) {
-      normal_text.append(text, last_end, block_start - last_end);
+      collect_segment(last_end, block_start - last_end);
     }
     last_end = range.second + eot_len;
   }
@@ -156,13 +166,20 @@ std::string Glm47Detector::extract_normal_text(
   if (last_end < text.length()) {
     size_t trailing_bot = text.find(bot_token_, last_end);
     if (trailing_bot == std::string::npos) {
-      normal_text.append(text, last_end, std::string::npos);
+      collect_segment(last_end, std::string::npos);
     } else if (trailing_bot > last_end) {
-      normal_text.append(text, last_end, trailing_bot - last_end);
+      collect_segment(last_end, trailing_bot - last_end);
     }
   }
 
-  return trim_whitespace(normal_text);
+  std::string normal_text;
+  for (size_t i = 0; i < segments.size(); ++i) {
+    if (i > 0) {
+      normal_text += " ";
+    }
+    normal_text += segments[i];
+  }
+  return normal_text;
 }
 
 std::pair<std::string, std::string> Glm47Detector::parse_tool_call_content(
