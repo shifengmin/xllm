@@ -25,6 +25,7 @@ xLLM uses gflags to manage service startup parameters. The specific parameter me
 | `enable_prefill_sp` | `bool` | false | true | Whether to enable prefill-only sequence parallel. | `enable_chunked_prefill=true` is supported only for prefill-only batches (`PREFILL` / `CHUNKED_PREFILL`); `MIXED` and `DECODE` batches do not run with sequence parallel. |
 | `enable_schedule_overlap` | `bool` | false | true | Whether to enable asynchronous scheduling. | [Details](./features/async_schedule.md) |
 | `enable_prefix_cache` | `bool` | true | false | Whether to enable prefix cache (not supported by DeepSeek currently). |  |
+| `enable_prefix_cache_aware_dp_routing` | `bool` | false | true | When data parallel and prefix cache are enabled, route a new request to the dp rank that can hold the whole prefill request and has the longest prefix-cache hit, instead of the rank with the most free blocks. |  |
 | `communication_backend` | `string` | "hccl" | "lccl" | The backend used for communication operations. |  |
 | `block_size` | `int32` | 128 |  | The block size for KV Cache storage. |  |
 | `task` | `string` | "generate" | "embed", "mm_embed" | Service type: generation, embedding, or multimodal embedding. |  |

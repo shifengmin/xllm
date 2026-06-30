@@ -112,12 +112,60 @@ int32_t BlockManagerPool::get_manager_with_max_free_blocks() const {
   return max_index;
 }
 
+int32_t BlockManagerPool::get_cache_aware_dp_rank(Sequence* sequence) const {
+  const size_t block_size = options_.block_size();
+  CHECK_GT(block_size, 0u);
+  const size_t needed_blocks =
+      (sequence->num_tokens() + block_size - 1) / block_size;
+
+  int32_t best_rank = 0;
+  // Ordered selection key (larger is better):
+  //   1. can_fit: the rank can hold the whole prefill request;
+  //   2. matched: prefix-cache hit length in blocks;
+  //   3. free: free blocks (tie-breaker).
+  int32_t best_can_fit = -1;
+  size_t best_matched = 0;
+  size_t best_free = 0;
+  for (size_t i = 0; i < block_managers_.size(); ++i) {
+    auto* composite =
+        static_cast<CompositeBlockManager*>(block_managers_[i].get());
+    const size_t matched =
+        composite->prefix_match_length_for_sequence(sequence);
+    const size_t free = composite->num_free_blocks();
+    const size_t cached = composite->num_blocks_in_prefix_cache();
+    // The matched blocks are reused (not evicted), so only the remaining cached
+    // blocks count toward the room eviction could reclaim.
+    const size_t evictable = cached > matched ? cached - matched : 0;
+    const size_t available = free + evictable;
+    const size_t net_needed =
+        needed_blocks > matched ? needed_blocks - matched : 0;
+    const int32_t can_fit = net_needed <= available ? 1 : 0;
+
+    const bool better = can_fit > best_can_fit ||
+                        (can_fit == best_can_fit && matched > best_matched) ||
+                        (can_fit == best_can_fit && matched == best_matched &&
+                         free > best_free);
+    if (better) {
+      best_can_fit = can_fit;
+      best_matched = matched;
+      best_free = free;
+      best_rank = static_cast<int32_t>(i);
+    }
+  }
+  return best_rank;
+}
+
 int32_t BlockManagerPool::get_dp_rank(Sequence* sequence) const {
   int32_t dp_rank;
   if (sequence->dp_rank() >= 0) {
     dp_rank = sequence->dp_rank();
   } else {
-    dp_rank = get_manager_with_max_free_blocks();
+    if (options_.enable_prefix_cache() && options_.enable_cache_aware_dp() &&
+        block_managers_.size() > 1) {
+      dp_rank = get_cache_aware_dp_rank(sequence);
+    } else {
+      dp_rank = get_manager_with_max_free_blocks();
+    }
     sequence->set_dp_rank(dp_rank);
   }
   return dp_rank;

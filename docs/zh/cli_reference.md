@@ -25,6 +25,7 @@ xLLM使用gflags来管理服务启动参数，具体的参数含义如下：
 | `enable_prefill_sp` | `bool` | false | true | 是否开启 prefill 阶段的 sequence parallel | 支持 `enable_chunked_prefill=true`，但仅限纯 prefill batch（`PREFILL` / `CHUNKED_PREFILL`）；`MIXED` 与 `DECODE` batch 不会进入 sequence parallel。 |
 | `enable_schedule_overlap` | `bool` | false | true | 是否开启异步调度 | [详情](./features/async_schedule.md) |
 | `enable_prefix_cache` | `bool` | true | false | 是否开启prefix cache（DeepSeek暂不支持） |  |
+| `enable_prefix_cache_aware_dp_routing` | `bool` | false | true | 开启数据并行(DP)且开启 prefix cache 时，将新请求路由到“能放下整个 prefill 请求且 prefix 命中最长”的 dp rank，而非空闲块最多的 rank。 |  |
 | `communication_backend` | `string` | "hccl" | "lccl" | 通信操作采用的后端 |  |
 | `block_size` | `int32` | 128 |  | KV Cache存储的block size大小 |  |
 | `task` | `string` | "generate" | "embed", "mm_embed" | 服务类型，生成式、embedding或多模态embedding |  |
