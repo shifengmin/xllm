@@ -120,6 +120,41 @@ std::vector<Block> PrefixCache::match(
   return blocks;
 }
 
+size_t PrefixCache::match_length(
+    const Slice<int32_t>& token_ids,
+    const Slice<Block>& existed_shared_blocks) const {
+  // allign tokens to block boundary
+  const size_t n_tokens = round_down(token_ids.size(), block_size_);
+  if (n_tokens == 0) {
+    return 0;
+  }
+
+  const size_t start_index = existed_shared_blocks.size() * block_size_;
+  // The already-shared blocks are guaranteed hits; start counting from there.
+  size_t matched = existed_shared_blocks.size();
+  XXH3Key token_hash_key =
+      existed_shared_blocks.empty()
+          ? XXH3Key{}
+          : XXH3Key{existed_shared_blocks.back().get_immutable_hash_value()};
+  for (size_t i = start_index; i < n_tokens; i += block_size_) {
+    if (i == 0) {
+      xxh3_128bits_hash(
+          nullptr, token_ids.slice(i, i + block_size_), token_hash_key.data);
+    } else {
+      xxh3_128bits_hash(token_hash_key.data,
+                        token_ids.slice(i, i + block_size_),
+                        token_hash_key.data);
+    }
+    // Read-only: probe the hash table without touching the LRU list, metrics,
+    // or block ref counts.
+    if (cached_blocks_.find(token_hash_key) == cached_blocks_.end()) {
+      break;
+    }
+    ++matched;
+  }
+  return matched;
+}
+
 size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
                            std::vector<Block>& blocks,
                            size_t existed_shared_blocks_num) {

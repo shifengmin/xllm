@@ -189,7 +189,11 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
       .block_size(block_size)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
-      .enable_cache_upload(options_.enable_cache_upload());
+      .enable_cache_upload(options_.enable_cache_upload())
+      .enable_cache_aware_dp(FLAGS_enable_prefix_cache_aware_dp_routing)
+      .cache_aware_match_threshold(FLAGS_prefix_cache_aware_dp_match_threshold)
+      .cache_aware_imbalance_threshold(
+          FLAGS_prefix_cache_aware_dp_imbalance_threshold);
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   return pipeline_->allocate_kv_cache(kv_cache_shape);

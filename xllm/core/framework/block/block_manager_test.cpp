@@ -119,4 +119,47 @@ TEST(BlockManagerTest, Basic) {
   }
 }
 
+// prefix_cache_match_length() reports the leading prefix-hit length in blocks
+// and must leave the cache (size and utilization) untouched.
+TEST(BlockManagerTest, PrefixCacheMatchLengthIsReadOnly) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(2).enable_prefix_cache(true);
+  // Leak intentionally: the prefix cache keeps the cached blocks referenced at
+  // teardown, which would otherwise trip the free-list check in
+  // ~BlockManagerImpl.
+  auto* manager = new BlockManagerImpl(options);
+
+  // Three full blocks: [1,2] [3,4] [5,6].
+  const std::vector<int32_t> tokens = {1, 2, 3, 4, 5, 6};
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/3);
+  ASSERT_EQ(blocks.size(), 3u);
+  manager->cache(
+      Slice<int32_t>(tokens), blocks, /*existed_shared_blocks_num=*/0);
+  ASSERT_EQ(manager->num_blocks_in_prefix_cache(), 3u);
+
+  const size_t cached_before = manager->num_blocks_in_prefix_cache();
+  const double util_before = manager->kv_cache_utilization();
+
+  // Full hit, and repeated probing is idempotent.
+  const size_t matched1 =
+      manager->prefix_cache_match_length(Slice<int32_t>(tokens));
+  const size_t matched2 =
+      manager->prefix_cache_match_length(Slice<int32_t>(tokens));
+  EXPECT_EQ(matched1, 3u);
+  EXPECT_EQ(matched2, matched1);
+
+  // A shorter prefix matches only its leading full blocks.
+  const std::vector<int32_t> short_tokens = {1, 2, 3, 4};
+  EXPECT_EQ(manager->prefix_cache_match_length(Slice<int32_t>(short_tokens)),
+            2u);
+
+  // A diverging prefix matches only the shared leading block.
+  const std::vector<int32_t> diverged = {1, 2, 9, 9};
+  EXPECT_EQ(manager->prefix_cache_match_length(Slice<int32_t>(diverged)), 1u);
+
+  // Probing mutated nothing.
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), cached_before);
+  EXPECT_DOUBLE_EQ(manager->kv_cache_utilization(), util_before);
+}
+
 }  // namespace xllm

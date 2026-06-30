@@ -67,6 +67,15 @@ class BlockManager {
   // get merged all dp rank KVCacheEvent
   virtual void get_merged_kvcache_event(KvCacheEvent* event) const = 0;
 
+  // Read-only probe of the prefix-cache hit length (in blocks) for `token_ids`.
+  // Mirrors allocate_shared's arguments but mutates no state. Managers without
+  // a prefix cache keep the base default of 0.
+  virtual size_t prefix_cache_match_length(
+      const Slice<int32_t>& /*token_ids*/,
+      const Slice<Block>& /*existed_shared_blocks*/ = {}) const {
+    return 0;
+  }
+
   virtual size_t num_blocks_in_prefix_cache() const = 0;
   virtual size_t num_free_blocks() const = 0;
   virtual size_t num_used_blocks() const = 0;

@@ -148,6 +148,15 @@ std::vector<Block> BlockManagerImpl::allocate_shared(
   return {};
 }
 
+size_t BlockManagerImpl::prefix_cache_match_length(
+    const Slice<int32_t>& token_ids,
+    const Slice<Block>& existed_shared_blocks) const {
+  if (!options_.enable_prefix_cache() || !prefix_cache_) {
+    return 0;
+  }
+  return prefix_cache_->match_length(token_ids, existed_shared_blocks);
+}
+
 void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                              std::vector<Block>& blocks,
                              size_t existed_shared_blocks_num) {

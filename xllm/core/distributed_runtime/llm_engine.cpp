@@ -655,7 +655,11 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
       .enable_xtensor(FLAGS_enable_xtensor)
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size)
-      .model_id(options_.model_id());
+      .model_id(options_.model_id())
+      .enable_cache_aware_dp(FLAGS_enable_prefix_cache_aware_dp_routing)
+      .cache_aware_match_threshold(FLAGS_prefix_cache_aware_dp_match_threshold)
+      .cache_aware_imbalance_threshold(
+          FLAGS_prefix_cache_aware_dp_imbalance_threshold);
 
   if (options_.host_blocks_factor() > 1.0 || options_.enable_kvcache_store()) {
     kv_cache_manager_ =

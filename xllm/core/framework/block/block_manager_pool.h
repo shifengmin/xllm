@@ -38,6 +38,19 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
     PROPERTY(std::string, model_id);    // Model ID for multi-model support
+    // When true (and prefix cache is on with dp_size > 1), a new sequence is
+    // routed to the dp rank that can fit the whole prefill request and has the
+    // longest prefix-cache hit, instead of the rank with the most free blocks.
+    PROPERTY(bool, enable_cache_aware_dp) = false;
+    // Minimum fraction of the prefill request's blocks that must hit a rank's
+    // prefix cache before cache-affinity prefers that rank. Below this, routing
+    // balances by free blocks. Prevents a tiny shared prefix (e.g. a one-block
+    // system prompt) from herding every request onto one rank at cold start.
+    PROPERTY(double, cache_aware_match_threshold) = 0.5;
+    // Maximum tolerated (max_used - min_used) / total_blocks before cache
+    // affinity is suspended in favor of the least-loaded rank. Prevents a
+    // popular shared prefix from pinning all traffic to a single rank.
+    PROPERTY(double, cache_aware_imbalance_threshold) = 0.1;
   };
 
   explicit BlockManagerPool(const Options& options, int32_t dp_size = 1);
@@ -89,6 +102,12 @@ class BlockManagerPool : public KVCacheManager {
 
  protected:
   int32_t get_manager_with_max_free_blocks() const;
+  // Prefix-cache-affinity routing: pick the dp rank by the ordered key
+  // (prefix_match_blocks, free_blocks) among ranks that can fit the request,
+  // guarded by a match-fraction threshold (avoids cold-start tiny-prefix
+  // herding) and a load-imbalance threshold (avoids pinning a popular prefix to
+  // one rank). Falls back to the least-loaded rank when no rank qualifies.
+  int32_t get_cache_aware_dp_rank(Sequence* sequence) const;
   int32_t get_dp_rank(Sequence* sequence) const;
 
   bool process_beam_search(Sequence* sequence, bool need_swap = false);

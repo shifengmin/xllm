@@ -291,6 +291,28 @@ DEFINE_bool(enable_prefix_cache,
             true,
             "Whether to enable the prefix cache for the block manager.");
 
+DEFINE_bool(enable_prefix_cache_aware_dp_routing,
+            false,
+            "When data parallel and prefix cache are enabled, route a new "
+            "sequence to the dp rank that can hold the whole prefill request "
+            "and has the longest prefix-cache hit, instead of the rank with "
+            "the most free blocks.");
+
+DEFINE_double(prefix_cache_aware_dp_match_threshold,
+              0.5,
+              "Cache-aware dp routing: minimum fraction of a request's blocks "
+              "that must hit a rank's prefix cache before affinity prefers it. "
+              "Below this, routing balances by free blocks. Prevents a tiny "
+              "shared prefix from herding every request onto one rank.");
+
+DEFINE_double(
+    prefix_cache_aware_dp_imbalance_threshold,
+    0.1,
+    "Cache-aware dp routing: maximum tolerated (max_used - min_used) "
+    "/ total_blocks before affinity is suspended in favor of the "
+    "least-loaded rank. Prevents a popular shared prefix from pinning "
+    "all traffic onto a single rank.");
+
 DEFINE_bool(enable_cache_upload,
             false,
             "Whether to upload cache info to service. This feature is only "

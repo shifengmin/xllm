@@ -48,6 +48,10 @@ class BlockManagerImpl : public BlockManager {
 
   void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
+  size_t prefix_cache_match_length(
+      const Slice<int32_t>& token_ids,
+      const Slice<Block>& existed_shared_blocks = {}) const override;
+
   size_t num_blocks_in_prefix_cache() const override {
     if (options_.enable_prefix_cache()) {
       CHECK(prefix_cache_);

@@ -41,6 +41,11 @@ class ConcurrentBlockManagerImpl : public BlockManagerImpl {
              size_t existed_shared_blocks_num = 0) override;
   void cache(const std::vector<Block>& blocks) override;
 
+  // read-only prefix-cache hit length probe
+  size_t prefix_cache_match_length(
+      const Slice<int32_t>& token_ids,
+      const Slice<Block>& existed_shared_blocks = {}) const override;
+
   // get the number of blocks in the prefix cache
   size_t num_blocks_in_prefix_cache() const override;
 
