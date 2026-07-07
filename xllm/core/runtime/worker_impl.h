@@ -37,6 +37,7 @@ limitations under the License.
 #include "framework/sampling/beam_searcher.h"
 #include "framework/sampling/sampler.h"
 #include "framework/state_dict/state_dict.h"
+#include "framework/weight_cache/weight_mmap_cache.h"
 #include "framework/xtensor/xtensor.h"
 #include "options.h"
 #include "platform/device.h"
@@ -321,6 +322,8 @@ class WorkerImpl {
   torch::Tensor expert_load_data_;
 
   std::string model_weights_path_;
+
+  std::unique_ptr<WeightMmapCache> weight_mmap_cache_;
 };
 
 }  // namespace xllm

@@ -50,6 +50,17 @@ DEFINE_bool(
     "The default prefetching ratio for gateup weight is 40%."
     "If adjustments are needed, e.g. export PREFETCH_COEFFOCIENT=0.5");
 
+DEFINE_bool(enable_weight_mmap_cache,
+            false,
+            "Persist preprocessed (TP-sharded, quantized) model weights to a "
+            "file-backed mmap cache. On restart, weights are loaded directly "
+            "from cache, skipping expensive preprocessing.");
+
+DEFINE_string(weight_mmap_cache_dir,
+              "",
+              "Directory for weight mmap cache files. "
+              "Defaults to {model_path}/.xllm_cache/ if empty.");
+
 namespace xllm {
 
 void LoadConfig::from_flags() {
@@ -58,6 +69,8 @@ void LoadConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(rolling_load_num_cached_layers);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(rolling_load_num_rolling_slots);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefetch_weight);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_weight_mmap_cache);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(weight_mmap_cache_dir);
 }
 
 void LoadConfig::from_json(const JsonReader& json) {
@@ -66,6 +79,8 @@ void LoadConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(rolling_load_num_cached_layers);
   XLLM_CONFIG_ASSIGN_FROM_JSON(rolling_load_num_rolling_slots);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefetch_weight);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_weight_mmap_cache);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(weight_mmap_cache_dir);
 }
 
 void LoadConfig::append_config_json(nlohmann::ordered_json& config_json) const {
@@ -80,6 +95,10 @@ void LoadConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, rolling_load_num_rolling_slots);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_prefetch_weight);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_weight_mmap_cache);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, weight_mmap_cache_dir);
 }
 
 LoadConfig& LoadConfig::get_instance() {

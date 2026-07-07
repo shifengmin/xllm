@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
+#include <string>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
@@ -44,7 +45,9 @@ class LoadConfig final {
          "enable_rolling_load",
          "rolling_load_num_cached_layers",
          "rolling_load_num_rolling_slots",
-         "enable_prefetch_weight"}};
+         "enable_prefetch_weight",
+         "enable_weight_mmap_cache",
+         "weight_mmap_cache_dir"}};
     return kOptionCategory;
   }
 
@@ -57,6 +60,10 @@ class LoadConfig final {
   PROPERTY(int32_t, rolling_load_num_rolling_slots) = -1;
 
   PROPERTY(bool, enable_prefetch_weight) = false;
+
+  PROPERTY(bool, enable_weight_mmap_cache) = false;
+
+  PROPERTY(std::string, weight_mmap_cache_dir) = "";
 };
 
 }  // namespace xllm

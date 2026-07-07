@@ -273,6 +273,9 @@ DECLARE_int32(rolling_load_num_rolling_slots);
 
 DECLARE_bool(enable_prefetch_weight);
 
+DECLARE_bool(enable_weight_mmap_cache);
+DECLARE_string(weight_mmap_cache_dir);
+
 // --- beam search config ---
 DECLARE_bool(enable_beam_search_kernel);
 

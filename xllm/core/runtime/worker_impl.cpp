@@ -1420,7 +1420,28 @@ void WorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
   }
 #endif
 
-  model_->load_model(std::move(loader));
+  if (::xllm::LoadConfig::get_instance().enable_weight_mmap_cache()) {
+    const auto& model_args = context_.get_model_args();
+    const auto& quant_args = context_.get_quant_args();
+    weight_mmap_cache_ = std::make_unique<WeightMmapCache>(
+        ::xllm::LoadConfig::get_instance().weight_mmap_cache_dir(),
+        model_weights_path_,
+        parallel_args_.rank(),
+        parallel_args_.world_size(),
+        model_args.model_type(),
+        model_args.dtype(),
+        quant_args.quant_method(),
+        quant_args.bits(),
+        quant_args.group_size());
+
+    if (weight_mmap_cache_->try_load(model_.get(), device_)) {
+      return;
+    }
+    model_->load_model(std::move(loader));
+    weight_mmap_cache_->save(model_.get());
+  } else {
+    model_->load_model(std::move(loader));
+  }
 }
 
 #if defined(USE_NPU)
