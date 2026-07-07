@@ -82,6 +82,7 @@ cc_library(
     :state_dict
     :dit_cache
     :model
+    :weight_mmap_cache
     :parallel_state
     :kv_cache
     :kv_cache_transfer
