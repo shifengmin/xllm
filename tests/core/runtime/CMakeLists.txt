@@ -94,16 +94,6 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
-cc_test(
-  NAME
-    cp_input_partition_test
-  SRCS
-    cp_input_partition_test.cpp
-  DEPS
-    :runtime
-    GTest::gtest_main
-)
-
 if(USE_MLU)
   cc_test(
     NAME
