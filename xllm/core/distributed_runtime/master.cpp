@@ -147,8 +147,8 @@ std::optional<std::string> validate_model_cp(const Options& options,
     std::string effective_backend;
     std::string resolved_name;
     std::string resolve_error;
-    const std::string requested_backend =
-        ::xllm::KernelConfig::get_instance().npu_kernel_backend();
+    // Runtime platform branches are type-checked in every platform build.
+    const std::string requested_backend = options.npu_kernel_backend();
     if (!resolve_model_registration(model_type,
                                     requested_backend,
                                     &effective_backend,
