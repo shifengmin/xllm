@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
+#include "core/framework/model/mtp_utils.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "spec_input_builder.h"
@@ -679,9 +680,7 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
   // hc_mult*hidden per row.
   if (impl_ != nullptr) {
     const ModelArgs& args = impl_->context_.get_model_args();
-    if (util::is_deepseek_v4_model_type(args.model_type())) {
-      return args.hc_mult() * args.hidden_size();
-    }
+    return mtp_hidden_state_width(args);
   }
   return static_cast<int64_t>(embedding_size_);
 }
@@ -1159,7 +1158,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       // process_draft_sample_output() compresses the still-full [batch, vocab]
       // probs into the cache: gathering the cached prob with a unified token
       // yields a unified prob, so we only broadcast the [batch] token tensor.
-      if (get_optimization_config().enable_spec_token_broadcast) {
+      if (get_optimization_config().enable_spec_token_broadcast &&
+          !current_draft_input.sampling_params.all_greedy_sample) {
         SampleOutput& draft_sample = draft_outputs.back().sample_output;
         broadcast_spec_tokens(draft_sample.next_tokens,
                               spec_broadcast_group(parallel_args_));
@@ -1258,7 +1258,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   // Catch-all for cross-rank RNG divergence: unify the accepted next_tokens to
   // the consensus group's rank 0 so all_draft_accepted and the next
   // draft-extend row layout agree across ranks.
-  if (get_optimization_config().enable_spec_token_broadcast) {
+  if (get_optimization_config().enable_spec_token_broadcast &&
+      !input.sampling_params.all_greedy_sample) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     broadcast_spec_tokens(val_output.next_tokens,
                           spec_broadcast_group(parallel_args_));
