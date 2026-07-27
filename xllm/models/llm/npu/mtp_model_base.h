@@ -128,9 +128,6 @@ class MtpModelImplBase : public torch::nn::Module {
     if (cp_plan.enabled()) {
       cp_plan.shard_model_input(h, positions);
     }
-    // input_params is const; the model needs a mutable copy to install the
-    // per-forward expert_array (sized to the post-shard hidden length).
-    ModelInputParams input_params_new = input_params;
 
     auto target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
@@ -144,16 +141,16 @@ class MtpModelImplBase : public torch::nn::Module {
     torch::Tensor attn_mask;
     // TODO(liangzhiwei20): support prefix cache for deepseek .
     if (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
-      int num_sequences = input_params_new.meta.num_sequences;
+      int num_sequences = input_params.meta.num_sequences;
       if (num_sequences > 0) {
         std::vector<torch::Tensor> req_mask_vec;
         req_mask_vec.reserve(num_sequences);
 
         for (int j = 0; j < num_sequences; j++) {
           auto mask = attn_mask_.gen_append_mask(
-              input_params_new.attention.host.q_seq_lens[j],
-              input_params_new.attention.host.kv_seq_lens[j],
-              input_params_new.meta.kv_max_seq_len,
+              input_params.attention.host.q_seq_lens[j],
+              input_params.attention.host.kv_seq_lens[j],
+              input_params.meta.kv_max_seq_len,
               h.dtype().toScalarType(),
               h.device());
           req_mask_vec.emplace_back(mask);
@@ -174,18 +171,12 @@ class MtpModelImplBase : public torch::nn::Module {
           attn_mask_.get_attn_mask(128, h.dtype().toScalarType(), h.device());
     }
 
-    int64_t input_length = h.size(0);
-    torch::Tensor expert_array = torch::arange(
-        0,
-        input_length * num_experts_per_tok_,
-        torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
+    prepare_legacy_expert_array(h, input_params);
 
     // TODO(liangzhiwei20): MTP need more support for layer wise copy.
     if (input_params.parallel.layer_wise_load_synchronizer != nullptr) {
       LOG(FATAL) << "MTP not support layer wise copy!";
     }
-
-    input_params_new.expert.expert_array = expert_array;
 
     torch::Tensor prev_topk_indices;
     if (input_params.mtp_topk_state != nullptr) {
@@ -221,7 +212,7 @@ class MtpModelImplBase : public torch::nn::Module {
                     sin_pos,
                     attn_mask,
                     kv_caches[i],
-                    input_params_new,
+                    input_params,
                     prev_topk_indices,
                     layer_index,
                     event,
@@ -299,6 +290,12 @@ class MtpModelImplBase : public torch::nn::Module {
   }
 
  protected:
+  // Among NPU MTP models, only GLM4 currently consumes the legacy
+  // ExpertInput::expert_array path.
+  virtual void prepare_legacy_expert_array(
+      const torch::Tensor& /*hidden_states*/,
+      const ModelInputParams& /*input_params*/) {}
+
   virtual void forward_layer(DecoderLayerType& layer,
                              torch::Tensor& h,
                              torch::Tensor& cos_pos,
