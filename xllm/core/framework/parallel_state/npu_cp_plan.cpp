@@ -922,30 +922,32 @@ torch::Tensor map_cache_slots_to_kv_shard(
   CHECK_LT(kv_split_rank, kv_split_size);
 
   const int32_t logical_block_size = block_size * kv_split_size;
-  torch::Tensor row_indices =
-      torch::arange(recovered_logical_slots.numel(), torch::kCPU);
-  torch::Tensor logical_block_offsets = row_indices % logical_block_size;
-  torch::Tensor row_kv_split_ranks =
+  // Shard ownership is encoded in the per-sequence logical slot, not in the
+  // token's flattened batch row.
+  torch::Tensor valid_slot_mask = recovered_logical_slots >= 0;
+  torch::Tensor logical_block_offsets =
+      torch::remainder(recovered_logical_slots, logical_block_size);
+  torch::Tensor slot_kv_split_ranks =
       torch::floor_divide(logical_block_offsets, block_size);
   torch::Tensor local_row_indices =
-      torch::nonzero(row_kv_split_ranks == kv_split_rank).flatten();
+      torch::nonzero(torch::logical_and(valid_slot_mask,
+                                        slot_kv_split_ranks == kv_split_rank))
+          .flatten();
 
   torch::Tensor physical_slots = torch::full_like(recovered_logical_slots, -1);
   if (local_row_indices.numel() == 0) {
     return physical_slots;
   }
 
-  const torch::Tensor device_row_indices = local_row_indices.to(
-      recovered_logical_slots.device(), /*non_blocking=*/false);
   torch::Tensor logical_slots =
-      recovered_logical_slots.index_select(/*dim=*/0, device_row_indices)
+      recovered_logical_slots.index_select(/*dim=*/0, local_row_indices)
           .to(torch::kInt32);
   torch::Tensor logical_block_ids =
       torch::floor_divide(logical_slots, logical_block_size);
   torch::Tensor physical_block_offsets = logical_slots % block_size;
   torch::Tensor local_physical_slots =
       logical_block_ids * block_size + physical_block_offsets;
-  physical_slots.index_put_({device_row_indices},
+  physical_slots.index_put_({local_row_indices},
                             local_physical_slots.to(physical_slots.dtype()));
   return physical_slots;
 }

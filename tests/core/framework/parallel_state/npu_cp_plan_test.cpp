@@ -176,28 +176,25 @@ torch::Tensor prepare_cache_slots_reference(
       /*dim=*/0, plan.attention_meta().kv_reorder_indices.to(torch::kLong));
 
   const int32_t logical_block_size = config.block_size * config.kv_split_size;
-  torch::Tensor row_indices =
-      torch::arange(recovered_logical_slots.numel(), torch::kCPU);
-  torch::Tensor logical_block_offsets = row_indices % logical_block_size;
-  torch::Tensor row_kv_split_ranks =
-      torch::floor_divide(logical_block_offsets, config.block_size);
-  torch::Tensor local_row_indices =
-      torch::nonzero(row_kv_split_ranks == config.kv_split_rank).flatten();
-
   torch::Tensor physical_slots = torch::full_like(recovered_logical_slots, -1);
-  if (local_row_indices.numel() == 0) {
-    return physical_slots;
+  CHECK(recovered_logical_slots.device().is_cpu());
+  CHECK_EQ(recovered_logical_slots.scalar_type(), torch::kInt32);
+  torch::Tensor contiguous_logical_slots = recovered_logical_slots.contiguous();
+  const int32_t* logical_slots = contiguous_logical_slots.data_ptr<int32_t>();
+  int32_t* mapped_slots = physical_slots.data_ptr<int32_t>();
+  for (int64_t row = 0; row < recovered_logical_slots.numel(); ++row) {
+    const int32_t logical_slot = logical_slots[row];
+    if (logical_slot < 0) {
+      continue;
+    }
+    const int32_t logical_block_offset = logical_slot % logical_block_size;
+    if (logical_block_offset / config.block_size != config.kv_split_rank) {
+      continue;
+    }
+    const int32_t logical_block_id = logical_slot / logical_block_size;
+    mapped_slots[row] = logical_block_id * config.block_size +
+                        logical_block_offset % config.block_size;
   }
-  torch::Tensor logical_slots =
-      recovered_logical_slots.index_select(/*dim=*/0, local_row_indices)
-          .to(torch::kInt32);
-  torch::Tensor logical_block_ids =
-      torch::floor_divide(logical_slots, logical_block_size);
-  torch::Tensor physical_block_offsets = logical_slots % config.block_size;
-  torch::Tensor local_physical_slots =
-      logical_block_ids * config.block_size + physical_block_offsets;
-  physical_slots.index_put_({local_row_indices},
-                            local_physical_slots.to(physical_slots.dtype()));
   return physical_slots;
 }
 
@@ -239,6 +236,23 @@ CpPlanInput make_plan_input(const std::vector<int32_t>& q_seq_lens,
   input.position_ids = int32_tensor(positions);
   input.prefix_token_counts.resize(q_seq_lens.size(), 0);
   return input;
+}
+
+torch::Tensor make_logical_slots(const std::vector<int32_t>& q_seq_lens,
+                                 int32_t logical_block_size) {
+  int64_t total_tokens = 0;
+  for (int32_t seq_len : q_seq_lens) {
+    total_tokens += seq_len;
+  }
+  std::vector<int32_t> slots;
+  slots.reserve(static_cast<size_t>(total_tokens));
+  for (size_t seq_idx = 0; seq_idx < q_seq_lens.size(); ++seq_idx) {
+    const int32_t block_id = 10 + static_cast<int32_t>(seq_idx) * 10;
+    for (int32_t token = 0; token < q_seq_lens[seq_idx]; ++token) {
+      slots.emplace_back(block_id * logical_block_size + token);
+    }
+  }
+  return int32_tensor(slots);
 }
 
 CpPlanInput aligned_input() { return make_plan_input({8, 12}, {0, 0}); }
@@ -651,8 +665,6 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
     const CpPlanInput input =
         make_plan_input(test_case.q_seq_lens,
                         std::vector<int32_t>(test_case.q_seq_lens.size(), 0));
-    torch::Tensor global_slots =
-        torch::arange(input.position_ids.numel(), torch::kInt32) * 137 + 1000;
     for (int32_t cp_rank = 0; cp_rank < test_case.cp_size; ++cp_rank) {
       SCOPED_TRACE(test_case.name);
       SCOPED_TRACE(cp_rank);
@@ -664,6 +676,8 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
       config.attention_cp_size = test_case.cp_size;
       config.attention_cp_group_size = test_case.cp_size;
       const NpuCpPlan plan = NpuCpPlan::build(input, config);
+      torch::Tensor global_slots = make_logical_slots(
+          test_case.q_seq_lens, config.block_size * config.kv_split_size);
 
       expect_tensor_bytes_equal(
           plan.prepare_cache_slots(global_slots),
@@ -672,30 +686,90 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
   }
 }
 
+TEST(NpuCpPlanTest, CacheSlotsUseLogicalOffsetsAcrossSequences) {
+  const CpPlanInput input = make_plan_input({200, 8}, {0, 0});
+  const int32_t logical_block_size = 256;
+  torch::Tensor global_slots =
+      torch::cat({torch::arange(10 * logical_block_size,
+                                10 * logical_block_size + 200,
+                                torch::kInt32),
+                  torch::arange(20 * logical_block_size,
+                                20 * logical_block_size + 8,
+                                torch::kInt32)});
+
+  CpPlanConfig rank0_config = cp2_rank0_config();
+  const NpuCpPlan rank0_plan = NpuCpPlan::build(input, rank0_config);
+  expect_tensor_bytes_equal(
+      rank0_plan.prepare_cache_slots(global_slots),
+      torch::cat({torch::arange(10 * rank0_config.block_size,
+                                11 * rank0_config.block_size,
+                                torch::kInt32),
+                  torch::full({72}, -1, torch::kInt32),
+                  torch::arange(20 * rank0_config.block_size,
+                                20 * rank0_config.block_size + 8,
+                                torch::kInt32)}));
+
+  CpPlanConfig rank1_config = rank0_config;
+  rank1_config.cp_rank = 1;
+  rank1_config.kv_split_rank = 1;
+  const NpuCpPlan rank1_plan = NpuCpPlan::build(input, rank1_config);
+  expect_tensor_bytes_equal(
+      rank1_plan.prepare_cache_slots(global_slots),
+      torch::cat({torch::full({128}, -1, torch::kInt32),
+                  torch::arange(10 * rank1_config.block_size,
+                                10 * rank1_config.block_size + 72,
+                                torch::kInt32),
+                  torch::full({8}, -1, torch::kInt32)}));
+}
+
+TEST(NpuCpPlanTest, CacheSlotsUseLogicalOffsetsForSingleSequenceChunk) {
+  const CpPlanInput input = make_plan_input({8}, {128});
+  const int32_t logical_block_size = 256;
+  torch::Tensor global_slots = torch::arange(30 * logical_block_size + 128,
+                                             30 * logical_block_size + 136,
+                                             torch::kInt32);
+
+  CpPlanConfig rank0_config = cp2_rank0_config();
+  const NpuCpPlan rank0_plan = NpuCpPlan::build(input, rank0_config);
+  expect_tensor_bytes_equal(rank0_plan.prepare_cache_slots(global_slots),
+                            torch::full({8}, -1, torch::kInt32));
+
+  CpPlanConfig rank1_config = rank0_config;
+  rank1_config.cp_rank = 1;
+  rank1_config.kv_split_rank = 1;
+  const NpuCpPlan rank1_plan = NpuCpPlan::build(input, rank1_config);
+  expect_tensor_bytes_equal(rank1_plan.prepare_cache_slots(global_slots),
+                            torch::arange(30 * rank1_config.block_size,
+                                          30 * rank1_config.block_size + 8,
+                                          torch::kInt32));
+}
+
 TEST(NpuCpPlanTest, MtpTargetAndDraftShardGlobalInputsExactlyOnce) {
   const CpPlanInput mtp_input = make_plan_input({5, 7}, {0, 0});
   const NpuCpPlan target_plan = NpuCpPlan::build(mtp_input, cp2_rank0_config());
   const NpuCpPlan draft_plan = NpuCpPlan::build(mtp_input, cp2_rank0_config());
-  torch::Tensor global_slots = torch::arange(12, torch::kInt32) + 1000;
+  torch::Tensor global_slots =
+      torch::cat({torch::arange(3 * 256, 3 * 256 + 5, torch::kInt32),
+                  torch::arange(4 * 256, 4 * 256 + 7, torch::kInt32)});
   torch::Tensor target_slots = target_plan.prepare_cache_slots(global_slots);
   torch::Tensor draft_slots = draft_plan.prepare_cache_slots(global_slots);
   EXPECT_EQ(target_slots.numel(), target_plan.recovered_token_count());
   expect_tensor_bytes_equal(target_slots,
-                            int32_tensor({488,
-                                          489,
-                                          490,
-                                          491,
-                                          492,
+                            int32_tensor({384,
+                                          385,
+                                          386,
+                                          387,
+                                          388,
                                           -1,
                                           -1,
                                           -1,
-                                          493,
-                                          494,
-                                          495,
-                                          496,
-                                          497,
-                                          498,
-                                          499,
+                                          512,
+                                          513,
+                                          514,
+                                          515,
+                                          516,
+                                          517,
+                                          518,
                                           -1}));
   expect_tensor_bytes_equal(draft_slots, target_slots);
 
