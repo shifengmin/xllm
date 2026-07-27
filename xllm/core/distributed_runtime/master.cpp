@@ -29,7 +29,6 @@ limitations under the License.
 #include <optional>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 
 #include "common/metrics.h"
@@ -77,50 +76,33 @@ std::optional<std::string> validate_model_cp(const Options& options,
   if (options.cp_size() < 1) {
     return "cp_size must be greater than or equal to 1";
   }
-  if (options.cp_size() > 1 && !Platform::uses_model_cp_sharding()) {
-    return "cp_size > 1 is only supported on platforms with model-side CP "
-           "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
-  }
-  const bool use_model_sharding =
-      options.cp_size() > 1 && Platform::uses_model_cp_sharding();
-  if (!use_model_sharding) {
+  if (options.cp_size() == 1) {
     return std::nullopt;
   }
-  if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
-    return "Model-side CP supports only LLM text generation";
-  }
-  if (options.task_type() != "generate") {
-    return "Model-side CP supports only the generate task";
-  }
-  if (engine_type == EngineType::SSM &&
-      SpeculativeConfig::requires_aux_hidden_capture(
-          options.speculative_algorithm())) {
-    return "Current model-side CP does not support aux-hidden-capture "
-           "speculative algorithms (Eagle3/DFlash); disable CP or disable "
-           "the speculative algorithm. MTP and Suffix are supported.";
-  }
-  // CP is prefill-only; reject graph/non-prefill roles.
-  if (options.enable_graph()) {
-    return "Model-side CP does not support graph capture (enable_graph=true); "
-           "disable graph or disable CP (cp_size=1).";
-  }
-  if (options.instance_role() != InstanceRole::DEFAULT &&
-      options.instance_role() != InstanceRole::PREFILL) {
-    return "Model-side CP supports only DEFAULT or PREFILL roles";
-  }
-  if (options.dp_size() != 1) {
-    return "Model-side CP requires dp_size == 1";
-  }
+
   if (Platform::is_mlu()) {
-    // MLU: cp_size==world, kv_split==1, ep in {1, world}.
-    static const std::unordered_set<std::string> kMluCpSupportedModelTypes = {
-        "deepseek_v32",
-        "deepseek_v32_mtp",
-        "glm_moe_dsa",
-        "glm_moe_dsa_mtp",
-    };
-    if (!kMluCpSupportedModelTypes.contains(model_type)) {
-      return "MLU model-side CP does not support model_type=" + model_type;
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "MLU CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "MLU CP supports only the generate task";
+    }
+    if (engine_type == EngineType::SSM &&
+        options.speculative_algorithm() != "Suffix") {
+      return "Current MLU model-side CP does not support MTPWorkerImpl-based "
+             "speculative algorithms such as MTP or Eagle3; disable CP, "
+             "disable the speculative algorithm, or wait for MLU worker-side "
+             "CP";
+    }
+    if (model_type != "deepseek_v32" && model_type != "glm_moe_dsa") {
+      return "MLU CP does not support model_type=" + model_type;
+    }
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "MLU CP supports only DEFAULT or PREFILL roles";
+    }
+    if (options.dp_size() != 1) {
+      return "MLU CP requires dp_size == 1";
     }
     if (options.cp_size() != global_world_size) {
       return "MLU CP requires cp_size == global world size";
@@ -133,47 +115,79 @@ std::optional<std::string> validate_model_cp(const Options& options,
     }
     return std::nullopt;
   }
-  // Require registered NPU model-side CP capability + ATB backend.
-  std::string effective_backend;
-  std::string resolved_name;
-  std::string resolve_error;
-  const std::string requested_backend =
-      ::xllm::KernelConfig::get_instance().npu_kernel_backend();
-  if (!resolve_model_registration(model_type,
-                                  requested_backend,
-                                  &effective_backend,
-                                  &resolved_name,
-                                  &resolve_error)) {
-    return "Model-side CP rejected model_type=" + model_type + ": " +
-           resolve_error;
+
+  if (Platform::is_npu()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "Model-side CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "Model-side CP supports only the generate task";
+    }
+    if (engine_type == EngineType::SSM &&
+        SpeculativeConfig::requires_aux_hidden_capture(
+            options.speculative_algorithm())) {
+      return "Current model-side CP does not support aux-hidden-capture "
+             "speculative algorithms (Eagle3/DFlash); disable CP or disable "
+             "the speculative algorithm. MTP and Suffix are supported.";
+    }
+    // CP is prefill-only; reject graph/non-prefill roles.
+    if (options.enable_graph()) {
+      return "Model-side CP does not support graph capture "
+             "(enable_graph=true); disable graph or disable CP (cp_size=1).";
+    }
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "Model-side CP supports only DEFAULT or PREFILL roles";
+    }
+    if (options.dp_size() != 1) {
+      return "Model-side CP requires dp_size == 1";
+    }
+
+    // Require registered NPU model-side CP capability + ATB backend.
+    std::string effective_backend;
+    std::string resolved_name;
+    std::string resolve_error;
+    const std::string requested_backend =
+        ::xllm::KernelConfig::get_instance().npu_kernel_backend();
+    if (!resolve_model_registration(model_type,
+                                    requested_backend,
+                                    &effective_backend,
+                                    &resolved_name,
+                                    &resolve_error)) {
+      return "Model-side CP rejected model_type=" + model_type + ": " +
+             resolve_error;
+    }
+    if (effective_backend != "ATB") {
+      return "NPU model-side CP requires --npu_kernel_backend=ATB for "
+             "model_type=" +
+             model_type + " (resolved backend=" + effective_backend + ")";
+    }
+    if (!is_npu_model_cp_capable(resolved_name)) {
+      return "NPU model-side CP does not support model_type=" + model_type +
+             " (resolved=" + resolved_name +
+             "); only deepseek_v32, deepseek_v32_mtp, glm_moe_dsa, "
+             "glm_moe_dsa_mtp are registered as CP-capable.";
+    }
+    if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+      return "NPU CP requires world_size divisible by dp_size * cp_size "
+             "(orthogonal CP x TP layout)";
+    }
+    const int32_t attn_tp_size =
+        global_world_size / (options.dp_size() * options.cp_size());
+    if (attn_tp_size < 1) {
+      return "NPU CP requires attn_tp_size >= 1";
+    }
+    const int32_t kv_split =
+        ParallelConfig::get_instance().kv_split_size_effective();
+    if (kv_split < 1 || options.cp_size() % kv_split != 0) {
+      return "NPU CP requires kv_split_size effective value to be a positive "
+             "divisor of cp_size";
+    }
+    return std::nullopt;
   }
-  if (effective_backend != "ATB") {
-    return "NPU model-side CP requires --npu_kernel_backend=ATB for "
-           "model_type=" +
-           model_type + " (resolved backend=" + effective_backend + ")";
-  }
-  if (!is_npu_model_cp_capable(resolved_name)) {
-    return "NPU model-side CP does not support model_type=" + model_type +
-           " (resolved=" + resolved_name +
-           "); only deepseek_v32, deepseek_v32_mtp, glm_moe_dsa, "
-           "glm_moe_dsa_mtp are registered as CP-capable.";
-  }
-  if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
-    return "NPU CP requires world_size divisible by dp_size * cp_size "
-           "(orthogonal CP x TP layout)";
-  }
-  const int32_t attn_tp_size =
-      global_world_size / (options.dp_size() * options.cp_size());
-  if (attn_tp_size < 1) {
-    return "NPU CP requires attn_tp_size >= 1";
-  }
-  const int32_t kv_split =
-      ParallelConfig::get_instance().kv_split_size_effective();
-  if (kv_split < 1 || options.cp_size() % kv_split != 0) {
-    return "NPU CP requires kv_split_size effective value to be a positive "
-           "divisor of cp_size";
-  }
-  return std::nullopt;
+
+  return "cp_size > 1 is only supported on platforms with model-side CP "
+         "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
 }
 
 void print_startup_banner(const std::filesystem::path& model_path,
