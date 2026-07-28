@@ -88,10 +88,13 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     k_normalized = npu_l2norm_last_dim(k);
   }
 
-  const bool use_bf16_compute =
-      q_normalized.scalar_type() == torch::kBFloat16 &&
-      k_normalized.scalar_type() == torch::kBFloat16 &&
-      v.scalar_type() == torch::kBFloat16;
+  // Force the fp16 compute path for GDN prefill. The recurrent state S
+  // accumulates K^T V over the whole prefix across chunks; bf16's 8-bit
+  // mantissa loses precision as the sequence grows, and past ~1700 prefill
+  // tokens the output degenerates into repeated "!". This is a regression from
+  // #1999, which switched this kernel from hardcoded fp16 to bf16. fp16
+  // restores the numerically stable pre-#1999 behavior.
+  const bool use_bf16_compute = false;
   const auto compute_dtype =
       use_bf16_compute ? torch::kBFloat16 : torch::kFloat16;
   auto q_compute = q_normalized.to(compute_dtype);
@@ -157,12 +160,12 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
   auto g_sum = torch::empty({B, T, H}, opts_fp32);
   auto g_t = torch::empty({H, T}, opts_fp32);
   auto beta_t = torch::empty({H, T}, opts_compute);
-  auto a = torch::empty({B, T, H, kMegaChunkSize}, opts_compute);
-  auto a_inv_f32 = torch::empty({B, T, H, kMegaChunkSize}, opts_fp32);
-  auto a_inv = torch::empty({B, T, H, kMegaChunkSize}, opts_compute);
+  auto a = torch::zeros({B, T, H, kMegaChunkSize}, opts_compute);
+  auto a_inv_f32 = torch::zeros({B, T, H, kMegaChunkSize}, opts_fp32);
+  auto a_inv = torch::zeros({B, T, H, kMegaChunkSize}, opts_compute);
   auto w = torch::empty({B, T, H, V}, opts_compute);
   auto u = torch::empty({B, T, H, V}, opts_compute);
-  auto h = torch::empty({num_matrices, K, V}, opts_compute);
+  auto h = torch::zeros({num_matrices, K, V}, opts_compute);
   auto v_new = torch::empty({B, T, H, V}, opts_compute);
 
   torch::Tensor initial_state_arg;
@@ -174,7 +177,7 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     initial_state_arg = torch::zeros({num_sequences, H, K, V}, opts_compute);
   }
 
-  auto final_state = torch::empty({num_sequences * H, K, V}, opts_compute);
+  auto final_state = torch::zeros({num_sequences * H, K, V}, opts_compute);
 
   EXEC_NPU_CMD(aclnnMegaChunkGdn,
                q_compute,

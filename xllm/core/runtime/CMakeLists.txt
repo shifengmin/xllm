@@ -33,14 +33,15 @@ cc_library(
     worker_client.h
     xservice_client.h
     speculative_worker_impl.h
+    mtp_async_input_builder.h
     mtp_worker_impl.h
+    mtp_async_state.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h
     spec_input_builder.h
     forward_shared_memory_manager.h
     worker_rendezvous.h
-    cp_input_partition.h
   SRCS
     executor.cpp
     executor_impl_factory.cpp
@@ -67,13 +68,14 @@ cc_library(
     xservice_client.cpp
     params_utils.cpp
     speculative_worker_impl.cpp
+    mtp_async_input_builder.cpp
     mtp_worker_impl.cpp
+    mtp_async_state.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
     dflash_worker_impl.cpp
     spec_input_builder.cpp
     forward_shared_memory_manager.cpp
-    cp_input_partition.cpp
   DEPS
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>

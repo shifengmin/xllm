@@ -70,7 +70,18 @@ if(USE_NPU)
       RESULT_VARIABLE XLLM_OPS_RESULT
     )
     if(NOT XLLM_OPS_RESULT EQUAL 0)
-      message(FATAL_ERROR "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}")
+      message(FATAL_ERROR
+        "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}.\n"
+        "This precompile ran because the xllm_ops git HEAD changed "
+        "(e.g. after switching commits/branches or updating the submodule).\n"
+        "A common cause of failure here is a stale incremental build cache: "
+        "removed or renamed operators leave dangling CMake targets and opc "
+        "reports 'xxx.json not generated'.\n"
+        "Fix by removing the stale xllm_ops build directory and re-running the "
+        "build. CMake re-triggers the xllm_ops precompile automatically (the "
+        "HEAD cache is only updated after a successful precompile), and the "
+        "main C++ incremental build is unaffected:\n"
+        "  rm -rf ${XLLM_OPS_BUILD_DIR}")
     endif()
 
     ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
@@ -353,6 +364,11 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenCV CONFIG REQUIRED)
 find_package(FFMPEG REQUIRED)
 find_package(Python COMPONENTS Development REQUIRED)
+
+if(Python_EXECUTABLE AND NOT Python3_EXECUTABLE)
+    set(Python3_EXECUTABLE "${Python_EXECUTABLE}")
+endif()
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
 if (USE_CXX11_ABI)
