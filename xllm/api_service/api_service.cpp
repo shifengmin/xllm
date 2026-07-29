@@ -29,7 +29,6 @@ limitations under the License.
 #include "call.h"
 #include "chat.pb.h"
 #include "common.pb.h"
-#include "common/global_flags.h"
 #include "completion.pb.h"
 #include "core/common/constants.h"
 #include "core/common/metrics.h"
@@ -40,6 +39,7 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/profile_config.h"
+#include "core/framework/request/request_tracer.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
@@ -200,7 +200,7 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
 
   std::string raw_body;
-  if (FLAGS_enable_request_trace) {
+  if (RequestTracer::get_instance().enabled()) {
     raw_body = ctrl->request_attachment().to_string();
   }
 
@@ -350,7 +350,7 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   ctrl->request_attachment().copy_to(&attachment, content_len, 0);
 
   std::string raw_body;
-  if (FLAGS_enable_request_trace) {
+  if (RequestTracer::get_instance().enabled()) {
     raw_body = attachment;
   }
 
