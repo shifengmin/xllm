@@ -52,6 +52,10 @@ class Platform final {
 #endif
   }
 
+  // Performance preference between equivalent mRoPE implementations, not a
+  // statement of functional support.
+  static constexpr bool prefers_sliced_mrope() { return is_mlu(); }
+
   // Model-side CP: shard after embed, gather+restore before LM head.
   static constexpr bool uses_model_cp_sharding() {
     return is_mlu() || is_npu();

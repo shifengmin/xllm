@@ -12,6 +12,18 @@ cc_test(
     glog::glog
 )
 
+cc_test(
+  NAME
+    rotary_embedding_util_test
+  SRCS
+    rotary_embedding_util_test.cpp
+  DEPS
+    :common_layers
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
 if(USE_CUDA)
   add_subdirectory(cuda)
 endif()

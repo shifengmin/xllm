@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/framework/model/model_output.h"
 #include "core/layers/common/lm_head.h"
+#include "core/layers/common/rotary_embedding_util.h"
 #include "models/model_registry.h"
 #include "models/vlm/mposition/mposition.h"
 #include "models/vlm/qwen3_vl_base.h"
@@ -89,34 +90,7 @@ class Qwen3_5ModelImpl final
 
   std::pair<torch::Tensor, torch::Tensor> apply_mrope(
       const torch::Tensor positions) override {
-    auto target_cos_sin = cos_sin_.index({positions});
-    auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
-    auto cos_pos = target_cos_sin_chunks[0].contiguous();
-    auto sin_pos = target_cos_sin_chunks[1].contiguous();
-    auto options = positions.options().dtype(torch::kLong);
-    auto apply = [this, options](torch::Tensor x) {
-      auto freqs_t = x[0].clone();
-      int64_t mrop_length = static_cast<int64_t>(freqs_t.size(-1) / 2);
-
-      for (int32_t dim_idx = 1; dim_idx <= 2; ++dim_idx) {
-        int64_t offset = dim_idx;
-        int64_t section_len = mrope_section_[dim_idx];
-        int64_t length = section_len * 3;
-
-        auto idx_first_half = torch::arange(offset, length, 3, options);
-        auto idx_second_half = torch::arange(
-            offset + mrop_length, length + mrop_length, 3, options);
-
-        auto idx_tensor =
-            torch::cat({idx_first_half, idx_second_half}, 0).to(x.device());
-        auto src = x[dim_idx].index_select(-1, idx_tensor);
-        freqs_t.index_copy_(-1, idx_tensor, src);
-      }
-      return freqs_t;
-    };
-    cos_pos = apply(cos_pos.reshape({positions.size(0), -1, cos_pos.size(-1)}));
-    sin_pos = apply(sin_pos.reshape({positions.size(0), -1, sin_pos.size(-1)}));
-    return std::make_pair(cos_pos, sin_pos);
+    return layer::rotary::apply_mrope(cos_sin_, positions, mrope_section_);
   }
 
   virtual ModelOutput forward(torch::Tensor tokens,
