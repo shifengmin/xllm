@@ -56,7 +56,12 @@ RequestTracer& RequestTracer::get_instance() {
   return instance;
 }
 
-bool RequestTracer::enabled() const { return FLAGS_enable_request_trace; }
+bool RequestTracer::enabled() { return FLAGS_enable_request_trace; }
+
+void RequestTracer::on_trace_disabled() {
+  std::lock_guard<std::mutex> lock(stream_mutex_);
+  stream_states_.clear();
+}
 
 RequestTracer::RequestTracer() = default;
 
@@ -246,14 +251,18 @@ void RequestTracer::write_record(Request& request,
   output["cancelled"] = cancelled;
   record["output"] = std::move(output);
 
-  // raw HTTP request for replay
+  // Read the raw HTTP request only while tracing is enabled. Call retains the
+  // brpc controller for the request lifetime, so no trace-specific storage is
+  // needed on the request path.
   if (state.call_.has_value() && state.call_.value() != nullptr) {
-    const auto& raw_body = state.call_.value()->raw_request_body();
+    std::string raw_body =
+        state.call_.value()->controller()->request_attachment().to_string();
     if (!raw_body.empty()) {
       nlohmann::json raw_req;
       raw_req["body"] =
           nlohmann::json::parse(raw_body, nullptr, /*allow_exceptions=*/false);
-      raw_req["path"] = state.call_.value()->request_endpoint();
+      raw_req["path"] =
+          state.call_.value()->controller()->http_request().uri().path();
       record["raw_request"] = std::move(raw_req);
     }
   }
@@ -282,17 +291,7 @@ void RequestTracer::write_record(Request& request,
 void RequestTracer::trace_completed_request(Request& request,
                                             const RequestOutput& output) {
   if (request.state().stream) {
-    if (enabled()) {
-      flush_stream_state(request);
-    } else {
-      // Tracing may have been disabled at runtime while this streaming request
-      // was in flight. Drop any accumulated state so it does not leak.
-      std::lock_guard<std::mutex> lock(stream_mutex_);
-      stream_states_.erase(request.request_id());
-    }
-    return;
-  }
-  if (!enabled()) {
+    flush_stream_state(request);
     return;
   }
   write_record(request,
@@ -304,10 +303,6 @@ void RequestTracer::trace_completed_request(Request& request,
 
 void RequestTracer::trace_stream_output(Request& request,
                                         const RequestOutput& output) {
-  if (!enabled()) {
-    return;
-  }
-
   // Only accumulate the delta here. The accumulated state is flushed exactly
   // once by trace_completed_request (which routes streaming requests through
   // flush_stream_state) when the request is finished or cancelled. Flushing

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
+#include "core/framework/request/request_tracer.h"
 
 DEFINE_string(host, "", "Host name for brpc server.");
 
@@ -78,14 +79,15 @@ DEFINE_bool(request_trace_per_file,
             "requests to a single JSON-lines file.");
 
 namespace {
-// brpc's /flags endpoint refuses to modify a gflag at runtime unless it has a
-// registered validator (it returns "A reloadable gflag must have validator").
-// Register a no-op validator so enable_request_trace can be toggled without
-// restarting the service, as documented for the request trace feature.
-bool validate_enable_request_trace(const char* /*unused*/, bool /*unused*/) {
+// brpc's /flags endpoint requires a validator before it permits a runtime
+// update. Clear stream state once when tracing is turned off.
+bool validate_enable_request_trace(const char* /*unused*/, bool enabled) {
+  if (!enabled) {
+    xllm::RequestTracer::get_instance().on_trace_disabled();
+  }
   return true;
 }
-const bool kEnableRequestTraceValidatorDummy =
+const bool kEnableRequestTraceValidatorRegistered =
     google::RegisterFlagValidator(&FLAGS_enable_request_trace,
                                   &validate_enable_request_trace);
 }  // namespace

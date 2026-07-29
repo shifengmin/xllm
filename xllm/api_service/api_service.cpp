@@ -39,7 +39,6 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/profile_config.h"
-#include "core/framework/request/request_tracer.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
@@ -199,11 +198,6 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
 
-  std::string raw_body;
-  if (RequestTracer::get_instance().enabled()) {
-    raw_body = ctrl->request_attachment().to_string();
-  }
-
   auto [preprocess_status, processed_json] =
       preprocess_completion_prompt(ctrl->request_attachment().to_string());
   if (!preprocess_status.ok()) {
@@ -225,8 +219,6 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
 
   std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
       ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
-  call->set_raw_request_body(std::move(raw_body));
-  call->set_request_endpoint("/v1/completions");
   if (completion_service_impl_) {
     completion_service_impl_->process_async(call);
   } else if (rec_completion_service_impl_) {
@@ -349,11 +341,6 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
   std::string attachment;
   ctrl->request_attachment().copy_to(&attachment, content_len, 0);
 
-  std::string raw_body;
-  if (RequestTracer::get_instance().enabled()) {
-    raw_body = attachment;
-  }
-
   auto [preprocess_status, processed_json] =
       chat_json_parser.preprocess(std::move(attachment));
   if (!preprocess_status.ok()) {
@@ -375,8 +362,6 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
 
   auto call = std::make_shared<ChatCall>(
       ctrl, guard.release(), req_pb, resp_pb, arena != nullptr /*use_arena*/);
-  call->set_raw_request_body(std::move(raw_body));
-  call->set_request_endpoint("/v1/chat/completions");
   service->process_async(call);
 }
 

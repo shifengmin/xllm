@@ -34,9 +34,8 @@ namespace xllm {
 
 class Request;
 
-// RequestTracer dumps the input and output of each request to a file when
-// FLAGS_enable_request_trace is set. The flag is checked on every request so
-// tracing can be enabled/disabled at runtime without restarting the service.
+// RequestTracer dumps the input and output of each request when tracing is
+// enabled. The scheduler checks the runtime flag before entering the tracer.
 //
 // Two output layouts are supported (FLAGS_request_trace_per_file):
 //   - false: append one JSON record per line to FLAGS_request_trace_path.
@@ -55,8 +54,11 @@ class RequestTracer {
  public:
   static RequestTracer& get_instance();
 
-  // Check the live flag value; callers use this for the fast-path skip.
-  bool enabled() const;
+  // Check the live flag value.
+  static bool enabled();
+
+  // Drop stream data buffered before request tracing was disabled at runtime.
+  void on_trace_disabled();
 
   // Dump a finished non-streaming request. The given output already contains
   // the complete generated text.
