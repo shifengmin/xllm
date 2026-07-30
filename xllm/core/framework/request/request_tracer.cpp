@@ -49,6 +49,19 @@ std::string sanitize_filename(const std::string& name) {
   return out;
 }
 
+// brpc's /flags endpoint requires a validator before it permits a runtime
+// update. Clear stream state once when tracing is turned off.
+bool validate_enable_request_trace(const char* /*unused*/, bool enabled) {
+  if (!enabled) {
+    RequestTracer::get_instance().on_trace_disabled();
+  }
+  return true;
+}
+
+const bool kEnableRequestTraceValidatorRegistered =
+    google::RegisterFlagValidator(&FLAGS_enable_request_trace,
+                                  &validate_enable_request_trace);
+
 }  // namespace
 
 RequestTracer& RequestTracer::get_instance() {
