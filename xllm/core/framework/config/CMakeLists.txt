@@ -48,5 +48,6 @@ cc_library(
     glog::glog
     nlohmann_json::nlohmann_json
     :platform
+    :request
     :util
 )
