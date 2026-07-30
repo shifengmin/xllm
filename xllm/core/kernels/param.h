@@ -348,6 +348,16 @@ struct MatmulReduceScatterParams {
   std::string reduce_op = "sum";
   int64_t comm_turn = 0;
   std::string comm_mode = "aiv";
+
+  // Optional per-token activation dequant scale, shape (m, 1), float32.
+  // When both x1_scale and x2_scale are set, the int8 quantized MMRS path is
+  // used (FC1 w8a8_dynamic): a/b are int8 and output is dequantized.
+  std::optional<torch::Tensor> x1_scale;
+  // Optional per-channel weight dequant scale, shape (1, n), float32.
+  std::optional<torch::Tensor> x2_scale;
+  // Optional output dtype for the quantized path (bf16/fp16). Ignored by the
+  // non-quant path.
+  std::optional<at::ScalarType> output_dtype;
 };
 
 // Quantized matmul parameters (NPU aclnnQuantMatmulV4 path).

@@ -93,13 +93,17 @@ torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
 
-torch::Tensor matmul_reduce_scatter(const torch::Tensor& a,
-                                    const torch::Tensor& b,
-                                    const std::optional<torch::Tensor>& bias,
-                                    ProcessGroup* process_group,
-                                    const std::string& reduce_op,
-                                    int64_t comm_turn,
-                                    const std::string& comm_mode);
+torch::Tensor matmul_reduce_scatter(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const std::optional<torch::Tensor>& bias,
+    ProcessGroup* process_group,
+    const std::string& reduce_op,
+    int64_t comm_turn,
+    const std::string& comm_mode,
+    const std::optional<torch::Tensor>& x1_scale = std::nullopt,
+    const std::optional<torch::Tensor>& x2_scale = std::nullopt,
+    const std::optional<at::ScalarType>& output_dtype = std::nullopt);
 
 torch::Tensor active(const torch::Tensor& input, const std::string& act_mode);
 

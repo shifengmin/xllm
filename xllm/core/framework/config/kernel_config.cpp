@@ -64,7 +64,9 @@ DEFINE_int32(flashcomm1_min_prefill_tokens,
 
 DEFINE_bool(enable_mmrs_fusion,
             false,
-            "Enable Matmul+ReduceScatter fusion kernel for FC1.");
+            "Enable Matmul+ReduceScatter (MMRS) fusion for FlashComm1. Only "
+            "read when enable_flashcomm1=true. Currently off by default "
+            "because the fused kernel can fail on some shapes.");
 
 DEFINE_string(mmrs_comm_mode,
               "aiv",
