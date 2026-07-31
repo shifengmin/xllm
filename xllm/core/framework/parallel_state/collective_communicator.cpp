@@ -160,7 +160,8 @@ DispatchAndCombineComm create_dispatch_and_combine_comm(int32_t global_rank,
       .moe_ep_size(ep_size)
       .pp_size(1)
       .sp_size(1)
-      .cp_size(normalized_cp_size);
+      .cp_size(normalized_cp_size)
+      .decode_dcp_size(ParallelConfig::get_instance().decode_dcp_size());
 
   MappingNPU mapping_npu(EPLBConfig::get_instance().rank_tablefile(),
                          world_size,
@@ -227,6 +228,8 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
         global_rank, world_size, dp_size, cp_size, nullptr, ep_size);
     parallel_args_->kv_split_size(
         ::xllm::ParallelConfig::get_instance().kv_split_size());
+    parallel_args_->decode_dcp_size(
+        ::xllm::ParallelConfig::get_instance().decode_dcp_size());
     return;
   }
 
@@ -250,7 +253,9 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
       .pp_size(1)
       .sp_size(1)
       .cp_size(normalized_cp_size)
-      .kv_split_size(mapping_kv_split_size);
+      .kv_split_size(mapping_kv_split_size)
+      .decode_dcp_size(
+          ::xllm::ParallelConfig::get_instance().decode_dcp_size());
   MappingNPU mapping_npu(::xllm::EPLBConfig::get_instance().rank_tablefile(),
                          world_size,
                          global_rank,
@@ -284,11 +289,15 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
                                                   dispatchAndCombineHcclComm);
   parallel_args_->kv_split_size(
       ::xllm::ParallelConfig::get_instance().kv_split_size());
+  parallel_args_->decode_dcp_size(
+      ::xllm::ParallelConfig::get_instance().decode_dcp_size());
 #else
   parallel_args_ = std::make_unique<ParallelArgs>(
       global_rank, world_size, dp_size, cp_size, nullptr, ep_size);
   parallel_args_->kv_split_size(
       ::xllm::ParallelConfig::get_instance().kv_split_size());
+  parallel_args_->decode_dcp_size(
+      ::xllm::ParallelConfig::get_instance().decode_dcp_size());
 #endif
 }
 

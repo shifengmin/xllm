@@ -440,6 +440,7 @@ ParallelArgs MTPDraftParallelArgs(const ParallelArgs& parallel_args,
       .dp_size(1)
       .ep_size(1)
       .cp_size(1)
+      .decode_dcp_size(1)
       .tp_size(1)
       .sp_size(1);
   draft_args.mapping_data(nlohmann::json{});

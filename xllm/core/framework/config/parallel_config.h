@@ -44,6 +44,7 @@ class ParallelConfig final {
         {"dp_size",
          "ep_size",
          "cp_size",
+         "decode_dcp_size",
          "tp_size",
          "sp_size",
          "cfg_size",
@@ -61,6 +62,9 @@ class ParallelConfig final {
   PROPERTY(int32_t, ep_size) = 1;
 
   PROPERTY(int32_t, cp_size) = 1;
+
+  // Decode layer-owner context-parallel width inside each attention TP group.
+  PROPERTY(int32_t, decode_dcp_size) = 1;
 
   // 0 means follow cp_size (legacy KV-split width).
   PROPERTY(int32_t, kv_split_size) = 1;

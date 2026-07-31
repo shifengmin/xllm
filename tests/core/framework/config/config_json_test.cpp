@@ -280,9 +280,20 @@ TEST(ConfigJsonTest, ParallelConfigReadsContextParallelSize) {
   EXPECT_EQ(parallel_config.cp_size(), 4);
 }
 
-TEST(ConfigJsonTest, RegistersOnlyContextParallelCommandLineOption) {
+TEST(ConfigJsonTest, ParallelConfigReadsDecodeDcpSize) {
+  const JsonReader json =
+      config::parse_json_string(R"json({"decode_dcp_size": 4})json");
+  ParallelConfig parallel_config;
+  parallel_config.from_json(json);
+
+  EXPECT_EQ(parallel_config.decode_dcp_size(), 4);
+}
+
+TEST(ConfigJsonTest, RegistersContextParallelCommandLineOptions) {
   google::CommandLineFlagInfo flag_info;
   EXPECT_TRUE(google::GetCommandLineFlagInfo("cp_size", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "1");
+  EXPECT_TRUE(google::GetCommandLineFlagInfo("decode_dcp_size", &flag_info));
   EXPECT_EQ(flag_info.default_value, "1");
 
   const std::string removed_flag = std::string("enable_") + "prefill_sp";

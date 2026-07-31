@@ -148,6 +148,9 @@ struct ParallelArgs {
   // cp size
   PROPERTY(int32_t, cp_size) = 1;
 
+  // Decode layer-owner context-parallel width inside attention TP.
+  PROPERTY(int32_t, decode_dcp_size) = 1;
+
   // Derived: CP rank of the current process within its DP group.
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
   [[nodiscard]] int32_t cp_rank() const noexcept {
