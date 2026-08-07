@@ -441,11 +441,14 @@ TEST_F(Glm47DetectorTest, StreamingParseWithNormalText) {
 // root-object closing brace; otherwise clients see truncated JSON like
 // {"city":"Beijing","config":{"nested":{"deep":"value"}}.
 TEST_F(Glm47DetectorTest, StreamingParseClosesRootAfterObjectArgValue) {
+  // Keep name and args in separate increments: name is emitted on the first
+  // <arg_key>, and argument JSON increments are only produced afterwards.
   std::string chunk1 = "<tool_call>get_weather";
   std::string chunk2 =
       "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
       "<arg_key>config</arg_key><arg_value>{\"nested\": {\"deep\": "
-      "\"value\"}}</arg_value></tool_call>";
+      "\"value\"}}</arg_value>";
+  std::string chunk3 = "</tool_call>";
 
   auto result1 = detector_->parse_streaming_increment(chunk1, tools_);
   EXPECT_EQ(result1.calls.size(), 0);
@@ -455,8 +458,15 @@ TEST_F(Glm47DetectorTest, StreamingParseClosesRootAfterObjectArgValue) {
   EXPECT_TRUE(result2.calls[0].name.has_value());
   EXPECT_EQ(result2.calls[0].name.value(), "get_weather");
 
+  auto result3 = detector_->parse_streaming_increment(chunk3, tools_);
+
   std::string streamed_args;
   for (const auto& call : result2.calls) {
+    if (!call.name.has_value()) {
+      streamed_args += call.parameters;
+    }
+  }
+  for (const auto& call : result3.calls) {
     if (!call.name.has_value()) {
       streamed_args += call.parameters;
     }
