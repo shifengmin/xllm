@@ -67,14 +67,16 @@ class FakeEngine final : public Engine {
  public:
   FakeEngine(int32_t num_blocks,
              int32_t block_size,
-             int32_t num_speculative_tokens = 0) {
+             int32_t num_speculative_tokens = 0,
+             bool enable_host_offload = false) {
     BlockManagerPool::Options options;
     options.num_blocks(num_blocks)
         .block_size(block_size)
         .enable_prefix_cache(true)
         .enable_disagg_pd(true)
         .num_speculative_tokens(num_speculative_tokens)
-        .num_embedding_blocks(num_blocks);
+        .num_embedding_blocks(num_blocks)
+        .enable_host_offload(enable_host_offload);
     tokenizer_ = std::make_unique<FakeTokenizer>();
     block_manager_ = std::make_unique<BlockManagerPool>(options, /*dp_size=*/1);
   }
@@ -430,6 +432,64 @@ TEST(DisaggPDSchedulerTest, PreservesPrefillCachedTokensOnDecodeRequest) {
   std::shared_ptr<Request> queued;
   ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
   EXPECT_EQ(queued->num_prefix_cache_tokens(), 2u);
+}
+
+TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
+  EXPECT_FALSE(pd_prompt_exceeds_block_capacity(
+      /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
+}
+
+TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
+  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/404));
+  EXPECT_TRUE(
+      decode_add_new_failure_is_terminal(kDecodeAddNewPromptTooLongStatusCode));
+  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/500));
+}
+
+TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
+  EXPECT_TRUE(pd_prompt_exceeds_block_capacity(
+      /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
+}
+
+TEST(DisaggPDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  std::shared_ptr<Request> holder = make_request({1, 2, 3, 4, 5, 6});
+  ASSERT_TRUE(block_manager->try_allocate(holder->sequences()[0].get()));
+  std::shared_ptr<Request> request = make_request({7, 8});
+  Sequence* sequence = request->sequences()[0].get();
+
+  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_FALSE(scheduler.prompt_exceeds_block_capacity(sequence));
+
+  block_manager->deallocate(holder.get());
+}
+
+TEST(DisaggPDSchedulerTest, OversizedDecodePromptIsPermanent) {
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4, 5, 6, 7});
+  Sequence* sequence = request->sequences()[0].get();
+
+  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_TRUE(scheduler.prompt_exceeds_block_capacity(sequence));
+
+  block_manager->deallocate(request.get());
+}
+
+TEST(DisaggPDSchedulerTest, HostOffloadedPrefillPromptIsNotAborted) {
+  FakeEngine engine(
+      /*num_blocks=*/4,
+      /*block_size=*/2,
+      /*num_speculative_tokens=*/0,
+      /*enable_host_offload=*/true);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4, 5, 6, 7});
+
+  EXPECT_FALSE(
+      scheduler.prompt_exceeds_block_capacity(request->sequences()[0].get()));
 }
 
 TEST(DisaggPDSchedulerTest, InvalidPrefillCachedTokensFallBackToZero) {
