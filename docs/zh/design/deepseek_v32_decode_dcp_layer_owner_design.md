@@ -879,6 +879,9 @@ Profiler 还应证明：
   layer owner。
 - target worker 的 block swap 跳过 non-owner 层。draft worker 不进入 layerwise
   ownership，继续保留单层全量 cache。
+- beam search copy-on-write 的 Torch fallback 和 NPU fused BlockCopy 均读取
+  `KVCache` 上持久化的 layer ownership；non-owner null cache 不执行 block
+  copy，owner cache 保持原有复制语义。
 - PD PUSH 从 decode response 获得 layerwise 开关和 `decode_dcp_size`，Prefill
   根据每个目标 decode TP rank 对应的 DCP local rank 逐层过滤；draft cache
   transfer 明确绕过过滤。

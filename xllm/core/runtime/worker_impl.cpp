@@ -969,9 +969,6 @@ void WorkerImpl::apply_kv_block_swaps(const ModelInputParams& input_params) {
   auto dst_tensor =
       torch::tensor(dst_indices, torch::dtype(torch::kLong).device(device_));
   for (size_t layer_id = 0; layer_id < kv_caches_.size(); ++layer_id) {
-    if (!owns_decode_dcp_layer(static_cast<int64_t>(layer_id))) {
-      continue;
-    }
     kv_caches_[layer_id].swap_blocks(src_tensor, dst_tensor);
   }
 #endif

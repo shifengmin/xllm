@@ -221,8 +221,10 @@ KVCache::KVCache(const DeepSeekV4KVCacheTensors& tensors)
 
 KVCache::KVCache(const KVCacheShape& kv_cache_shape,
                  const KVCacheCreateOptions& create_options,
-                 int64_t layer_id)
-    : impl_(create_kv_cache_impl(kv_cache_shape, create_options, layer_id)) {}
+                 int64_t layer_id,
+                 bool owns_layer_cache)
+    : owns_layer_cache_(owns_layer_cache),
+      impl_(create_kv_cache_impl(kv_cache_shape, create_options, layer_id)) {}
 
 KVCache::KVCache(const KVCacheShape& kv_cache_shape,
                  const KVCacheCreateOptions& create_options,
@@ -301,6 +303,9 @@ bool KVCache::empty() const { return impl_->empty(); }
 
 void KVCache::swap_blocks(torch::Tensor& src_tensor,
                           torch::Tensor& dst_tensor) {
+  if (!owns_layer_cache_) {
+    return;
+  }
   impl_->swap_blocks(src_tensor, dst_tensor);
 }
 
@@ -410,7 +415,10 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
                             layer_cache_owned[static_cast<size_t>(layer_idx)];
     const KVCacheShape& layer_shape =
         owns_layer ? kv_cache_shape : null_cache_shape;
-    kv_caches.emplace_back(layer_shape, create_options, layer_idx);
+    kv_caches.emplace_back(layer_shape,
+                           create_options,
+                           layer_idx,
+                           /*owns_layer_cache=*/owns_layer);
   }
 }
 

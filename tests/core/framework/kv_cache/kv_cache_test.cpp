@@ -461,14 +461,23 @@ TEST(KVCacheTest, LayerwiseOwnershipAllocatesOneBlockForNonOwnerLayers) {
   allocate_kv_caches(caches, shape, options);
 
   ASSERT_EQ(caches.size(), 4U);
+  EXPECT_TRUE(caches[0].owns_layer_cache());
   EXPECT_EQ(caches[0].get_k_cache().size(0), kBlockCount);
   EXPECT_EQ(caches[0].get_index_cache().size(0), kBlockCount);
+  EXPECT_FALSE(caches[1].owns_layer_cache());
   EXPECT_EQ(caches[1].get_k_cache().size(0), 1);
   EXPECT_EQ(caches[1].get_index_cache().size(0), 1);
+  EXPECT_TRUE(caches[2].owns_layer_cache());
   EXPECT_EQ(caches[2].get_k_cache().size(0), kBlockCount);
   EXPECT_EQ(caches[2].get_index_cache().size(0), kBlockCount);
+  EXPECT_FALSE(caches[3].owns_layer_cache());
   EXPECT_EQ(caches[3].get_k_cache().size(0), 1);
   EXPECT_EQ(caches[3].get_index_cache().size(0), 1);
+
+  caches[1].get_k_cache().fill_(1);
+  torch::Tensor out_of_range_block = torch::tensor({1}, torch::kLong);
+  caches[1].swap_blocks(out_of_range_block, out_of_range_block);
+  EXPECT_TRUE(torch::all(caches[1].get_k_cache() == 1).item<bool>());
 }
 
 #if defined(USE_MLU)
