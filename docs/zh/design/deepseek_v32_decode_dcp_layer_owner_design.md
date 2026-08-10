@@ -882,6 +882,10 @@ Profiler 还应证明：
 - beam search copy-on-write 的 Torch fallback 和 NPU fused BlockCopy 均读取
   `KVCache` 上持久化的 layer ownership；non-owner null cache 不执行 block
   copy，owner cache 保持原有复制语义。
+- layerwise 原始配置在 Master 启动阶段校验只允许 DECODE role；Engine 和
+  Worker 构造时一次性解析实例级有效开关，所有 draft 实例固定关闭。容量估算、
+  cache 分配和 speculative target 路径之后只读取该有效开关，不再重复判断
+  instance role 或 draft 身份。
 - PD PUSH 从 decode response 获得 layerwise 开关和 `decode_dcp_size`，Prefill
   根据每个目标 decode TP rank 对应的 DCP local rank 逐层过滤；draft cache
   transfer 明确绕过过滤。

@@ -4,6 +4,7 @@ cc_test(
   NAME
     common_test
   SRCS
+    decode_dcp_layer_placement_test.cpp
     options_test.cpp
     rate_limiter_test.cpp
   DEPS

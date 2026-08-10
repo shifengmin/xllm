@@ -429,12 +429,13 @@ runtime::Options mtp_draft_options(const runtime::Options& options) {
 
 ParallelArgs MTPDraftParallelArgs(const ParallelArgs& parallel_args,
                                   const runtime::Options& options) {
+  ParallelArgs draft_args = parallel_args;
+  draft_args.enable_decode_dcp_layerwise_kv_cache(false);
   if (!options.enable_mtp_draft_body_tp1()) {
-    return parallel_args;
+    return draft_args;
   }
   CHECK(parallel_args.single_rank_group_ != nullptr)
       << "MTP draft body TP1 requires a single-rank process group";
-  ParallelArgs draft_args = parallel_args;
   draft_args.rank(0)
       .world_size(1)
       .dp_size(1)

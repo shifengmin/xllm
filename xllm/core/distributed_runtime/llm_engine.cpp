@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/interruption_bus.h"
 #include "common/metrics.h"
 #include "common/options.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
@@ -67,6 +68,10 @@ constexpr size_t kXTensorWeightPageSafetyMargin = 20;
 LLMEngine::LLMEngine(const runtime::Options& options,
                      std::shared_ptr<DistManager> dist_manager)
     : options_(options), dist_manager_(dist_manager) {
+  enable_decode_dcp_layerwise_kv_cache_ =
+      resolve_decode_dcp_layerwise_kv_cache_enabled(
+          ParallelConfig::get_instance().enable_decode_dcp_layerwise_kv_cache(),
+          options_.is_draft_engine());
   InterruptionBus::get_instance().subscribe([this](bool interrupted) {
     this->layer_forward_interrupted_ = interrupted;
   });
@@ -470,13 +475,8 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
   estimate_options.enable_rdma_scale_padding =
       options_.instance_role() != InstanceRole::DEFAULT;
-#if defined(USE_NPU)
   estimate_options.enable_decode_dcp_layerwise_kv_cache =
-      ::xllm::ParallelConfig::get_instance()
-          .enable_decode_dcp_layerwise_kv_cache() &&
-      options_.instance_role() == InstanceRole::DECODE &&
-      !options_.is_draft_engine();
-#endif
+      enable_decode_dcp_layerwise_kv_cache_;
   estimate_options.decode_dcp_size =
       ::xllm::ParallelConfig::get_instance().decode_dcp_size();
   if (options_.enable_mtp_draft_body_tp1() && options_.is_draft_engine()) {

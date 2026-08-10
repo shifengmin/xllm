@@ -264,6 +264,10 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
   }
+  parallel_args_.enable_decode_dcp_layerwise_kv_cache(
+      resolve_decode_dcp_layerwise_kv_cache_enabled(
+          parallel_args_.enable_decode_dcp_layerwise_kv_cache(),
+          options_.is_draft_engine() || is_spec_draft_));
 
   // first worker is the driver
   driver_ = parallel_args.rank() == 0;
@@ -450,12 +454,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
 }
 
 bool WorkerImpl::decode_dcp_layerwise_kv_cache_enabled() const {
-#if defined(USE_NPU)
-  return parallel_args_.enable_decode_dcp_layerwise_kv_cache() &&
-         options_.instance_role() == InstanceRole::DECODE && !is_spec_draft_;
-#else
-  return false;
-#endif
+  return parallel_args_.enable_decode_dcp_layerwise_kv_cache();
 }
 
 bool WorkerImpl::owns_decode_dcp_layer(int64_t layer_id) const {

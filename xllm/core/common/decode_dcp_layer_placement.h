@@ -19,7 +19,34 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "common/types.h"
+
 namespace xllm {
+
+inline void validate_decode_dcp_layerwise_kv_cache_config(
+    bool enabled,
+    InstanceRole instance_role,
+    int32_t decode_dcp_size) {
+  if (!enabled) {
+    return;
+  }
+#if !defined(USE_NPU)
+  CHECK(false)
+      << "Decode DCP layerwise KV cache is only supported on the NPU backend.";
+#endif
+  CHECK(instance_role == InstanceRole::DECODE)
+      << "Decode DCP layerwise KV cache requires the DECODE instance role, "
+         "got "
+      << instance_role.to_string() << ".";
+  CHECK_GT(decode_dcp_size, 1)
+      << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
+}
+
+[[nodiscard]] inline bool resolve_decode_dcp_layerwise_kv_cache_enabled(
+    bool configured,
+    bool is_draft_model) noexcept {
+  return configured && !is_draft_model;
+}
 
 class DecodeDcpLayerPlacement final {
  public:

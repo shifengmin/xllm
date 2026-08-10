@@ -33,6 +33,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/xllm_build_info.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -285,6 +286,12 @@ Master::Master(const Options& options, EngineType type)
     : options_(options),
       engine_type_(type),
       master_status_(options.master_status()) {
+  const ParallelConfig& startup_parallel_config =
+      ParallelConfig::get_instance();
+  validate_decode_dcp_layerwise_kv_cache_config(
+      startup_parallel_config.enable_decode_dcp_layerwise_kv_cache(),
+      options_.instance_role(),
+      startup_parallel_config.decode_dcp_size());
   const auto model_path =
       std::filesystem::path(options_.model_path()).lexically_normal();
   // Multi-process serving runs one worker per process. Select one runtime

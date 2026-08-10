@@ -155,6 +155,9 @@ class LLMEngine : public Engine {
   bool init_model(MasterStatus master_status = MasterStatus::WAKEUP);
   int64_t get_effective_xtensor_weight_size(
       const ModelLoader& model_loader) const;
+  bool decode_dcp_layerwise_kv_cache_enabled() const noexcept {
+    return enable_decode_dcp_layerwise_kv_cache_;
+  }
   KVCacheCapacity estimate_kv_cache_capacity();
   bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap);
   std::vector<ForwardInput> prepare_inputs(std::vector<Batch>& batch);
@@ -182,6 +185,7 @@ class LLMEngine : public Engine {
   int64_t head_dim_ = 0;
   int64_t n_local_linear_v_heads_ = 0;
   int64_t n_local_linear_k_heads_ = 0;
+  bool enable_decode_dcp_layerwise_kv_cache_ = false;
 
   // common frequently used args
   uint32_t dp_size_ = 1;
