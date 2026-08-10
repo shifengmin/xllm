@@ -470,6 +470,15 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
   estimate_options.enable_rdma_scale_padding =
       options_.instance_role() != InstanceRole::DEFAULT;
+#if defined(USE_NPU)
+  estimate_options.enable_decode_dcp_layerwise_kv_cache =
+      ::xllm::ParallelConfig::get_instance()
+          .enable_decode_dcp_layerwise_kv_cache() &&
+      options_.instance_role() == InstanceRole::DECODE &&
+      !options_.is_draft_engine();
+#endif
+  estimate_options.decode_dcp_size =
+      ::xllm::ParallelConfig::get_instance().decode_dcp_size();
   if (options_.enable_mtp_draft_body_tp1() && options_.is_draft_engine()) {
     estimate_options.world_size = 1;
     estimate_options.n_local_kv_heads =

@@ -580,6 +580,10 @@ void DisaggPDScheduler::dispatch_requests() {
           info.dp_rank = resps.resps()[i].dp_rank();
           // TODO: remote_instances_info_ is not multi-thread safe.
           info.remote_instance_info = remote_instances_info_[selected_instance];
+          info.remote_instance_info.enable_decode_dcp_layerwise_kv_cache =
+              resp.enable_decode_dcp_layerwise_kv_cache();
+          info.remote_instance_info.decode_dcp_size =
+              std::max(resp.decode_dcp_size(), 1);
 
           // XTensor mode: save destination offsets from D-node
           if (resp.xtensor_layer_offsets_size() > 0) {

@@ -42,11 +42,13 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/profile_config.h"
@@ -345,6 +347,31 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
+  std::vector<bool> layer_cache_owned;
+  if (decode_dcp_layerwise_kv_cache_enabled()) {
+    CHECK(!enable_linear_attention)
+        << "Decode DCP layerwise KV cache supports full-attention models only.";
+    CHECK_GT(parallel_args_.decode_dcp_size(), 1)
+        << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
+    CHECK_NE(::xllm::KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
+        << "Decode DCP layerwise KV cache requires the NPU ATB backend.";
+    CHECK_LE(options_.host_blocks_factor(), 1.0)
+        << "Decode DCP layerwise KV cache does not support hierarchy host "
+           "cache.";
+    if (options_.enable_disagg_pd()) {
+      CHECK_EQ(options_.kv_cache_transfer_mode(), "PUSH")
+          << "Decode DCP layerwise KV cache only supports PUSH transfer mode.";
+      CHECK_EQ(::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type(),
+               "LlmDataDist")
+          << "Decode DCP layerwise KV cache currently requires LlmDataDist.";
+      CHECK(!options_.enable_pd_ooc())
+          << "Decode DCP layerwise KV cache does not support PD-OOC.";
+    }
+    layer_cache_owned.reserve(static_cast<size_t>(num_layers));
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      layer_cache_owned.emplace_back(owns_decode_dcp_layer(layer_id));
+    }
+  }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
 
@@ -395,6 +422,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .enable_sleep_mode(options_.enable_sleep_mode())
       .enable_linear_attention(enable_linear_attention)
       .enable_lighting_indexer(enable_lighting_indexer)
+      .layer_cache_owned(std::move(layer_cache_owned))
       .indexer_cache_enabled_layers(std::move(indexer_cache_enabled_layers))
       .enable_kv_cache_quant(enable_kv_cache_quant)
       .enable_indexer_cache_quant(enable_indexer_cache_quant)
@@ -419,6 +447,23 @@ bool WorkerImpl::allocate_kv_cache_storage(
 #endif
 
   return true;
+}
+
+bool WorkerImpl::decode_dcp_layerwise_kv_cache_enabled() const {
+#if defined(USE_NPU)
+  return parallel_args_.enable_decode_dcp_layerwise_kv_cache() &&
+         options_.instance_role() == InstanceRole::DECODE && !is_spec_draft_;
+#else
+  return false;
+#endif
+}
+
+bool WorkerImpl::owns_decode_dcp_layer(int64_t layer_id) const {
+  const DecodeDcpLayerPlacement placement(
+      decode_dcp_layerwise_kv_cache_enabled(),
+      parallel_args_.decode_dcp_size(),
+      parallel_args_.decode_dcp_rank());
+  return placement.owns(layer_id);
 }
 
 bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
@@ -924,6 +969,9 @@ void WorkerImpl::apply_kv_block_swaps(const ModelInputParams& input_params) {
   auto dst_tensor =
       torch::tensor(dst_indices, torch::dtype(torch::kLong).device(device_));
   for (size_t layer_id = 0; layer_id < kv_caches_.size(); ++layer_id) {
+    if (!owns_decode_dcp_layer(static_cast<int64_t>(layer_id))) {
+      continue;
+    }
     kv_caches_[layer_id].swap_blocks(src_tensor, dst_tensor);
   }
 #endif

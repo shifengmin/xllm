@@ -156,6 +156,8 @@ message InstanceInfo {
   repeated uint64 cluster_ids = 4;
   repeated string addrs = 8;
   int32 dp_size = 7;
+  bool enable_decode_dcp_layerwise_kv_cache = 9;
+  int32 decode_dcp_size = 10;
 }
 
 message TransferKVInfo {

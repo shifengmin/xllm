@@ -207,10 +207,10 @@ bool LlmDataDistTransfer::push_kv_blocks(
     bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
-  (void)is_spec_draft;
   return push_layer_registered_caches(layer_registered_caches_,
                                       merged_kv_infos,
                                       layer_synchronizer,
+                                      is_spec_draft,
                                       kv_split_rank,
                                       kv_split_size);
 }
@@ -274,6 +274,7 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
     const LayerRegisteredCaches& layer_registered_caches,
     std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
     std::shared_ptr<NPULayerSynchronizerImpl>& layer_synchronizer,
+    bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
   std::vector<std::string> keys;
@@ -289,12 +290,23 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
   for (int64_t layer_index = 0;
        layer_index < static_cast<int64_t>(layer_registered_caches.size());
        ++layer_index) {
+    std::vector<std::string> layer_keys;
+    layer_keys.reserve(keys.size());
+    for (const std::string& key : keys) {
+      if (should_push_layer_to_destination(
+              merged_kv_infos.at(key), layer_index, is_spec_draft)) {
+        layer_keys.emplace_back(key);
+      }
+    }
+    if (layer_keys.empty()) {
+      continue;
+    }
     // Wait for the KV cache computation of this layer to complete.
     if (!layer_synchronizer->synchronize_layer(layer_index)) {
       result = false;
       continue;
     }
-    for (const std::string& key : keys) {
+    for (const std::string& key : layer_keys) {
       const KVCacheInfo& kv_info = merged_kv_infos.at(key);
       if (kv_info.src_blocks.empty() && kv_info.src_linear_state_ids.empty() &&
           kv_info.block_transfer_groups.empty()) {

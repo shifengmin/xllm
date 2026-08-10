@@ -107,6 +107,8 @@ DECLARE_int32(cp_size);
 
 DECLARE_int32(decode_dcp_size);
 
+DECLARE_bool(enable_decode_dcp_layerwise_kv_cache);
+
 DECLARE_int64(tp_size);
 
 DECLARE_int64(sp_size);

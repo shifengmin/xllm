@@ -45,6 +45,7 @@ class ParallelConfig final {
          "ep_size",
          "cp_size",
          "decode_dcp_size",
+         "enable_decode_dcp_layerwise_kv_cache",
          "tp_size",
          "sp_size",
          "cfg_size",
@@ -65,6 +66,9 @@ class ParallelConfig final {
 
   // Decode layer-owner context-parallel width inside each attention TP group.
   PROPERTY(int32_t, decode_dcp_size) = 1;
+
+  // Allocate full KV cache only for layers owned by the local decode DCP rank.
+  PROPERTY(bool, enable_decode_dcp_layerwise_kv_cache) = false;
 
   // 0 means follow cp_size (legacy KV-split width).
   PROPERTY(int32_t, kv_split_size) = 1;

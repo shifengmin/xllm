@@ -230,6 +230,9 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
         ::xllm::ParallelConfig::get_instance().kv_split_size());
     parallel_args_->decode_dcp_size(
         ::xllm::ParallelConfig::get_instance().decode_dcp_size());
+    parallel_args_->enable_decode_dcp_layerwise_kv_cache(
+        ::xllm::ParallelConfig::get_instance()
+            .enable_decode_dcp_layerwise_kv_cache());
     return;
   }
 
@@ -291,6 +294,11 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
       ::xllm::ParallelConfig::get_instance().kv_split_size());
   parallel_args_->decode_dcp_size(
       ::xllm::ParallelConfig::get_instance().decode_dcp_size());
+  const auto decode_dcp_info = mapping.Get(atb_speed::base::ATTN_DECODE_DCP);
+  parallel_args_->decode_dcp_rank(decode_dcp_info.rank);
+  parallel_args_->enable_decode_dcp_layerwise_kv_cache(
+      ::xllm::ParallelConfig::get_instance()
+          .enable_decode_dcp_layerwise_kv_cache());
 #else
   parallel_args_ = std::make_unique<ParallelArgs>(
       global_rank, world_size, dp_size, cp_size, nullptr, ep_size);
@@ -298,6 +306,9 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
       ::xllm::ParallelConfig::get_instance().kv_split_size());
   parallel_args_->decode_dcp_size(
       ::xllm::ParallelConfig::get_instance().decode_dcp_size());
+  parallel_args_->enable_decode_dcp_layerwise_kv_cache(
+      ::xllm::ParallelConfig::get_instance()
+          .enable_decode_dcp_layerwise_kv_cache());
 #endif
 }
 

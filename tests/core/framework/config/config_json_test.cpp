@@ -281,12 +281,14 @@ TEST(ConfigJsonTest, ParallelConfigReadsContextParallelSize) {
 }
 
 TEST(ConfigJsonTest, ParallelConfigReadsDecodeDcpSize) {
-  const JsonReader json =
-      config::parse_json_string(R"json({"decode_dcp_size": 4})json");
+  const JsonReader json = config::parse_json_string(
+      R"json({"decode_dcp_size": 4,
+               "enable_decode_dcp_layerwise_kv_cache": true})json");
   ParallelConfig parallel_config;
   parallel_config.from_json(json);
 
   EXPECT_EQ(parallel_config.decode_dcp_size(), 4);
+  EXPECT_TRUE(parallel_config.enable_decode_dcp_layerwise_kv_cache());
 }
 
 TEST(ConfigJsonTest, RegistersContextParallelCommandLineOptions) {
@@ -295,6 +297,9 @@ TEST(ConfigJsonTest, RegistersContextParallelCommandLineOptions) {
   EXPECT_EQ(flag_info.default_value, "1");
   EXPECT_TRUE(google::GetCommandLineFlagInfo("decode_dcp_size", &flag_info));
   EXPECT_EQ(flag_info.default_value, "1");
+  EXPECT_TRUE(google::GetCommandLineFlagInfo(
+      "enable_decode_dcp_layerwise_kv_cache", &flag_info));
+  EXPECT_EQ(flag_info.default_value, "false");
 
   const std::string removed_flag = std::string("enable_") + "prefill_sp";
   EXPECT_FALSE(

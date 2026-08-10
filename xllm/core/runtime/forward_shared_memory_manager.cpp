@@ -191,6 +191,8 @@ inline size_t get_instance_info_size(const InstanceInfo& info) {
 
   size += type_size<int32_t>    // dp_size
           + type_size<int32_t>  // kv_split_size
+          + type_size<bool>     // enable_decode_dcp_layerwise_kv_cache
+          + type_size<int32_t>  // decode_dcp_size
           + type_size<uint64_t> +
           info.ttft_profiling_data.size() *
               (type_size<int32_t> + type_size<int64_t>);
@@ -726,6 +728,8 @@ inline void write_instance_info(char*& buffer, const InstanceInfo& info) {
 
   write_data(buffer, info.dp_size);
   write_data(buffer, info.kv_split_size);
+  write_data(buffer, info.enable_decode_dcp_layerwise_kv_cache);
+  write_data(buffer, info.decode_dcp_size);
 
   const uint64_t prof_size = info.ttft_profiling_data.size();
   write_data(buffer, prof_size);
@@ -752,6 +756,8 @@ inline void write_instance_info(RawInputSerializeContext& context,
 
   write_data(context.descriptor, info.dp_size);
   write_data(context.descriptor, info.kv_split_size);
+  write_data(context.descriptor, info.enable_decode_dcp_layerwise_kv_cache);
+  write_data(context.descriptor, info.decode_dcp_size);
 
   const uint64_t prof_size = info.ttft_profiling_data.size();
   write_data(context.descriptor, prof_size);
@@ -1624,6 +1630,8 @@ inline void read_instance_info(const char*& buffer, InstanceInfo& info) {
 
   read_data(buffer, info.dp_size);
   read_data(buffer, info.kv_split_size);
+  read_data(buffer, info.enable_decode_dcp_layerwise_kv_cache);
+  read_data(buffer, info.decode_dcp_size);
 
   uint64_t prof_size;
   read_data(buffer, prof_size);
@@ -1652,6 +1660,8 @@ inline void read_instance_info(ReadContext& context, InstanceInfo& info) {
 
   read_data(context, info.dp_size);
   read_data(context, info.kv_split_size);
+  read_data(context, info.enable_decode_dcp_layerwise_kv_cache);
+  read_data(context, info.decode_dcp_size);
 
   uint64_t prof_size;
   read_data(context, prof_size);

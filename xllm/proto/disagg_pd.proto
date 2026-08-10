@@ -121,6 +121,11 @@ message DisaggResponse {
   // request did not hit the D-side cache; also zero on responses from
   // engines that do not populate it (backward-compatible default).
   uint32 remote_shared_num = 21;
+
+  // Decode-side layerwise-owner KV cache placement. Prefill uses these fields
+  // only for PUSH routing; draft-model cache transfer remains unfiltered.
+  bool enable_decode_dcp_layerwise_kv_cache = 22;
+  int32 decode_dcp_size = 23;
 }
 
 // XTensor mode: offsets for one layer

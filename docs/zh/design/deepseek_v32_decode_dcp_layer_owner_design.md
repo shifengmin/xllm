@@ -859,3 +859,66 @@ Profiler 还应证明：
 | 与快速验证的关系 | 需要先定义真实 sequence shard，无法在全量副本上忠实验证数据分布 | 即使外部仍有全量 cache，也能通过 owner-only 图和 poison 测试忠实验证最终 decode 数据依赖 |
 
 因此第一版选择 layerwise owner。两级 Indexer 不作为 fallback 同时保留，避免出现两套难以对齐的 causal 和 top-k 语义。
+
+## 17. 框架真实 sharding 实现进展（2026-08-10）
+
+当前本地开发基线为 `codex/feat/deepseek-v32-decode-dcp`，基线提交
+`6c530ec1`。框架真实 sharding 与 PD PUSH 适配正在该工作区以未提交改动
+继续开发。
+
+### 17.1 已实现
+
+- 新增 `enable_decode_dcp_layerwise_kv_cache` 开关，默认关闭，并接入命令行、
+  JSON 配置和 `ParallelArgs`。
+- 新增统一的 `DecodeDcpLayerPlacement`，worker 分配与 Prefill PUSH 过滤共同
+  使用 `owner = layer_id % decode_dcp_size`。
+- target decode owner 层按公共逻辑 block 数分配完整 KV；non-owner 层仍创建
+  相同 `KVCache` 接口，但 K/V、Indexer 和 scale tensor 的 block 维均缩为 1。
+- 容量估算按每个 DCP rank 的 owner 层成本和所有 non-owner null block 成本
+  计算，并取所有 DCP rank 可支持的最小公共 block 数，block manager 无需感知
+  layer owner。
+- target worker 的 block swap 跳过 non-owner 层。draft worker 不进入 layerwise
+  ownership，继续保留单层全量 cache。
+- PD PUSH 从 decode response 获得 layerwise 开关和 `decode_dcp_size`，Prefill
+  根据每个目标 decode TP rank 对应的 DCP local rank 逐层过滤；draft cache
+  transfer 明确绕过过滤。
+- LlmDataDist 使用逐层直接写已注册远端 cache 的协议，没有 receiver 侧层计数；
+  因此 layer 过滤只改变 sender 的目标 key 集合，不引入额外完成消息或等待条件。
+
+### 17.2 本轮发现并修复的原始问题
+
+`SpeculativeEngine::calculate_kv_cache` 原先在 target/draft 共用设备时，仍按
+target 的“所有层全量 KV”重新计算共同 block 数。该逻辑会覆盖 target
+layerwise estimator 的结果，使 MTP 下显存收益丢失，也没有表达“target 按
+owner/null sharding、draft 单层全量 cache”的真实分配。
+
+当前已将 layerwise 容量公式抽成共享 helper。MTP 的公共 block 数现在对每个
+DCP rank 使用以下成本计算并取最小值：
+
+`non_owner_null_bytes + N * (owned_target_bytes + full_draft_bytes)`。
+
+因此 DCP 仍不感知 MTP 的执行语义；唯一额外处理发生在显存容量估算，draft
+cache 本身不做 layerwise sharding。
+
+### 17.3 已补测试
+
+- layer 数不能被 DCP size 整除时，以最大 owner footprint 决定公共 block 数；
+- MTP full draft cache 参与 layerwise 公共容量计算；
+- owner 层 tensor 使用完整 block 数，non-owner 层 tensor 只有 1 个 block；
+- 配置开关的 JSON/命令行注册；
+- PUSH 按目标 owner 过滤，配置关闭保持全量传输，draft cache 始终全量传输。
+
+### 17.4 待验证
+
+1. 已在远端 `/export/home/shifengmin.3/workspace/xllm-dcp-e2e` 完成
+   `python setup.py build --device npu` 全量构建，主二进制、Python export 和
+   `all_tests` 均通过。
+2. 聚焦单元测试当前在通用 NPU test bootstrap 导入 `torch_npu` 前中止：测试
+   二进制链接的 `/usr/local/libtorch_npu` 与 Python wheel 自带的 `torch_npu`
+   动态库不匹配。该问题与本功能断言无关，且截至上游 main 的
+   `736f998` 尚未统一两者的库来源；待使用匹配的 NPU runtime 环境后重跑。
+3. 单机整机 8 卡/16 Die 运行 GLM-5 target decode，比较 DCP 关闭基线与
+   layerwise 开启后的生成、block 数、每层实际 tensor shape 和 HBM 占用。
+4. 开启 MTP 验证 target layerwise + draft 单层全量 cache。
+5. PD 分离 PUSH 验证每个 decode rank 只接收 owner 层 target KV，draft KV
+   全量传输，并确认无越界、等待或死锁。

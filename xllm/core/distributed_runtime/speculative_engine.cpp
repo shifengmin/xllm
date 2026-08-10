@@ -22,6 +22,8 @@ limitations under the License.
 #include <memory>
 
 #include "common/metrics.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "llm_engine.h"
 #include "runtime/forward_params.h"
 #include "util/timer.h"
@@ -232,6 +234,22 @@ int64_t SpeculativeEngine::calculate_kv_cache(
                               draft_kv_cache_cap.index_slot_size())
           : block_size * draft_full_attention_layers *
                 draft_allocated_full_attention_slot_size;
+#if defined(USE_NPU)
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const bool enable_decode_dcp_layerwise_kv_cache =
+      parallel_config.enable_decode_dcp_layerwise_kv_cache() &&
+      options_.instance_role() == InstanceRole::DECODE;
+  if (enable_decode_dcp_layerwise_kv_cache) {
+    CHECK_EQ(linear_cache_size_in_bytes, 0)
+        << "Decode DCP layerwise KV cache does not support linear attention.";
+    return estimate_decode_dcp_layerwise_block_count(
+        model_args_,
+        parallel_config.decode_dcp_size(),
+        target_kv_cache_cap,
+        cache_size_in_bytes,
+        draft_full_attention_block_size_in_bytes);
+  }
+#endif
   const int64_t full_attention_block_size_in_bytes =
       target_full_attention_block_size_in_bytes +
       draft_full_attention_block_size_in_bytes;

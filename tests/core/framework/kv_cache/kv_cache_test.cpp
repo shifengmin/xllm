@@ -430,6 +430,47 @@ TEST(KVCacheTest, IndexedKVCacheExposesQuantizedKvScaleTensors) {
             (std::vector<int64_t>{2, 4, 1}));
 }
 
+TEST(KVCacheTest, LayerwiseOwnershipAllocatesOneBlockForNonOwnerLayers) {
+  constexpr int64_t kBlockCount = 8;
+  constexpr int64_t kBlockSize = 16;
+
+  KVCacheCapacity capacity;
+  capacity.n_blocks(kBlockCount).block_size(kBlockSize);
+
+  ModelArgs model_args;
+  model_args.model_type("glm_moe_dsa")
+      .enable_mla(true)
+      .n_heads(8)
+      .n_kv_heads(2)
+      .head_dim(64)
+      .kv_lora_rank(64)
+      .qk_rope_head_dim(16)
+      .index_n_heads(1)
+      .index_head_dim(32);
+  const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
+
+  KVCacheCreateOptions options;
+  options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kBFloat16)
+      .num_layers(4)
+      .model_type("glm_moe_dsa")
+      .enable_lighting_indexer(true)
+      .layer_cache_owned({true, false, true, false});
+
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, shape, options);
+
+  ASSERT_EQ(caches.size(), 4U);
+  EXPECT_EQ(caches[0].get_k_cache().size(0), kBlockCount);
+  EXPECT_EQ(caches[0].get_index_cache().size(0), kBlockCount);
+  EXPECT_EQ(caches[1].get_k_cache().size(0), 1);
+  EXPECT_EQ(caches[1].get_index_cache().size(0), 1);
+  EXPECT_EQ(caches[2].get_k_cache().size(0), kBlockCount);
+  EXPECT_EQ(caches[2].get_index_cache().size(0), kBlockCount);
+  EXPECT_EQ(caches[3].get_k_cache().size(0), 1);
+  EXPECT_EQ(caches[3].get_index_cache().size(0), 1);
+}
+
 #if defined(USE_MLU)
 TEST(KVCacheTest,
      MluQuantizedIndexedKVCacheAllocatesInt8KvAndScalesOnCpuDevice) {

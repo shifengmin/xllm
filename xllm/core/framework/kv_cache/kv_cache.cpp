@@ -311,10 +311,18 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
 
   const int64_t num_layers = create_options.num_layers();
   kv_caches.reserve(num_layers);
+  const std::vector<bool>& layer_cache_owned =
+      create_options.layer_cache_owned();
+  if (!layer_cache_owned.empty()) {
+    CHECK_EQ(layer_cache_owned.size(), static_cast<size_t>(num_layers))
+        << "Layer cache ownership mask must match num_layers.";
+  }
 
   if (util::is_target_model_type(create_options.model_type(),
                                  /*target_type=*/"deepseek_v4",
                                  /*match_mtp=*/true)) {
+    CHECK(layer_cache_owned.empty())
+        << "DeepSeek V4 does not support decode DCP layerwise KV cache.";
     std::vector<int32_t> layer_compress_ratios;
     layer_compress_ratios.reserve(static_cast<size_t>(num_layers));
     std::map<int32_t, std::string> ratio_shape_summaries;
@@ -348,11 +356,15 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
   }
 
   if (create_options.enable_sleep_mode()) {
+    CHECK(layer_cache_owned.empty())
+        << "Sleep mode does not support decode DCP layerwise KV cache.";
     allocate_sleepable_kv_caches(kv_caches, kv_cache_shape, create_options);
     return;
   }
 
   if (create_options.enable_xtensor()) {
+    CHECK(layer_cache_owned.empty())
+        << "XTensor does not support decode DCP layerwise KV cache.";
     CHECK(kv_cache_shape.has_key_cache_shape())
         << "key_cache_shape must be initialized for XTensor mode.";
     CHECK(kv_cache_shape.has_value_cache_shape())
@@ -392,8 +404,13 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
     return;
   }
 
+  const KVCacheShape null_cache_shape = kv_cache_shape.with_block_count(1);
   for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    kv_caches.emplace_back(kv_cache_shape, create_options, layer_idx);
+    const bool owns_layer = layer_cache_owned.empty() ||
+                            layer_cache_owned[static_cast<size_t>(layer_idx)];
+    const KVCacheShape& layer_shape =
+        owns_layer ? kv_cache_shape : null_cache_shape;
+    kv_caches.emplace_back(layer_shape, create_options, layer_idx);
   }
 }
 
