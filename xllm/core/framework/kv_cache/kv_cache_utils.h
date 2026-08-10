@@ -67,6 +67,9 @@ struct KVCacheCreateOptions {
   PROPERTY(bool, enable_sleep_mode) = false;
   PROPERTY(bool, enable_linear_attention) = false;
   PROPERTY(bool, enable_lighting_indexer) = false;
+  // Empty keeps the legacy full allocation. Otherwise false means that the
+  // layer only keeps one block as a valid null-cache binding.
+  PROPERTY(std::vector<bool>, layer_cache_owned);
   // Empty keeps the legacy all-layer behavior. Otherwise each entry controls
   // whether that layer owns indexer cache tensors.
   PROPERTY(std::vector<bool>, indexer_cache_enabled_layers);

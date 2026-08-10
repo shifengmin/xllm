@@ -54,6 +54,9 @@ class KVCacheTransfer {
   struct KVCacheInfo {
     uint64_t dst_cluster_id;
     std::string dst_addr;
+    bool enable_decode_dcp_layerwise_kv_cache = false;
+    int32_t decode_dcp_size = 1;
+    int32_t decode_dcp_rank = 0;
     std::vector<uint64_t> src_blocks;
     std::vector<uint64_t> dst_blocks;
     std::vector<uint64_t> src_linear_state_ids;
@@ -70,6 +73,10 @@ class KVCacheTransfer {
   static std::vector<std::string> rotate_dst_rank(
       const std::vector<std::string>& keys,
       int32_t kv_split_rank);
+
+  static bool should_push_layer_to_destination(const KVCacheInfo& kv_info,
+                                               int64_t layer_id,
+                                               bool is_spec_draft);
 
   KVCacheTransfer() = default;
   virtual ~KVCacheTransfer() = default;

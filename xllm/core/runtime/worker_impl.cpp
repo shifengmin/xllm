@@ -42,6 +42,7 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -262,6 +263,10 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
   }
+  parallel_args_.enable_decode_dcp_layerwise_kv_cache(
+      resolve_decode_dcp_layerwise_kv_cache_enabled(
+          parallel_args_.enable_decode_dcp_layerwise_kv_cache(),
+          options_.is_draft_engine() || is_spec_draft_));
 
   // first worker is the driver
   driver_ = parallel_args.rank() == 0;
@@ -345,6 +350,13 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
+  std::vector<bool> layer_cache_owned;
+  if (decode_dcp_layerwise_kv_cache_enabled()) {
+    layer_cache_owned.reserve(static_cast<size_t>(num_layers));
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      layer_cache_owned.emplace_back(owns_decode_dcp_layer(layer_id));
+    }
+  }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
 
@@ -395,6 +407,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .enable_sleep_mode(options_.enable_sleep_mode())
       .enable_linear_attention(enable_linear_attention)
       .enable_lighting_indexer(enable_lighting_indexer)
+      .layer_cache_owned(std::move(layer_cache_owned))
       .indexer_cache_enabled_layers(std::move(indexer_cache_enabled_layers))
       .enable_kv_cache_quant(enable_kv_cache_quant)
       .enable_indexer_cache_quant(enable_indexer_cache_quant)
@@ -419,6 +432,18 @@ bool WorkerImpl::allocate_kv_cache_storage(
 #endif
 
   return true;
+}
+
+bool WorkerImpl::decode_dcp_layerwise_kv_cache_enabled() const {
+  return parallel_args_.enable_decode_dcp_layerwise_kv_cache();
+}
+
+bool WorkerImpl::owns_decode_dcp_layer(int64_t layer_id) const {
+  const DecodeDcpLayerPlacement placement(
+      decode_dcp_layerwise_kv_cache_enabled(),
+      parallel_args_.decode_dcp_size(),
+      parallel_args_.decode_dcp_rank());
+  return placement.owns(layer_id);
 }
 
 bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {

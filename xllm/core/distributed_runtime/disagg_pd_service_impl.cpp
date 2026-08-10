@@ -20,6 +20,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/types.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "distributed_runtime/llm_engine.h"
 #include "framework/request/request_output.h"
 #include "scheduler/disagg_pd_scheduler.h"
@@ -148,6 +149,10 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
   for (auto& req : request->reqs()) {
     auto resp = response->add_resps();
     resp->set_req_id(req.req_id());
+    const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+    resp->set_enable_decode_dcp_layerwise_kv_cache(
+        parallel_config.enable_decode_dcp_layerwise_kv_cache());
+    resp->set_decode_dcp_size(parallel_config.decode_dcp_size());
 
     auto new_request = generate_request(req);
     if (new_request == nullptr) {

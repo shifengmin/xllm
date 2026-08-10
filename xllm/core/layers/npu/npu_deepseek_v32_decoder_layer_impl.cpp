@@ -21,6 +21,7 @@ limitations under the License.
 #include <boost/algorithm/string.hpp>
 #include <cctype>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <utility>
@@ -389,6 +390,15 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_, model_args, parallel_args, /*is_prefill=*/true);
   param_from_args(
       decode_param_, model_args, parallel_args, /*is_prefill=*/false);
+  if (decode_param_.enableDecodeDcpLayerOwner) {
+    CHECK_GT(model_args.max_position_embeddings(), 0);
+    CHECK_LE(model_args.max_position_embeddings(),
+             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    max_position_embeddings_ =
+        static_cast<int32_t>(model_args.max_position_embeddings());
+    decode_dcp_block_size_ = ::xllm::KVCacheConfig::get_instance().block_size();
+    CHECK_GT(decode_dcp_block_size_, 0);
+  }
   has_mtp_topk_fallback_ =
       skip_topk_ && model_args.index_share_for_mtp_iteration() &&
       model_args.model_type().find("_mtp") != std::string::npos;
@@ -434,6 +444,20 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_tensors(
   block_tables_placeholder_ =
       torch::zeros({1, 1}).to(torch::kInt32).to(device_);
   tensor_placeholder_ = torch::zeros({1}).to(options);
+
+  if (decode_param_.enableDecodeDcpLayerOwner) {
+    std::vector<int32_t> logical_block_lut(max_position_embeddings_);
+    std::vector<int32_t> block_offset_lut(max_position_embeddings_);
+    for (int32_t position = 0; position < max_position_embeddings_;
+         ++position) {
+      logical_block_lut[position] = position / decode_dcp_block_size_;
+      block_offset_lut[position] = position % decode_dcp_block_size_;
+    }
+    decode_dcp_logical_block_lut_ =
+        torch::tensor(logical_block_lut, torch::kInt32).to(device_);
+    decode_dcp_block_offset_lut_ =
+        torch::tensor(block_offset_lut, torch::kInt32).to(device_);
+  }
 
   expert_group_ = torch::arange(1024, torch::kInt32).to(device_);
   one_hot_ = torch::tensor({1}, torch::kInt32).to(device_);
@@ -581,8 +605,21 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
   param.index_head_dim = args.index_head_dim();
   param.index_n_heads = args.index_n_heads();
   param.index_topk = args.index_topk();
+  CHECK_GT(param.index_topk, 0);
   param.skipTopk = skip_topk_;
   param.outputTopk = output_topk_;
+  const bool is_mtp_draft_model =
+      args.model_type().find("_mtp") != std::string::npos;
+  param.enableDecodeDcpLayerOwner = !param.isPrefill && !is_mtp_draft_model &&
+                                    parallel_args.decode_dcp_size() > 1;
+  param.decodeDcpBlockSize = ::xllm::KVCacheConfig::get_instance().block_size();
+  if (param.enableDecodeDcpLayerOwner) {
+    CHECK_LE(param.index_topk, 2048)
+        << "Decode DCP LightningIndexer selected count must not exceed 2048.";
+    CHECK(!param.enableMlaPreprocess)
+        << "Decode layer-owner DCP currently requires the ordinary MLA "
+           "preprocess path.";
+  }
 }
 
 void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
@@ -1016,6 +1053,118 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
   return atb::NO_ERROR;
 }
 
+NpuDeepseekV32DecoderLayerImpl::DecodeDcpRuntimeInputs
+NpuDeepseekV32DecoderLayerImpl::prepare_decode_dcp_runtime_inputs(
+    const torch::Tensor& x,
+    const ModelInputParams& input_params) const {
+  CHECK(decode_param_.enableDecodeDcpLayerOwner);
+  CHECK(!input_params.enable_graph)
+      << "Decode layer-owner DCP currently supports eager ATB only.";
+
+  const int64_t query_count = x.size(0);
+  CHECK_GT(query_count, 0)
+      << "Decode DCP requires the existing non-empty execution placeholder.";
+  CHECK_LE(query_count,
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+  const int32_t execution_query_count = static_cast<int32_t>(query_count);
+
+  std::vector<int32_t> visible_lengths;
+  std::vector<int32_t> query_block_rows;
+  visible_lengths.reserve(query_count);
+  query_block_rows.reserve(query_count);
+
+  const bool use_expanded_attention =
+      input_params.graph.use_expanded_decode_for_spec_verify_attention;
+  if (use_expanded_attention) {
+    CHECK_EQ(input_params.graph.expanded_kv_seq_lens_vec.size(),
+             static_cast<size_t>(query_count));
+    visible_lengths = input_params.graph.expanded_kv_seq_lens_vec;
+    for (int32_t query_idx = 0; query_idx < execution_query_count;
+         ++query_idx) {
+      query_block_rows.emplace_back(query_idx);
+    }
+  } else {
+    const std::vector<int32_t>& q_seq_lens =
+        input_params.attention.host.q_seq_lens;
+    const std::vector<int32_t>& kv_seq_lens =
+        input_params.attention.host.kv_seq_lens;
+    const bool empty_batch = input_params.meta.num_sequences == 0;
+    if (empty_batch || q_seq_lens.empty() || kv_seq_lens.empty()) {
+      visible_lengths.assign(query_count, 1);
+      query_block_rows.assign(query_count, 0);
+    } else {
+      CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
+          << "Decode DCP expects one q_len and kv_len per sequence.";
+      int64_t expanded_query_count = 0;
+      for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+           ++sequence_idx) {
+        const int32_t q_len = q_seq_lens[sequence_idx];
+        const int32_t kv_len = kv_seq_lens[sequence_idx];
+        CHECK_GT(q_len, 0);
+        CHECK_GE(kv_len, q_len);
+        for (int32_t token_idx = 0; token_idx < q_len; ++token_idx) {
+          visible_lengths.emplace_back(kv_len - q_len + token_idx + 1);
+          query_block_rows.emplace_back(static_cast<int32_t>(sequence_idx));
+          ++expanded_query_count;
+        }
+      }
+      CHECK_EQ(expanded_query_count, query_count)
+          << "Decode DCP query metadata does not match hidden-state rows.";
+    }
+  }
+
+  const int32_t index_topk = decode_param_.index_topk;
+  std::vector<int32_t> packed_gather_indices;
+  std::vector<int32_t> packed_query_block_rows;
+  std::vector<int32_t> actual_seq_lengths_query(query_count);
+  std::vector<int32_t> actual_seq_lengths_key(query_count);
+  std::vector<int32_t> identity_topk(
+      static_cast<size_t>(query_count) * index_topk, -1);
+
+  int64_t packed_key_count = 0;
+  for (int32_t query_idx = 0; query_idx < execution_query_count; ++query_idx) {
+    const int32_t visible_len = visible_lengths[query_idx];
+    CHECK_GT(visible_len, 0);
+    CHECK_LE(visible_len, max_position_embeddings_)
+        << "Decode DCP logical-position LUT is too small.";
+    const int32_t valid_topk = std::min(index_topk, visible_len);
+    actual_seq_lengths_query[query_idx] = query_idx + 1;
+    packed_key_count += valid_topk;
+    CHECK_LE(packed_key_count,
+             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    actual_seq_lengths_key[query_idx] = static_cast<int32_t>(packed_key_count);
+    for (int32_t topk_idx = 0; topk_idx < valid_topk; ++topk_idx) {
+      packed_gather_indices.emplace_back(query_idx * index_topk + topk_idx);
+      packed_query_block_rows.emplace_back(query_block_rows[query_idx]);
+      identity_topk[static_cast<size_t>(query_idx) * index_topk + topk_idx] =
+          topk_idx;
+    }
+  }
+  CHECK_GT(packed_key_count, 0);
+
+  DecodeDcpRuntimeInputs inputs;
+  inputs.packed_gather_indices =
+      torch::tensor(packed_gather_indices, torch::kInt32).to(device_);
+  inputs.packed_query_block_rows =
+      torch::tensor(packed_query_block_rows, torch::kInt32).to(device_);
+  inputs.actual_seq_lengths_query =
+      torch::tensor(actual_seq_lengths_query, torch::kInt32).to(device_);
+  inputs.actual_seq_lengths_key =
+      torch::tensor(actual_seq_lengths_key, torch::kInt32).to(device_);
+  inputs.identity_topk = torch::tensor(identity_topk, torch::kInt32)
+                             .view({query_count, 1, index_topk})
+                             .to(device_);
+
+  const int64_t selected_cache_width =
+      static_cast<int64_t>(kv_lora_rank_) + qk_rope_head_dim_;
+  inputs.selected_cache_buffer =
+      torch::empty({packed_key_count, 1, selected_cache_width}, x.options());
+  inputs.topk_buffer =
+      torch::empty({query_count, 1, index_topk},
+                   torch::TensorOptions().device(device_).dtype(torch::kInt32));
+  return inputs;
+}
+
 torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward(
     torch::Tensor& x,
     torch::Tensor& cos_pos,
@@ -1056,7 +1205,31 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
   atb::Status st;
   ModelInputParams& input_params_new =
       const_cast<ModelInputParams&>(input_params);
-  if (input_params_new.meta.batch_forward_type.is_decode()) {
+  const bool use_decode_dcp =
+      decode_param_.enableDecodeDcpLayerOwner &&
+      (input_params_new.meta.batch_forward_type.is_decode() ||
+       input_params_new.graph.use_expanded_decode_for_spec_verify_attention);
+  if (use_decode_dcp) {
+    decode_dcp_runtime_inputs_ =
+        prepare_decode_dcp_runtime_inputs(x, input_params_new);
+    build_node_variant_pack(decode_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            attn_mask,
+                            kv_cache,
+                            input_params_new,
+                            false,
+                            shared_topk_indices,
+                            output_topk_indices,
+                            skip_topk_,
+                            output_topk_,
+                            &decode_dcp_runtime_inputs_);
+    st = execute_node(decode_node_, node_id, event, event_flag);
+    LOG_IF(FATAL, st != 0) << model_name_
+                           << " execute decode DCP layer failed, error code: "
+                           << st;
+  } else if (input_params_new.meta.batch_forward_type.is_decode()) {
     build_node_variant_pack(decode_node_,
                             x,
                             cos_pos,
@@ -1071,7 +1244,8 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             output_topk_);
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "execute prefill layer fail, error code: " << st;
+                           << " execute decode layer failed, error code: "
+                           << st;
   } else {
     build_node_variant_pack(prefill_node_,
                             x,
@@ -1158,7 +1332,8 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     const torch::Tensor& shared_topk_indices,
     torch::Tensor* output_topk_indices,
     bool skip_topk,
-    bool output_topk) {
+    bool output_topk,
+    const DecodeDcpRuntimeInputs* dcp_inputs) {
   internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
@@ -1167,6 +1342,9 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   const CpAttentionMeta& cp_attention_meta =
       input_params.parallel.cp_plan.attention_meta();
   const bool use_cp_ep_padding = (cp_size_ > 1 && is_prefill);
+  const bool use_expanded_decode_dcp =
+      dcp_inputs != nullptr &&
+      input_params.graph.use_expanded_decode_for_spec_verify_attention;
 
   if (dp_size_ <= 1 && ep_size_ <= 1 || cp_size_ > 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
@@ -1197,9 +1375,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
-  if ((!input_params.attention.device.block_tables.defined() ||
-       input_params.attention.device.block_tables.storage().data() ==
-           nullptr)) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.graph.expanded_kv_seq_lens);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
+        const_cast<int32_t*>(
+            input_params.graph.expanded_kv_seq_lens_vec.data());
+  } else if ((!input_params.attention.device.block_tables.defined() ||
+              input_params.attention.device.block_tables.storage().data() ==
+                  nullptr)) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
@@ -1221,8 +1406,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
 
-  if (!input_params.attention.device.block_tables.defined() ||
-      input_params.attention.device.block_tables.storage().data() == nullptr) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.graph.expanded_block_tables);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.new_cache_slots);
+  } else if (!input_params.attention.device.block_tables.defined() ||
+             input_params.attention.device.block_tables.storage().data() ==
+                 nullptr) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
         atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
@@ -1328,7 +1521,10 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   const bool use_q_cu_seq_lens =
       !empty_batch && input_params.attention.device.q_cu_seq_lens.defined() &&
       input_params.attention.device.q_cu_seq_lens.numel() != 0;
-  if (use_q_cu_seq_lens) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_query);
+  } else if (use_q_cu_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.q_cu_seq_lens);
@@ -1343,6 +1539,27 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
         << "DSA top-k sharing requires previous top-k indices.";
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(shared_topk_indices);
+  }
+
+  if (dcp_inputs != nullptr) {
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->selected_cache_buffer);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->topk_buffer);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(decode_dcp_logical_block_lut_);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(decode_dcp_block_offset_lut_);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_gather_indices);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_query_block_rows);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_query);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_key);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->identity_topk);
   }
 
   if (cp_size_ > 1 && is_prefill) {

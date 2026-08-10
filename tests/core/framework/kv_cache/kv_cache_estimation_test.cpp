@@ -60,6 +60,40 @@ TEST(KVCacheEstimationTest, EstimatesStandardAttentionBlocks) {
   EXPECT_EQ(capacity.n_blocks(), 128);
 }
 
+TEST(KVCacheEstimationTest, LayerwiseCapacityUsesLargestOwnerFootprint) {
+  ModelArgs model_args = make_standard_args();
+  model_args.n_layers(5);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.enable_decode_dcp_layerwise_kv_cache = true;
+  options.decode_dcp_size = 2;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  EXPECT_EQ(capacity.n_blocks(), 170);
+}
+
+TEST(KVCacheEstimationTest, LayerwiseCapacityIncludesFullDraftCache) {
+  ModelArgs model_args = make_standard_args();
+  model_args.n_layers(5);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.enable_decode_dcp_layerwise_kv_cache = true;
+  options.decode_dcp_size = 2;
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  const int64_t draft_block_bytes =
+      capacity.block_size() * capacity.slot_size();
+
+  const int64_t block_count =
+      estimate_decode_dcp_layerwise_block_count(model_args,
+                                                options.decode_dcp_size,
+                                                capacity,
+                                                options.cache_size_in_bytes,
+                                                draft_block_bytes);
+
+  EXPECT_EQ(block_count, 127);
+}
+
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   ModelArgs model_args = make_standard_args();
   KVCacheEstimateOptions options = make_estimate_options();

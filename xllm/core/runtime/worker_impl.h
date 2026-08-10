@@ -245,6 +245,10 @@ class WorkerImpl {
   // model
   int64_t get_num_layers() const;
 
+  bool decode_dcp_layerwise_kv_cache_enabled() const;
+
+  bool owns_decode_dcp_layer(int64_t layer_id) const;
+
   bool wakeup_local(const WakeupOptions& options);
 
   // ---- RL deep-sleep path (SleepableAllocator), isolated from the xtensor
