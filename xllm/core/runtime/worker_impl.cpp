@@ -48,7 +48,6 @@ limitations under the License.
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
-#include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/profile_config.h"
@@ -353,24 +352,6 @@ bool WorkerImpl::allocate_kv_cache_storage(
   const int64_t num_layers = get_num_layers();
   std::vector<bool> layer_cache_owned;
   if (decode_dcp_layerwise_kv_cache_enabled()) {
-    CHECK(!enable_linear_attention)
-        << "Decode DCP layerwise KV cache supports full-attention models only.";
-    CHECK_GT(parallel_args_.decode_dcp_size(), 1)
-        << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
-    CHECK_NE(::xllm::KernelConfig::get_instance().npu_kernel_backend(), "TORCH")
-        << "Decode DCP layerwise KV cache requires the NPU ATB backend.";
-    CHECK_LE(options_.host_blocks_factor(), 1.0)
-        << "Decode DCP layerwise KV cache does not support hierarchy host "
-           "cache.";
-    if (options_.enable_disagg_pd()) {
-      CHECK_EQ(options_.kv_cache_transfer_mode(), "PUSH")
-          << "Decode DCP layerwise KV cache only supports PUSH transfer mode.";
-      CHECK_EQ(::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type(),
-               "LlmDataDist")
-          << "Decode DCP layerwise KV cache currently requires LlmDataDist.";
-      CHECK(!options_.enable_pd_ooc())
-          << "Decode DCP layerwise KV cache does not support PD-OOC.";
-    }
     layer_cache_owned.reserve(static_cast<size_t>(num_layers));
     for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
       layer_cache_owned.emplace_back(owns_decode_dcp_layer(layer_id));

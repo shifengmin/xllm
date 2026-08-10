@@ -62,6 +62,19 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+void validate_decode_dcp_layerwise_kv_cache_model(bool enabled,
+                                                  const ModelArgs& model_args) {
+  if (!enabled) {
+    return;
+  }
+  CHECK(!has_linear_attention_layers(model_args))
+      << "Decode DCP layerwise KV cache supports full-attention models only.";
+}
+
+}  // namespace
+
 // Extra weight pages reserved for mapping/alignment overhead.
 constexpr size_t kXTensorWeightPageSafetyMargin = 20;
 
@@ -194,6 +207,8 @@ bool LLMEngine::init_model(MasterStatus master_status) {
 
   args_ = model_loader->model_args();
   quant_args_ = model_loader->quant_args();
+  validate_decode_dcp_layerwise_kv_cache_model(
+      enable_decode_dcp_layerwise_kv_cache_, args_);
 
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.

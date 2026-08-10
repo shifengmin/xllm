@@ -929,3 +929,17 @@ cache 本身不做 layerwise sharding。
 4. 开启 MTP 验证 target layerwise + draft 单层全量 cache。
 5. PD 分离 PUSH 验证每个 decode rank 只接收 owner 层 target KV，draft KV
    全量传输，并确认无越界、等待或死锁。
+
+### 17.5 启动校验职责重构
+
+- 将 layerwise DCP 的静态配置约束从 Worker KV 分配路径集中到 Master 启动
+  校验：DECODE role、`decode_dcp_size > 1`、NPU ATB backend、禁用 hierarchy
+  host cache，以及 PD 场景只允许 PUSH + LlmDataDist 且禁用 PD-OOC。
+- NPU backend 校验在 `AUTO` 完成实际 backend 解析之后执行，避免对未解析配置
+  做错误判断。
+- full-attention 模型能力依赖 `ModelArgs`，因此在 `LLMEngine::init_model` 读取
+  模型配置后校验，不延迟到 KV tensor 分配阶段。
+- Worker 的 layerwise 分配路径现在只读取初始化后有效的功能开关并生成逐层
+  owner mask，不再重复感知 instance role、backend、PD 模式或模型类型。
+- 本轮完成 `clang-format --dry-run --Werror` 和 `git diff --check`；按当前重构阶段
+  约定未启动远端 NPU 全量编译和端到端测试。
