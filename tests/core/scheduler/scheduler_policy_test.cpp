@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/model/model_args.h"
+#include "framework/request/request_output.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -197,6 +198,19 @@ void update_requests(std::vector<std::shared_ptr<Request>> requests) {
       Token token(1);
       seq->append_token(token);
     }
+  }
+}
+
+void advance_running_prefill(ContinuousScheduler* scheduler) {
+  CHECK(scheduler != nullptr);
+  const std::vector<std::shared_ptr<Request>> running_requests =
+      scheduler->get_running_requests();
+  const std::vector<size_t> running_budgets =
+      scheduler->get_running_sequences_budgets();
+  ASSERT_EQ(running_requests.size(), running_budgets.size());
+  for (size_t i = 0; i < running_requests.size(); ++i) {
+    Sequence* sequence = running_requests[i]->sequences()[0].get();
+    sequence->kv_state().incr_kv_cache_tokens_num(running_budgets[i]);
   }
 }
 
@@ -638,6 +652,8 @@ TEST(SchedulerPolicyTest, FullFootprintAdmissionGate) {
   ASSERT_EQ(batch.size(), 1);
   // Only A admitted. B blocked: after A uses 1 block, available=8-1=7 < 8.
   EXPECT_EQ(batch[0].size(), 1);
+  EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
+  EXPECT_FALSE(requests[1]->cancelled());
 }
 
 // TEST: Full-footprint gate admits both when capacity is sufficient.
@@ -672,6 +688,48 @@ TEST(SchedulerPolicyTest, FullFootprintAdmitsBothWhenFits) {
   auto batch = scheduler->prepare_batch_test();
   ASSERT_EQ(batch.size(), 1);
   EXPECT_EQ(batch[0].size(), 2);  // Both admitted.
+}
+
+TEST(SchedulerPolicyTest, ProbeOneBreaksOversizedPrefillLivelock) {
+  const int32_t block_num = 4;
+  const int32_t block_size = 2;
+  ContinuousScheduler::Options opt = create_scheduler_options(
+      /*max_tokens_per_batch=*/2,
+      /*max_seqs=*/1,
+      /*spec_tokens=*/0,
+      /*max_tokens_per_chunk=*/2,
+      /*dp_size=*/1);
+  opt.enable_chunked_prefill() = true;
+  opt.enable_disagg_pd() = true;
+  opt.instance_role() = InstanceRole::PREFILL;
+
+  auto engine = std::make_unique<FakeEngine>(block_num, block_size);
+  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto requests =
+      generate_request({20, 20}, {10, 10}, std::nullopt, std::nullopt, 10000);
+  for (std::shared_ptr<Request>& request : requests) {
+    request->state().output_func = [](const RequestOutput&) { return true; };
+    scheduler->add_request(request);
+  }
+
+  bool made_progress = false;
+  int32_t rounds = 0;
+  for (; rounds < 16; ++rounds) {
+    const std::vector<Batch> batches = scheduler->prepare_batch_test();
+    if (!batches.empty()) {
+      made_progress = true;
+      advance_running_prefill(scheduler.get());
+    }
+    if (made_progress && scheduler->get_running_requests().empty() &&
+        scheduler->get_waiting_requests_num() == 0) {
+      break;
+    }
+  }
+
+  EXPECT_TRUE(made_progress);
+  EXPECT_LT(rounds, 16);
+  EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
 }
 
 }  // namespace xllm

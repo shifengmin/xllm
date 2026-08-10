@@ -149,7 +149,9 @@ class SchedulerPolicy {
       SchedulerState& state,
       ScheduleBudget& budget,
       std::vector<std::shared_ptr<Request>>& finished,
-      size_t& reserved_full_footprint);
+      size_t& reserved_full_footprint,
+      bool has_block_holders,
+      bool& fresh_probe_used);
   size_t compute_prefill_tokens(Sequence* seq,
                                 size_t remaining_budget,
                                 const SchedulerState& state);

@@ -70,16 +70,27 @@ void DecodeFirstPolicy::schedule(
     // accumulates full footprints of newly admitted prefill requests.
     constexpr double kDecodeReserveMargin = 1.1;
     size_t reserved_full_footprint = 0;
+    bool fresh_probe_used = false;
     if (has_decode) {
       const size_t max_used =
           util::max(state.kv_cache_manager->num_used_blocks());
       reserved_full_footprint =
           static_cast<size_t>(max_used * kDecodeReserveMargin);
     }
-    schedule_prefill_from_queue(
-        &state.chunk_queue, state, budget, finished, reserved_full_footprint);
-    schedule_prefill_from_queue(
-        &state.prefill_queue, state, budget, finished, reserved_full_footprint);
+    schedule_prefill_from_queue(&state.chunk_queue,
+                                state,
+                                budget,
+                                finished,
+                                reserved_full_footprint,
+                                /*has_block_holders=*/false,
+                                fresh_probe_used);
+    schedule_prefill_from_queue(&state.prefill_queue,
+                                state,
+                                budget,
+                                finished,
+                                reserved_full_footprint,
+                                /*has_block_holders=*/false,
+                                fresh_probe_used);
   }
 
   // Step 3: redistribute remaining budget to prefill sequences.

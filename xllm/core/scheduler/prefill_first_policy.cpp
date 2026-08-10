@@ -17,12 +17,48 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 
 #include "core/framework/config/scheduler_config.h"
 #include "framework/request/priority_comparator.h"
 #include "scheduler/scheduler_policy.h"
+#include "util/utils.h"
 
 namespace xllm {
+
+namespace {
+
+struct PrefillReservation {
+  size_t full_footprint = 0;
+  bool has_block_holders = false;
+};
+
+PrefillReservation collect_prefill_reservation(
+    const RequestPriorityQueue& queue,
+    size_t block_size) {
+  PrefillReservation reservation;
+  if (block_size == 0) {
+    return reservation;
+  }
+  std::unique_ptr<RequestPriorityQueue> queued_requests = queue.clone();
+  while (!queued_requests->empty()) {
+    const std::shared_ptr<Request> request = queued_requests->top();
+    queued_requests->pop_top();
+    if (request == nullptr || request->sequences().empty()) {
+      continue;
+    }
+    Sequence* sequence = request->sequences()[0].get();
+    if (sequence == nullptr || !sequence->kv_state().has_any_blocks()) {
+      continue;
+    }
+    reservation.has_block_holders = true;
+    reservation.full_footprint +=
+        util::ceil_div(sequence->num_prompt_tokens(), block_size);
+  }
+  return reservation;
+}
+
+}  // namespace
 
 // =============================================================================
 // PrefillFirstPolicy::schedule
@@ -101,11 +137,31 @@ void PrefillFirstPolicy::schedule(
   // Schedule chunked prefill continuations first (they already have partial
   // KV).
   size_t reserved_full_footprint = 0;
-  schedule_prefill_from_queue(
-      &state.chunk_queue, state, budget, finished, reserved_full_footprint);
+  bool has_block_holders = false;
+  if (options_.enable_disagg_pd() && options_.instance_role().has_value() &&
+      options_.instance_role().value() == InstanceRole::PREFILL) {
+    const PrefillReservation reservation = collect_prefill_reservation(
+        state.chunk_queue,
+        static_cast<size_t>(state.kv_cache_manager->block_size()));
+    reserved_full_footprint = reservation.full_footprint;
+    has_block_holders = reservation.has_block_holders;
+  }
+  bool fresh_probe_used = false;
+  schedule_prefill_from_queue(&state.chunk_queue,
+                              state,
+                              budget,
+                              finished,
+                              reserved_full_footprint,
+                              has_block_holders,
+                              fresh_probe_used);
   // Then new prefill requests.
-  schedule_prefill_from_queue(
-      &state.prefill_queue, state, budget, finished, reserved_full_footprint);
+  schedule_prefill_from_queue(&state.prefill_queue,
+                              state,
+                              budget,
+                              finished,
+                              reserved_full_footprint,
+                              has_block_holders,
+                              fresh_probe_used);
 
   if (!state.running_sequences.empty()) {
     state.last_step_prefill = true;

@@ -173,13 +173,19 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     SchedulerState& state,
     ScheduleBudget& budget,
     std::vector<std::shared_ptr<Request>>& finished,
-    size_t& reserved_full_footprint) {
+    size_t& reserved_full_footprint,
+    bool has_block_holders,
+    bool& fresh_probe_used) {
   if (queue == nullptr || queue->empty()) {
     return;
   }
 
   bool budget_exhausted = false;
   bool blocks_exhausted = false;
+  std::vector<std::shared_ptr<Request>> deferred;
+  const bool is_pd_prefill =
+      options_.enable_disagg_pd() && options_.instance_role().has_value() &&
+      options_.instance_role().value() == InstanceRole::PREFILL;
 
   while (!queue->empty() && budget.remaining_seq_budget > 0 &&
          budget.remaining_token_budget > 0 &&
@@ -216,18 +222,55 @@ void SchedulerPolicy::schedule_prefill_from_queue(
       continue;
     }
 
-    // Full-footprint admission (fresh requests only): check that the system
-    // has enough capacity for this request's full KV plus all already-reserved
-    // blocks. In-flight chunked requests are always allowed to continue.
-    if (batch_mode_.enable_chunked_prefill &&
-        request->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
+    const bool is_in_flight =
+        request->sequences()[0]->kv_state().has_any_blocks();
+    size_t full_footprint = 0;
+    size_t usable_blocks = 0;
+    bool can_probe_fresh_request = false;
+    if (batch_mode_.enable_chunked_prefill && is_pd_prefill) {
       const size_t block_size =
           static_cast<size_t>(state.kv_cache_manager->block_size());
       const size_t total_blocks =
           static_cast<size_t>(state.kv_cache_manager->num_blocks());
-      const size_t full_footprint =
-          (request->sequences()[0]->num_tokens() + block_size - 1) / block_size;
-      if (reserved_full_footprint + full_footprint > total_blocks) {
+      usable_blocks = total_blocks == 0 ? 0 : total_blocks - 1;
+      if (block_size == 0) {
+        blocks_exhausted = true;
+        break;
+      }
+      full_footprint = util::ceil_div(
+          request->sequences()[0]->num_prompt_tokens(), block_size);
+      if (!is_in_flight) {
+        const bool footprint_fits =
+            full_footprint <= usable_blocks &&
+            reserved_full_footprint <= usable_blocks - full_footprint;
+        can_probe_fresh_request = !footprint_fits && !has_block_holders &&
+                                  state.running_sequences.empty() &&
+                                  !fresh_probe_used;
+        if (!footprint_fits && !can_probe_fresh_request) {
+          queue->pop_top();
+          deferred.emplace_back(request);
+          continue;
+        }
+        if (can_probe_fresh_request) {
+          fresh_probe_used = true;
+        }
+      }
+    } else if (batch_mode_.enable_chunked_prefill &&
+               request->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
+      const size_t block_size =
+          static_cast<size_t>(state.kv_cache_manager->block_size());
+      const size_t total_blocks =
+          static_cast<size_t>(state.kv_cache_manager->num_blocks());
+      if (block_size == 0) {
+        blocks_exhausted = true;
+        break;
+      }
+      const size_t original_full_footprint =
+          util::ceil_div(request->sequences()[0]->num_tokens(), block_size);
+      const bool footprint_fits =
+          original_full_footprint <= total_blocks &&
+          reserved_full_footprint <= total_blocks - original_full_footprint;
+      if (!footprint_fits) {
         blocks_exhausted = true;
         break;
       }
@@ -296,6 +339,25 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     }
 
     if (!can_schedule) {
+      const bool exceeds_pd_capacity =
+          is_pd_prefill && full_footprint > usable_blocks;
+      if (exceeds_pd_capacity && state.running_sequences.empty()) {
+        queue->pop_top();
+        clear_mtp_bootstrap(request.get(), state);
+        state.kv_cache_manager->deallocate(request.get());
+        state.response_processor->process_failed_request(
+            request,
+            {StatusCode::RESOURCE_EXHAUSTED,
+             "Request prompt exceeds PD prefill KV cache capacity"});
+        continue;
+      }
+      if (is_pd_prefill) {
+        queue->pop_top();
+        deferred.emplace_back(request);
+        if (can_probe_fresh_request) {
+          continue;
+        }
+      }
       break;
     }
 
@@ -315,7 +377,8 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     cache_in_batch_prefix(prefill_sequences, prefill_sequences_budget, state);
 
     // Update reserved footprint for the admission gate.
-    if (batch_mode_.enable_chunked_prefill) {
+    if (batch_mode_.enable_chunked_prefill &&
+        (!is_pd_prefill || !is_in_flight)) {
       const size_t block_size =
           static_cast<size_t>(state.kv_cache_manager->block_size());
       for (auto* seq : prefill_sequences) {
@@ -325,9 +388,13 @@ void SchedulerPolicy::schedule_prefill_from_queue(
     }
   }
 
-  // Handle unschedulable head request.
-  handle_unschedulable_head(
-      queue, state, finished, budget_exhausted, blocks_exhausted);
+  for (const std::shared_ptr<Request>& request : deferred) {
+    queue->push(request);
+  }
+  if (budget_exhausted || blocks_exhausted) {
+    handle_unschedulable_head(
+        queue, state, finished, budget_exhausted, blocks_exhausted);
+  }
 }
 
 size_t SchedulerPolicy::compute_prefill_tokens(Sequence* seq,
