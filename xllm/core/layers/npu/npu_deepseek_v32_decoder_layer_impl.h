@@ -92,22 +92,6 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   bool has_mtp_topk_fallback() const { return has_mtp_topk_fallback_; }
 
  private:
-  struct DecodeDcpRuntimeInputs {
-    torch::Tensor selected_cache_buffer;
-    torch::Tensor topk_buffer;
-    torch::Tensor packed_gather_indices;
-    torch::Tensor packed_query_block_rows;
-    // Cumulative query lengths for spec-verify, where every query token is
-    // expanded into its own block-table row of length one.
-    torch::Tensor expanded_query_cu_seq_lens;
-  };
-
-  struct LayerwisePrefillRuntimeInputs {
-    torch::Tensor history_slots;
-    torch::Tensor history_kv_buffer;
-    torch::Tensor history_indexer_buffer;
-  };
-
   struct ShardingConfig {
     bool is_sharded;
     int index;
@@ -164,14 +148,6 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   int64_t init_node(atb_speed::Model::Node& node,
                     atb_speed::deepseekV2::DecoderLayerParam& param);
 
-  DecodeDcpRuntimeInputs prepare_decode_dcp_runtime_inputs(
-      const torch::Tensor& x,
-      const ModelInputParams& input_params) const;
-
-  LayerwisePrefillRuntimeInputs prepare_layerwise_prefill_runtime_inputs(
-      const KVCache& kv_cache,
-      const ModelInputParams& input_params) const;
-
   void build_node_variant_pack(
       atb_speed::Model::Node& node,
       torch::Tensor& x,
@@ -185,8 +161,8 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
       torch::Tensor* output_topk_indices,
       bool skip_topk,
       bool output_topk,
-      const DecodeDcpRuntimeInputs* dcp_inputs = nullptr,
-      const LayerwisePrefillRuntimeInputs* prefill_inputs = nullptr);
+      const NpuDecodeDcpInput* dcp_inputs = nullptr,
+      const NpuLayerwisePrefillInput* prefill_inputs = nullptr);
 
   torch::Tensor block_tables_placeholder_;
   std::string model_name_;
@@ -248,8 +224,6 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   torch::Tensor int_tensor_placeholder_;
   torch::Tensor decode_dcp_logical_block_lut_;
   torch::Tensor decode_dcp_block_offset_lut_;
-  DecodeDcpRuntimeInputs decode_dcp_runtime_inputs_;
-  LayerwisePrefillRuntimeInputs layerwise_prefill_runtime_inputs_;
   torch::Tensor decode_attn_mask_;
   torch::Tensor expert_group_;
   torch::Tensor one_hot_;

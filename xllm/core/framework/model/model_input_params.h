@@ -908,6 +908,24 @@ struct GraphInput {
   }
 };
 
+#if defined(USE_NPU)
+struct NpuDecodeDcpInput {
+  torch::Tensor selected_cache_buffer;
+  torch::Tensor topk_buffer;
+  torch::Tensor packed_gather_indices;
+  torch::Tensor packed_query_block_rows;
+  // Cumulative query lengths for spec-verify, where every query token is
+  // expanded into its own block-table row of length one.
+  torch::Tensor expanded_query_cu_seq_lens;
+};
+
+struct NpuLayerwisePrefillInput {
+  torch::Tensor history_slots;
+  torch::Tensor history_kv_buffer;
+  torch::Tensor history_indexer_buffer;
+};
+#endif
+
 struct ModelInputParams {
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
@@ -919,6 +937,10 @@ struct ModelInputParams {
     params.parallel = parallel.to(device);
     params.expert = expert.to(device);
     params.graph = graph.to(device);
+#if defined(USE_NPU)
+    params.npu_decode_dcp = npu_decode_dcp;
+    params.npu_layerwise_prefill = npu_layerwise_prefill;
+#endif
     params.dit_forward_input = dit_forward_input.to(device);
     params.linear_state_cache_ops = linear_state_cache_ops;
     params.is_spec_verify = is_spec_verify;
@@ -1038,6 +1060,12 @@ struct ModelInputParams {
   MultiModalInput multimodal;
   ExpertInput expert;
   GraphInput graph;
+#if defined(USE_NPU)
+  // Model-specific DCP metadata is materialized on the worker prepare stream
+  // and shared by every decoder layer in the step.
+  NpuDecodeDcpInput npu_decode_dcp;
+  NpuLayerwisePrefillInput npu_layerwise_prefill;
+#endif
 
   // Multi block manager block tables for DeepSeek V4.
   // Each tensor is [batch_size, max_block_len] for one manager.

@@ -32,6 +32,7 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -182,6 +183,11 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
 }
 
 #if defined(USE_NPU)
+bool uses_npu_deepseek_v32_decoder_layer(const ModelArgs& model_args) {
+  const std::string& model_type = model_args.model_type();
+  return model_type == "deepseek_v32" || model_type == "glm_moe_dsa";
+}
+
 void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   const std::vector<int32_t>& host_q_seq_lens =
       input_params.attention.host.q_seq_lens;
@@ -455,6 +461,219 @@ bool WorkerImpl::owns_decode_dcp_layer(int64_t layer_id) const {
       parallel_args_.decode_dcp_rank());
   return placement.owns(layer_id);
 }
+
+#if defined(USE_NPU)
+void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
+  ModelInputParams& input_params = processed_input.input_params;
+  input_params.npu_decode_dcp = NpuDecodeDcpInput();
+  input_params.npu_layerwise_prefill = NpuLayerwisePrefillInput();
+
+  const bool is_draft_model = options_.is_draft_engine() || is_spec_draft_;
+  if (model_executor_ == nullptr || is_draft_model ||
+      options_.npu_kernel_backend() != "ATB" ||
+      parallel_args_.decode_dcp_size() <= 1) {
+    return;
+  }
+  const ModelArgs& model_args = context_.get_model_args();
+  if (!uses_npu_deepseek_v32_decoder_layer(model_args)) {
+    return;
+  }
+  const bool has_dsa_indexer = model_args.index_n_heads() > 0 &&
+                               model_args.index_head_dim() > 0 &&
+                               model_args.index_topk() > 0;
+  if (!has_dsa_indexer) {
+    return;
+  }
+
+  const bool use_decode_dcp =
+      input_params.meta.batch_forward_type.is_decode() ||
+      input_params.graph.use_expanded_decode_for_spec_verify_attention;
+  const int32_t block_size = ::xllm::KVCacheConfig::get_instance().block_size();
+  CHECK_GT(block_size, 0);
+
+  if (use_decode_dcp) {
+    CHECK(!input_params.enable_graph)
+        << "Decode layer-owner DCP currently supports eager ATB only.";
+    const int64_t query_count = processed_input.token_ids.numel();
+    CHECK_GT(query_count, 0)
+        << "Decode DCP requires a non-empty execution input.";
+    CHECK_LE(query_count,
+             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    const int32_t execution_query_count = static_cast<int32_t>(query_count);
+
+    std::vector<int32_t> visible_lengths;
+    std::vector<int32_t> query_block_rows;
+    visible_lengths.reserve(query_count);
+    query_block_rows.reserve(query_count);
+    if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+      CHECK_EQ(input_params.graph.expanded_kv_seq_lens_vec.size(),
+               static_cast<size_t>(query_count));
+      visible_lengths = input_params.graph.expanded_kv_seq_lens_vec;
+      for (int32_t query_idx = 0; query_idx < execution_query_count;
+           ++query_idx) {
+        query_block_rows.emplace_back(query_idx);
+      }
+    } else {
+      const std::vector<int32_t>& q_seq_lens =
+          input_params.attention.host.q_seq_lens;
+      const std::vector<int32_t>& kv_seq_lens =
+          input_params.attention.host.kv_seq_lens;
+      const bool empty_batch = input_params.meta.num_sequences == 0;
+      if (empty_batch || q_seq_lens.empty() || kv_seq_lens.empty()) {
+        visible_lengths.assign(query_count, 1);
+        query_block_rows.assign(query_count, 0);
+      } else {
+        CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
+            << "Decode DCP expects one q_len and kv_len per sequence.";
+        int64_t expanded_query_count = 0;
+        for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+             ++sequence_idx) {
+          const int32_t q_len = q_seq_lens[sequence_idx];
+          const int32_t kv_len = kv_seq_lens[sequence_idx];
+          CHECK_GT(q_len, 0);
+          CHECK_GE(kv_len, q_len);
+          for (int32_t token_idx = 0; token_idx < q_len; ++token_idx) {
+            visible_lengths.emplace_back(kv_len - q_len + token_idx + 1);
+            query_block_rows.emplace_back(static_cast<int32_t>(sequence_idx));
+            ++expanded_query_count;
+          }
+        }
+        CHECK_EQ(expanded_query_count, query_count)
+            << "Decode DCP query metadata does not match the execution input.";
+      }
+    }
+
+    const int32_t index_topk = model_args.index_topk();
+    const int64_t max_position_embeddings =
+        model_args.max_position_embeddings();
+    CHECK_GT(index_topk, 0);
+    CHECK_GT(max_position_embeddings, 0);
+    std::vector<int32_t> valid_topk_counts(query_count);
+    int64_t packed_key_count = 0;
+    for (int32_t query_idx = 0; query_idx < execution_query_count;
+         ++query_idx) {
+      const int32_t visible_len = visible_lengths[query_idx];
+      CHECK_GT(visible_len, 0);
+      CHECK_LE(static_cast<int64_t>(visible_len), max_position_embeddings)
+          << "Decode DCP logical position exceeds the model limit.";
+      valid_topk_counts[query_idx] = std::min(index_topk, visible_len);
+      packed_key_count += valid_topk_counts[query_idx];
+    }
+    CHECK_GT(packed_key_count, 0);
+    CHECK_LE(packed_key_count,
+             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+
+    // Only the leading min(index_topk, visible_len) entries are meaningful.
+    // Pack those entries so cache gather, broadcast and scratch scatter use
+    // the same compact row ordering on every DCP rank.
+    std::vector<int32_t> packed_gather_indices;
+    std::vector<int32_t> packed_query_block_rows;
+    std::vector<int32_t> expanded_query_cu_seq_lens(query_count);
+    packed_gather_indices.reserve(packed_key_count);
+    packed_query_block_rows.reserve(packed_key_count);
+    for (int32_t query_idx = 0; query_idx < execution_query_count;
+         ++query_idx) {
+      expanded_query_cu_seq_lens[query_idx] = query_idx + 1;
+      for (int32_t topk_idx = 0; topk_idx < valid_topk_counts[query_idx];
+           ++topk_idx) {
+        packed_gather_indices.emplace_back(query_idx * index_topk + topk_idx);
+        packed_query_block_rows.emplace_back(query_block_rows[query_idx]);
+      }
+    }
+
+    NpuDecodeDcpInput& dcp_input = input_params.npu_decode_dcp;
+    dcp_input.packed_gather_indices =
+        torch::tensor(packed_gather_indices, torch::kInt32).to(device_);
+    dcp_input.packed_query_block_rows =
+        torch::tensor(packed_query_block_rows, torch::kInt32).to(device_);
+    dcp_input.expanded_query_cu_seq_lens =
+        torch::tensor(expanded_query_cu_seq_lens, torch::kInt32).to(device_);
+
+    const int64_t selected_cache_width =
+        model_args.kv_lora_rank() + model_args.qk_rope_head_dim();
+    dcp_input.selected_cache_buffer =
+        torch::empty({packed_key_count, 1, selected_cache_width},
+                     torch::TensorOptions().device(device_).dtype(dtype_));
+    dcp_input.topk_buffer = torch::empty(
+        {query_count, 1, index_topk},
+        torch::TensorOptions().device(device_).dtype(torch::kInt32));
+    return;
+  }
+
+  if (!decode_dcp_layerwise_kv_cache_enabled()) {
+    return;
+  }
+  CHECK(!input_params.enable_graph)
+      << "Layerwise prefill history currently supports eager ATB only.";
+  CHECK(!kv_caches_.empty());
+  const std::vector<int32_t>& q_seq_lens =
+      input_params.attention.host.q_seq_lens;
+  const std::vector<int32_t>& kv_seq_lens =
+      input_params.attention.host.kv_seq_lens;
+  const torch::Tensor& block_tables = input_params.attention.host.block_tables;
+  std::vector<int32_t> history_slots;
+  if (!q_seq_lens.empty() && block_tables.defined() &&
+      block_tables.dim() == 2) {
+    CHECK(block_tables.device().is_cpu())
+        << "Layerwise prefill requires host block tables during preparation.";
+    CHECK_EQ(block_tables.scalar_type(), torch::kInt32);
+    CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
+        << "Layerwise prefill expects one q_len and kv_len per sequence.";
+    CHECK_EQ(block_tables.size(0), static_cast<int64_t>(q_seq_lens.size()))
+        << "Layerwise prefill expects one block-table row per sequence.";
+    const torch::Tensor block_tables_cpu = block_tables.contiguous();
+    const auto block_table_rows = block_tables_cpu.accessor<int32_t, 2>();
+    const int64_t max_blocks_per_row = block_tables_cpu.size(1);
+
+    // History excludes the current chunk, so full first-prefill requests have
+    // no real history while chunked and prefix-cache requests include their
+    // existing prefix slots.
+    int64_t total_history = 0;
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      total_history += kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+    }
+    CHECK_GE(total_history, 0);
+    history_slots.reserve(total_history);
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      const int32_t history_len =
+          kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+      CHECK_GE(history_len, 0)
+          << "Layerwise prefill requires kv_len to include the current chunk.";
+      for (int32_t position = 0; position < history_len; ++position) {
+        const int64_t logical_block = position / block_size;
+        CHECK_LT(logical_block, max_blocks_per_row)
+            << "Layerwise prefill history exceeds the block table.";
+        history_slots.emplace_back(
+            block_table_rows[sequence_idx][logical_block] * block_size +
+            position % block_size);
+      }
+    }
+  }
+  // All DCP ranks must enter the same broadcasts with the same shape. Use one
+  // dummy slot when this step has no history instead of skipping collectives.
+  if (history_slots.empty()) {
+    history_slots.emplace_back(0);
+  }
+
+  const KVCache& cache = kv_caches_.front();
+  NpuLayerwisePrefillInput& prefill_input = input_params.npu_layerwise_prefill;
+  prefill_input.history_slots =
+      torch::tensor(history_slots, torch::kInt32).to(device_);
+  const int64_t history_count = static_cast<int64_t>(history_slots.size());
+  const int64_t history_kv_width =
+      model_args.kv_lora_rank() + model_args.qk_rope_head_dim();
+  prefill_input.history_kv_buffer =
+      torch::empty({history_count, 1, history_kv_width},
+                   torch::TensorOptions().device(device_).dtype(
+                       cache.get_k_cache().scalar_type()));
+  prefill_input.history_indexer_buffer =
+      torch::empty({history_count, 1, model_args.index_head_dim()},
+                   torch::TensorOptions().device(device_).dtype(
+                       cache.get_index_cache().scalar_type()));
+}
+#endif
 
 bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   if (!allocate_kv_cache_storage(kv_cache_shape)) {
@@ -837,6 +1056,11 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
       empty_shard = false;
     }
     if (empty_shard) {
+#if defined(USE_NPU)
+      // NPU model forwards materialize a placeholder token for an EMPTY batch.
+      // Prepare the matching dummy DCP inputs before that forward as well.
+      prepare_npu_dcp_inputs(processed_input);
+#endif
       return;
     }
 
@@ -900,6 +1124,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                                            kv_caches_,
                                            processed_input.input_params);
     }
+
+    prepare_npu_dcp_inputs(processed_input);
 
 #endif
   };

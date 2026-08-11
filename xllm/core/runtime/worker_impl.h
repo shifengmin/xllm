@@ -249,6 +249,10 @@ class WorkerImpl {
 
   bool owns_decode_dcp_layer(int64_t layer_id) const;
 
+#if defined(USE_NPU)
+  void prepare_npu_dcp_inputs(ForwardInput& processed_input);
+#endif
+
   bool wakeup_local(const WakeupOptions& options);
 
   // ---- RL deep-sleep path (SleepableAllocator), isolated from the xtensor
