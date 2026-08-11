@@ -44,6 +44,12 @@ class LinearAttentionKVCacheImpl final : public KVCacheImpl {
     NOT_IMPLEMENTED();
   };
 
+  std::unique_ptr<KVCacheImpl> create_view() const override {
+    LOG(FATAL) << "Linear attention KV cache does not support layerwise "
+                  "shared views.";
+    return nullptr;
+  }
+
  private:
   torch::Tensor conv_cache_;
   torch::Tensor ssm_cache_;

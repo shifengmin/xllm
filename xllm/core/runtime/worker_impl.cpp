@@ -349,6 +349,16 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "KVCache does not support linear attention and lighting indexer "
       << "simultaneously.";
 
+  if (kv_cache_shape.has_key_cache_shape()) {
+    const std::vector<int64_t>& key_cache_shape =
+        kv_cache_shape.key_cache_shape();
+    CHECK(!key_cache_shape.empty()) << "Key cache shape must not be empty.";
+    validate_decode_dcp_slot_addressing(
+        parallel_args_.decode_dcp_size(),
+        /*n_blocks=*/key_cache_shape[0],
+        ::xllm::KVCacheConfig::get_instance().block_size());
+  }
+
   const int64_t num_layers = get_num_layers();
   std::vector<bool> layer_cache_owned;
   if (decode_dcp_layerwise_kv_cache_enabled()) {

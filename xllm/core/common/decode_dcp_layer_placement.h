@@ -34,12 +34,38 @@ inline void validate_decode_dcp_layerwise_kv_cache_config(
   CHECK(false)
       << "Decode DCP layerwise KV cache is only supported on the NPU backend.";
 #endif
-  CHECK(instance_role == InstanceRole::DECODE)
-      << "Decode DCP layerwise KV cache requires the DECODE instance role, "
-         "got "
+  // Prefill materializes the history of a layer into the shared scratch before
+  // running the unchanged attention graph, so every serving role can shard its
+  // persistent cache by layer owner.
+  CHECK(instance_role == InstanceRole::DECODE ||
+        instance_role == InstanceRole::PREFILL ||
+        instance_role == InstanceRole::DEFAULT ||
+        instance_role == InstanceRole::MIX)
+      << "Decode DCP layerwise KV cache got an unsupported instance role: "
       << instance_role.to_string() << ".";
   CHECK_GT(decode_dcp_size, 1)
       << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
+}
+
+// The decode DCP graph turns a logical top-k position into a physical cache
+// slot with ATB Elewise ops, which take floating point only, so the slot index
+// round-trips through fp32. That is exact while the value fits the 24-bit
+// mantissa; past it a slot would silently resolve to the wrong block instead of
+// failing, so the cache pool is capped here rather than at the first bad read.
+inline constexpr int64_t kDecodeDcpMaxExactSlotCount = 1LL << 24;
+
+inline void validate_decode_dcp_slot_addressing(int32_t decode_dcp_size,
+                                                int64_t n_blocks,
+                                                int64_t block_size) {
+  if (decode_dcp_size <= 1) {
+    return;
+  }
+  CHECK_LE(n_blocks * block_size, kDecodeDcpMaxExactSlotCount)
+      << "Decode DCP resolves cache slots through an fp32 round-trip that is "
+         "only exact below "
+      << kDecodeDcpMaxExactSlotCount << " slots, but n_blocks=" << n_blocks
+      << " and block_size=" << block_size << " need " << n_blocks * block_size
+      << ".";
 }
 
 [[nodiscard]] inline bool resolve_decode_dcp_layerwise_kv_cache_enabled(

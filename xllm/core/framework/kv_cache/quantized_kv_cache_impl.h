@@ -31,6 +31,8 @@ class QuantizedKVCacheImpl final : public KVCacheImpl {
   void swap_blocks(torch::Tensor& src_tensor,
                    torch::Tensor& dst_tensor) override;
 
+  std::unique_ptr<KVCacheImpl> create_view() const override;
+
  private:
   // scale tensors for quantized KV cache (int8)
   torch::Tensor key_cache_scale_;

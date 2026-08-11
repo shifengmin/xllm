@@ -86,6 +86,14 @@ void validate_decode_dcp_layerwise_kv_cache_startup_config(
   CHECK_LE(options.host_blocks_factor(), 1.0)
       << "Decode DCP layerwise KV cache does not support hierarchy host "
          "cache.";
+  // Context parallelism shards a layer along tokens while layer ownership
+  // shards the model along layers. Expressing both at once needs a
+  // two-dimensional placement that capacity, block metadata and PD routing do
+  // not carry yet.
+  CHECK_EQ(parallel_config.cp_size(), 1)
+      << "Decode DCP layerwise KV cache does not support context parallelism.";
+  CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+      << "Decode DCP layerwise KV cache does not support KV split.";
   if (!options.enable_disagg_pd()) {
     return;
   }

@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -69,6 +70,11 @@ class KVCacheImpl {
 
   virtual void swap_blocks(torch::Tensor& src_tensor,
                            torch::Tensor& dst_tensor);
+
+  // Build a second impl over the same tensors. Layerwise KV cache uses it so
+  // every non-owner layer binds one shared scratch allocation instead of
+  // holding its own blocks.
+  virtual std::unique_ptr<KVCacheImpl> create_view() const;
 
  protected:
   void create_host_tensor(const std::vector<int64_t>& dims,

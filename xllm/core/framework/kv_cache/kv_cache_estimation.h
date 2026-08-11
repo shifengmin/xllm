@@ -63,6 +63,9 @@ std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers);
 
+// Common block count across a decode DCP group. Each rank pays for the layers
+// it owns plus one shared scratch layer of the same per-block cost, so the
+// group settles on the smallest count any rank can afford.
 int64_t estimate_decode_dcp_layerwise_block_count(
     const ModelArgs& model_args,
     int32_t decode_dcp_size,

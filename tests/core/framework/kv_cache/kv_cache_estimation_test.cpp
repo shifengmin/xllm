@@ -70,7 +70,9 @@ TEST(KVCacheEstimationTest, LayerwiseCapacityUsesLargestOwnerFootprint) {
   const KVCacheCapacity capacity =
       estimate_kv_cache_capacity(model_args, options);
 
-  EXPECT_EQ(capacity.n_blocks(), 170);
+  // Rank 0 owns layers 0/2/4 and every rank also pays for the shared scratch
+  // layer, so the group settles on 1 MiB / (4 * 16 * 128 B).
+  EXPECT_EQ(capacity.n_blocks(), 128);
 }
 
 TEST(KVCacheEstimationTest, LayerwiseCapacityIncludesFullDraftCache) {
@@ -91,7 +93,9 @@ TEST(KVCacheEstimationTest, LayerwiseCapacityIncludesFullDraftCache) {
                                                 options.cache_size_in_bytes,
                                                 draft_block_bytes);
 
-  EXPECT_EQ(block_count, 127);
+  // Rank 0 pays for 3 owned layers, the shared scratch layer and the full
+  // draft layer: 1 MiB / (5 * 16 * 128 B).
+  EXPECT_EQ(block_count, 102);
 }
 
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {

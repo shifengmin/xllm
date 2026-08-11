@@ -612,13 +612,17 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
       args.model_type().find("_mtp") != std::string::npos;
   param.enableDecodeDcpLayerOwner = !param.isPrefill && !is_mtp_draft_model &&
                                     parallel_args.decode_dcp_size() > 1;
+  // Prefill only needs the history exchange when the persistent cache is really
+  // sharded by layer owner; with a full cache on every rank the local history
+  // is already correct.
+  param.enableLayerwisePrefillHistory =
+      param.isPrefill && !is_mtp_draft_model &&
+      parallel_args.decode_dcp_size() > 1 &&
+      parallel_args.enable_decode_dcp_layerwise_kv_cache();
   param.decodeDcpBlockSize = ::xllm::KVCacheConfig::get_instance().block_size();
   if (param.enableDecodeDcpLayerOwner) {
     CHECK_LE(param.index_topk, 2048)
         << "Decode DCP LightningIndexer selected count must not exceed 2048.";
-    CHECK(!param.enableMlaPreprocess)
-        << "Decode layer-owner DCP currently requires the ordinary MLA "
-           "preprocess path.";
   }
 }
 
@@ -1113,47 +1117,47 @@ NpuDeepseekV32DecoderLayerImpl::prepare_decode_dcp_runtime_inputs(
     }
   }
 
+  // Only the leading min(index_topk, visible_len) entries of a query's top-k
+  // are meaningful, and they are exactly the entries attention reads back from
+  // the cache. Packing them keeps the gathered rows, the broadcast payload and
+  // the scattered slots aligned with what the unchanged attention node touches,
+  // so the padded tail never has to be materialized.
   const int32_t index_topk = decode_param_.index_topk;
-  std::vector<int32_t> packed_gather_indices;
-  std::vector<int32_t> packed_query_block_rows;
-  std::vector<int32_t> actual_seq_lengths_query(query_count);
-  std::vector<int32_t> actual_seq_lengths_key(query_count);
-  std::vector<int32_t> identity_topk(
-      static_cast<size_t>(query_count) * index_topk, -1);
-
+  std::vector<int32_t> valid_topk_counts(query_count);
   int64_t packed_key_count = 0;
   for (int32_t query_idx = 0; query_idx < execution_query_count; ++query_idx) {
     const int32_t visible_len = visible_lengths[query_idx];
     CHECK_GT(visible_len, 0);
     CHECK_LE(visible_len, max_position_embeddings_)
         << "Decode DCP logical-position LUT is too small.";
-    const int32_t valid_topk = std::min(index_topk, visible_len);
-    actual_seq_lengths_query[query_idx] = query_idx + 1;
-    packed_key_count += valid_topk;
-    CHECK_LE(packed_key_count,
-             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-    actual_seq_lengths_key[query_idx] = static_cast<int32_t>(packed_key_count);
-    for (int32_t topk_idx = 0; topk_idx < valid_topk; ++topk_idx) {
-      packed_gather_indices.emplace_back(query_idx * index_topk + topk_idx);
-      packed_query_block_rows.emplace_back(query_block_rows[query_idx]);
-      identity_topk[static_cast<size_t>(query_idx) * index_topk + topk_idx] =
-          topk_idx;
-    }
+    valid_topk_counts[query_idx] = std::min(index_topk, visible_len);
+    packed_key_count += valid_topk_counts[query_idx];
   }
   CHECK_GT(packed_key_count, 0);
+  CHECK_LE(packed_key_count,
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+
+  std::vector<int32_t> packed_gather_indices;
+  std::vector<int32_t> packed_query_block_rows;
+  std::vector<int32_t> expanded_query_cu_seq_lens(query_count);
+  packed_gather_indices.reserve(packed_key_count);
+  packed_query_block_rows.reserve(packed_key_count);
+  for (int32_t query_idx = 0; query_idx < execution_query_count; ++query_idx) {
+    expanded_query_cu_seq_lens[query_idx] = query_idx + 1;
+    for (int32_t topk_idx = 0; topk_idx < valid_topk_counts[query_idx];
+         ++topk_idx) {
+      packed_gather_indices.emplace_back(query_idx * index_topk + topk_idx);
+      packed_query_block_rows.emplace_back(query_block_rows[query_idx]);
+    }
+  }
 
   DecodeDcpRuntimeInputs inputs;
   inputs.packed_gather_indices =
       torch::tensor(packed_gather_indices, torch::kInt32).to(device_);
   inputs.packed_query_block_rows =
       torch::tensor(packed_query_block_rows, torch::kInt32).to(device_);
-  inputs.actual_seq_lengths_query =
-      torch::tensor(actual_seq_lengths_query, torch::kInt32).to(device_);
-  inputs.actual_seq_lengths_key =
-      torch::tensor(actual_seq_lengths_key, torch::kInt32).to(device_);
-  inputs.identity_topk = torch::tensor(identity_topk, torch::kInt32)
-                             .view({query_count, 1, index_topk})
-                             .to(device_);
+  inputs.expanded_query_cu_seq_lens =
+      torch::tensor(expanded_query_cu_seq_lens, torch::kInt32).to(device_);
 
   const int64_t selected_cache_width =
       static_cast<int64_t>(kv_lora_rank_) + qk_rope_head_dim_;
@@ -1162,6 +1166,84 @@ NpuDeepseekV32DecoderLayerImpl::prepare_decode_dcp_runtime_inputs(
   inputs.topk_buffer =
       torch::empty({query_count, 1, index_topk},
                    torch::TensorOptions().device(device_).dtype(torch::kInt32));
+  return inputs;
+}
+
+NpuDeepseekV32DecoderLayerImpl::LayerwisePrefillRuntimeInputs
+NpuDeepseekV32DecoderLayerImpl::prepare_layerwise_prefill_runtime_inputs(
+    const KVCache& kv_cache,
+    const ModelInputParams& input_params) const {
+  CHECK(prefill_param_.enableLayerwisePrefillHistory);
+  CHECK(!input_params.enable_graph)
+      << "Layerwise prefill history currently supports eager ATB only.";
+
+  // A sequence's history is everything the batch will attend over minus the
+  // tokens this chunk is about to write, so a full first chunk contributes
+  // nothing and a chunked or prefix-cache-hit request contributes its prefix.
+  const std::vector<int32_t>& q_seq_lens =
+      input_params.attention.host.q_seq_lens;
+  const std::vector<int32_t>& kv_seq_lens =
+      input_params.attention.host.kv_seq_lens;
+  const torch::Tensor& block_tables = input_params.attention.host.block_tables;
+  std::vector<int32_t> history_slots;
+  if (!q_seq_lens.empty() && block_tables.defined() &&
+      block_tables.dim() == 2) {
+    CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
+        << "Layerwise prefill expects one q_len and kv_len per sequence.";
+    CHECK_EQ(block_tables.size(0), static_cast<int64_t>(q_seq_lens.size()))
+        << "Layerwise prefill expects one block-table row per sequence.";
+    const torch::Tensor block_tables_cpu = block_tables.to(torch::kCPU);
+    const auto block_table_rows = block_tables_cpu.accessor<int32_t, 2>();
+    const int64_t max_blocks_per_row = block_tables_cpu.size(1);
+
+    int64_t total_history = 0;
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      total_history += kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+    }
+    history_slots.reserve(total_history);
+
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      const int32_t history_len =
+          kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+      CHECK_GE(history_len, 0)
+          << "Layerwise prefill requires kv_len to include the current chunk.";
+      for (int32_t position = 0; position < history_len; ++position) {
+        const int64_t logical_block = position / decode_dcp_block_size_;
+        CHECK_LT(logical_block, max_blocks_per_row)
+            << "Layerwise prefill history exceeds the block table.";
+        history_slots.emplace_back(
+            block_table_rows[sequence_idx][logical_block] *
+                decode_dcp_block_size_ +
+            position % decode_dcp_block_size_);
+      }
+    }
+  }
+
+  // The group must run the same collectives with the same shapes, and every
+  // rank derives the list from identical batch metadata. An empty history still
+  // exchanges one dummy slot rather than skipping the broadcast.
+  if (history_slots.empty()) {
+    history_slots.emplace_back(0);
+  }
+
+  // The receive buffers carry gathered cache rows, so they must follow the
+  // cache dtype rather than the layer's compute dtype.
+  LayerwisePrefillRuntimeInputs inputs;
+  inputs.history_slots =
+      torch::tensor(history_slots, torch::kInt32).to(device_);
+  const int64_t history_count = static_cast<int64_t>(history_slots.size());
+  const int64_t history_kv_width =
+      static_cast<int64_t>(kv_lora_rank_) + qk_rope_head_dim_;
+  inputs.history_kv_buffer = torch::empty(
+      {history_count, 1, history_kv_width},
+      torch::TensorOptions().device(device_).dtype(
+          kv_cache.get_k_cache().scalar_type()));
+  inputs.history_indexer_buffer = torch::empty(
+      {history_count, 1, static_cast<int64_t>(prefill_param_.index_head_dim)},
+      torch::TensorOptions().device(device_).dtype(
+          kv_cache.get_index_cache().scalar_type()));
   return inputs;
 }
 
@@ -1247,6 +1329,12 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                            << " execute decode layer failed, error code: "
                            << st;
   } else {
+    const LayerwisePrefillRuntimeInputs* prefill_inputs = nullptr;
+    if (prefill_param_.enableLayerwisePrefillHistory) {
+      layerwise_prefill_runtime_inputs_ =
+          prepare_layerwise_prefill_runtime_inputs(kv_cache, input_params_new);
+      prefill_inputs = &layerwise_prefill_runtime_inputs_;
+    }
     build_node_variant_pack(prefill_node_,
                             x,
                             cos_pos,
@@ -1258,7 +1346,9 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             shared_topk_indices,
                             output_topk_indices,
                             skip_topk_,
-                            output_topk_);
+                            output_topk_,
+                            /*dcp_inputs=*/nullptr,
+                            prefill_inputs);
     st = execute_node(prefill_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
@@ -1333,7 +1423,8 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     torch::Tensor* output_topk_indices,
     bool skip_topk,
     bool output_topk,
-    const DecodeDcpRuntimeInputs* dcp_inputs) {
+    const DecodeDcpRuntimeInputs* dcp_inputs,
+    const LayerwisePrefillRuntimeInputs* prefill_inputs) {
   internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
@@ -1523,7 +1614,8 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
       input_params.attention.device.q_cu_seq_lens.numel() != 0;
   if (use_expanded_decode_dcp) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_query);
+        atb_speed::Utils::AtTensor2Tensor(
+            dcp_inputs->expanded_query_cu_seq_lens);
   } else if (use_q_cu_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(
@@ -1541,6 +1633,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
         atb_speed::Utils::AtTensor2Tensor(shared_topk_indices);
   }
 
+  if (prefill_inputs != nullptr) {
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_inputs->history_slots);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_inputs->history_kv_buffer);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            prefill_inputs->history_indexer_buffer);
+  }
+
   if (dcp_inputs != nullptr) {
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->selected_cache_buffer);
@@ -1554,12 +1656,6 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_gather_indices);
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_query_block_rows);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_query);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->actual_seq_lengths_key);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->identity_topk);
   }
 
   if (cp_size_ > 1 && is_prefill) {

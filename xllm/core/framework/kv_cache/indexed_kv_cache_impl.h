@@ -43,6 +43,8 @@ class IndexedKVCacheImpl final : public KVCacheImpl {
   void swap_blocks(torch::Tensor& src_tensor,
                    torch::Tensor& dst_tensor) override;
 
+  std::unique_ptr<KVCacheImpl> create_view() const override;
+
  private:
   torch::Tensor index_cache_;
   std::optional<torch::Tensor> index_cache_scale_;

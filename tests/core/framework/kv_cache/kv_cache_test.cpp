@@ -430,7 +430,7 @@ TEST(KVCacheTest, IndexedKVCacheExposesQuantizedKvScaleTensors) {
             (std::vector<int64_t>{2, 4, 1}));
 }
 
-TEST(KVCacheTest, LayerwiseOwnershipAllocatesOneBlockForNonOwnerLayers) {
+TEST(KVCacheTest, LayerwiseOwnershipSharesOneScratchForNonOwnerLayers) {
   constexpr int64_t kBlockCount = 8;
   constexpr int64_t kBlockSize = 16;
 
@@ -462,22 +462,40 @@ TEST(KVCacheTest, LayerwiseOwnershipAllocatesOneBlockForNonOwnerLayers) {
 
   ASSERT_EQ(caches.size(), 4U);
   EXPECT_TRUE(caches[0].owns_layer_cache());
-  EXPECT_EQ(caches[0].get_k_cache().size(0), kBlockCount);
-  EXPECT_EQ(caches[0].get_index_cache().size(0), kBlockCount);
-  EXPECT_FALSE(caches[1].owns_layer_cache());
-  EXPECT_EQ(caches[1].get_k_cache().size(0), 1);
-  EXPECT_EQ(caches[1].get_index_cache().size(0), 1);
   EXPECT_TRUE(caches[2].owns_layer_cache());
-  EXPECT_EQ(caches[2].get_k_cache().size(0), kBlockCount);
-  EXPECT_EQ(caches[2].get_index_cache().size(0), kBlockCount);
+  EXPECT_FALSE(caches[1].owns_layer_cache());
   EXPECT_FALSE(caches[3].owns_layer_cache());
-  EXPECT_EQ(caches[3].get_k_cache().size(0), 1);
-  EXPECT_EQ(caches[3].get_index_cache().size(0), 1);
 
+  // Non-owner layers must keep the full block capacity so attention can address
+  // them with the real block table and slot mapping.
+  for (const KVCache& cache : caches) {
+    EXPECT_EQ(cache.get_k_cache().size(0), kBlockCount);
+    EXPECT_EQ(cache.get_index_cache().size(0), kBlockCount);
+  }
+
+  // All non-owner layers view one scratch allocation; owner layers stay
+  // independent of it and of each other.
+  EXPECT_EQ(caches[1].get_k_cache().data_ptr(),
+            caches[3].get_k_cache().data_ptr());
+  EXPECT_EQ(caches[1].get_index_cache().data_ptr(),
+            caches[3].get_index_cache().data_ptr());
+  EXPECT_NE(caches[0].get_k_cache().data_ptr(),
+            caches[1].get_k_cache().data_ptr());
+  EXPECT_NE(caches[0].get_k_cache().data_ptr(),
+            caches[2].get_k_cache().data_ptr());
+
+  caches[0].get_k_cache().zero_();
   caches[1].get_k_cache().fill_(1);
-  torch::Tensor out_of_range_block = torch::tensor({1}, torch::kLong);
-  caches[1].swap_blocks(out_of_range_block, out_of_range_block);
-  EXPECT_TRUE(torch::all(caches[1].get_k_cache() == 1).item<bool>());
+  EXPECT_TRUE(torch::all(caches[3].get_k_cache() == 1).item<bool>());
+  EXPECT_TRUE(torch::all(caches[0].get_k_cache() == 0).item<bool>());
+
+  // Block swaps must skip non-owner layers: the scratch is not part of the
+  // scheduler's block lifetime.
+  torch::Tensor src_block = torch::tensor({0}, torch::kLong);
+  torch::Tensor dst_block = torch::tensor({1}, torch::kLong);
+  caches[1].get_k_cache()[0].zero_();
+  caches[1].swap_blocks(src_block, dst_block);
+  EXPECT_TRUE(torch::all(caches[1].get_k_cache()[1] == 1).item<bool>());
 }
 
 #if defined(USE_MLU)

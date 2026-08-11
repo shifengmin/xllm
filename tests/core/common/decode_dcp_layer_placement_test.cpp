@@ -34,18 +34,45 @@ TEST(DecodeDcpLayerPlacementTest, DisabledConfigSkipsRoleValidation) {
       /*enabled=*/false, InstanceRole::PREFILL, /*decode_dcp_size=*/1));
 }
 
-#if defined(USE_NPU)
-TEST(DecodeDcpLayerPlacementTest, AcceptsDecodeRoleAtStartup) {
-  EXPECT_NO_FATAL_FAILURE(validate_decode_dcp_layerwise_kv_cache_config(
-      /*enabled=*/true, InstanceRole::DECODE, /*decode_dcp_size=*/2));
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingIgnoresSingleRankDcp) {
+  EXPECT_NO_FATAL_FAILURE(
+      validate_decode_dcp_slot_addressing(/*decode_dcp_size=*/1,
+                                          /*n_blocks=*/1 << 20,
+                                          /*block_size=*/128));
 }
 
-TEST(DecodeDcpLayerPlacementTest, RejectsNonDecodeRoleAtStartup) {
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingAcceptsRepresentablePool) {
+  EXPECT_NO_FATAL_FAILURE(validate_decode_dcp_slot_addressing(
+      /*decode_dcp_size=*/2,
+      /*n_blocks=*/kDecodeDcpMaxExactSlotCount / 128,
+      /*block_size=*/128));
+}
+
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingRejectsPoolBeyondFp32Mantissa) {
+  EXPECT_DEATH(validate_decode_dcp_slot_addressing(
+                   /*decode_dcp_size=*/2,
+                   /*n_blocks=*/kDecodeDcpMaxExactSlotCount / 128 + 1,
+                   /*block_size=*/128),
+               "fp32 round-trip");
+}
+
+#if defined(USE_NPU)
+TEST(DecodeDcpLayerPlacementTest, AcceptsEveryServingRoleAtStartup) {
+  for (const InstanceRole role : {InstanceRole(InstanceRole::DECODE),
+                                  InstanceRole(InstanceRole::PREFILL),
+                                  InstanceRole(InstanceRole::DEFAULT),
+                                  InstanceRole(InstanceRole::MIX)}) {
+    EXPECT_NO_FATAL_FAILURE(validate_decode_dcp_layerwise_kv_cache_config(
+        /*enabled=*/true, role, /*decode_dcp_size=*/2));
+  }
+}
+
+TEST(DecodeDcpLayerPlacementTest, RejectsInvalidRoleAtStartup) {
   EXPECT_DEATH(validate_decode_dcp_layerwise_kv_cache_config(
                    /*enabled=*/true,
-                   InstanceRole::PREFILL,
+                   InstanceRole::INVALID,
                    /*decode_dcp_size=*/2),
-               "requires the DECODE instance role");
+               "unsupported instance role");
 }
 
 TEST(DecodeDcpLayerPlacementTest, RejectsSingleRankDcpAtStartup) {

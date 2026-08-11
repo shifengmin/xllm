@@ -200,6 +200,26 @@ void allocate_sleepable_kv_caches(std::vector<KVCache>& kv_caches,
             << ", total_bytes=" << total_bytes << ", base=" << base;
 }
 
+// Layerwise KV cache keeps one shared scratch cache at the same block capacity
+// as an owned layer. Non-owner layers view it instead of holding their own
+// blocks, which lets attention address it with the real block table and slot
+// mapping once the layer owner has materialized the rows it needs.
+//
+// The per-layer indexer mask is dropped so the scratch exposes the superset of
+// the per-layer cache ABI: a layer that owns indexer tensors must find them on
+// the scratch too.
+KVCache create_layerwise_scratch_cache(
+    const KVCacheShape& kv_cache_shape,
+    const KVCacheCreateOptions& create_options) {
+  KVCacheCreateOptions scratch_options = create_options;
+  scratch_options.indexer_cache_enabled_layers(std::vector<bool>{});
+  scratch_options.layer_cache_owned(std::vector<bool>{});
+  return KVCache(kv_cache_shape,
+                 scratch_options,
+                 /*layer_id=*/0,
+                 /*owns_layer_cache=*/false);
+}
+
 }  // namespace
 
 KVCache::KVCache() : impl_(std::make_unique<KVCacheImpl>()) {}
@@ -300,6 +320,13 @@ std::vector<std::vector<int64_t>> KVCache::get_shapes() {
 }
 
 bool KVCache::empty() const { return impl_->empty(); }
+
+KVCache KVCache::create_shared_view() const {
+  KVCache view;
+  view.owns_layer_cache_ = false;
+  view.impl_ = impl_->create_view();
+  return view;
+}
 
 void KVCache::swap_blocks(torch::Tensor& src_tensor,
                           torch::Tensor& dst_tensor) {
@@ -409,16 +436,29 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
     return;
   }
 
-  const KVCacheShape null_cache_shape = kv_cache_shape.with_block_count(1);
+  if (layer_cache_owned.empty()) {
+    for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+      kv_caches.emplace_back(kv_cache_shape,
+                             create_options,
+                             layer_idx,
+                             /*owns_layer_cache=*/true);
+    }
+    return;
+  }
+
+  // The scratch object itself is local: its tensors stay alive through the
+  // per-layer views because torch tensors share storage by reference count.
+  const KVCache scratch_cache =
+      create_layerwise_scratch_cache(kv_cache_shape, create_options);
   for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    const bool owns_layer = layer_cache_owned.empty() ||
-                            layer_cache_owned[static_cast<size_t>(layer_idx)];
-    const KVCacheShape& layer_shape =
-        owns_layer ? kv_cache_shape : null_cache_shape;
-    kv_caches.emplace_back(layer_shape,
+    if (!layer_cache_owned[static_cast<size_t>(layer_idx)]) {
+      kv_caches.emplace_back(scratch_cache.create_shared_view());
+      continue;
+    }
+    kv_caches.emplace_back(kv_cache_shape,
                            create_options,
                            layer_idx,
-                           /*owns_layer_cache=*/owns_layer);
+                           /*owns_layer_cache=*/true);
   }
 }
 

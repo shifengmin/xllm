@@ -75,6 +75,12 @@ class KVCache final {
     return owns_layer_cache_;
   }
 
+  // Build a non-owning cache over the same tensors. Layerwise KV cache gives
+  // every non-owner layer such a view of one shared scratch allocation, so the
+  // model keeps a uniform per-layer KVCache interface while only owner layers
+  // hold real blocks.
+  [[nodiscard]] KVCache create_shared_view() const;
+
   void swap_blocks(torch::Tensor& src_tensor, torch::Tensor& dst_tensor);
 
  private:

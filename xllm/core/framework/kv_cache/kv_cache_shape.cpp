@@ -161,29 +161,6 @@ bool KVCacheShape::has_ssm_cache_shape() const {
   return ssm_cache_shape_.has_value();
 }
 
-KVCacheShape KVCacheShape::with_block_count(int64_t block_count) const {
-  CHECK_GT(block_count, 0) << "KV cache block count must be positive.";
-  CHECK(!has_grouped_cache_layout())
-      << "Grouped KV cache layout does not support per-layer block counts.";
-  CHECK(!has_conv_cache_shape() && !has_ssm_cache_shape())
-      << "Linear attention cache does not support per-layer block counts.";
-
-  KVCacheShape result = *this;
-  auto replace_block_count =
-      [block_count](std::optional<std::vector<int64_t>>* shape) {
-        if (!shape->has_value()) {
-          return;
-        }
-        CHECK(!shape->value().empty()) << "KV cache shape must not be empty.";
-        shape->value()[0] = block_count;
-      };
-  replace_block_count(&result.key_cache_shape_);
-  replace_block_count(&result.value_cache_shape_);
-  replace_block_count(&result.index_cache_shape_);
-  replace_block_count(&result.index_cache_scale_shape_);
-  return result;
-}
-
 void KVCacheShape::print_shapes() const {
   if (shape_kind_ == ShapeKind::GROUPED_POOL) {
     print_dsv4_pool_shape();

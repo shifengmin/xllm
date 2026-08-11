@@ -255,7 +255,16 @@ void LlmDataDistTransfer::register_layer_registered_caches(
   layer_registered_caches.clear();
   layer_registered_caches.resize(kv_caches.size());
 
+  bool registered_any_layer = false;
   for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    // Layerwise KV cache: a non-owner layer only views the shared scratch,
+    // which never takes part in transfer. Registering it would map the same
+    // memory once per layer and let a peer write into the scratch. Leaving the
+    // entry empty also gives the source side of a PUSH its own ownership
+    // filter, on top of the destination filter applied per key below.
+    if (!kv_caches[layer_id].owns_layer_cache()) {
+      continue;
+    }
     for (const KVCacheTensor& cache_tensor :
          kv_caches[layer_id].get_cache_tensors()) {
       if (!cache_tensor.sequence_scoped &&
@@ -267,7 +276,9 @@ void LlmDataDistTransfer::register_layer_registered_caches(
     }
     CHECK(!layer_registered_caches[layer_id].empty())
         << "No cache tensor registered at layer " << layer_id;
+    registered_any_layer = true;
   }
+  CHECK(registered_any_layer) << "No KV cache layer registered for transfer.";
 }
 
 bool LlmDataDistTransfer::push_layer_registered_caches(
