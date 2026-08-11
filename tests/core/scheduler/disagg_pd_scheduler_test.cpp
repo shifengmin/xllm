@@ -433,19 +433,19 @@ TEST(DisaggPDSchedulerTest, PreservesPrefillCachedTokensOnDecodeRequest) {
 }
 
 TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
-  EXPECT_FALSE(pd_prompt_exceeds_block_capacity(
+  EXPECT_FALSE(pd_prompt_exceeds_decode_block_capacity(
       /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
 }
 
 TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
-  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/404));
-  EXPECT_TRUE(
-      decode_add_new_failure_is_terminal(kDecodeAddNewPromptTooLongStatusCode));
-  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/500));
+  EXPECT_FALSE(is_decode_add_request_failure_terminal(/*status_code=*/404));
+  EXPECT_TRUE(is_decode_add_request_failure_terminal(
+      kDecodeAddNewPromptTooLongStatusCode));
+  EXPECT_FALSE(is_decode_add_request_failure_terminal(/*status_code=*/500));
 }
 
 TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
-  EXPECT_TRUE(pd_prompt_exceeds_block_capacity(
+  EXPECT_TRUE(pd_prompt_exceeds_decode_block_capacity(
       /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
 }
 
@@ -459,7 +459,7 @@ TEST(DisaggPDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
   Sequence* sequence = request->sequences()[0].get();
 
   EXPECT_FALSE(scheduler.try_allocate(sequence));
-  EXPECT_FALSE(scheduler.prompt_exceeds_block_capacity(sequence));
+  EXPECT_FALSE(scheduler.prompt_exceeds_decode_block_capacity(sequence));
 
   block_manager->deallocate(holder.get());
 }
@@ -472,7 +472,7 @@ TEST(DisaggPDSchedulerTest, OversizedDecodePromptIsPermanent) {
   Sequence* sequence = request->sequences()[0].get();
 
   EXPECT_FALSE(scheduler.try_allocate(sequence));
-  EXPECT_TRUE(scheduler.prompt_exceeds_block_capacity(sequence));
+  EXPECT_TRUE(scheduler.prompt_exceeds_decode_block_capacity(sequence));
 
   block_manager->deallocate(request.get());
 }

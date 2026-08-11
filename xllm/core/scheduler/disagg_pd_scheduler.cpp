@@ -48,13 +48,13 @@ limitations under the License.
 
 namespace xllm {
 
-bool decode_add_new_failure_is_terminal(int32_t status_code) {
+bool is_decode_add_request_failure_terminal(int32_t status_code) {
   return status_code == kDecodeAddNewPromptTooLongStatusCode;
 }
 
-bool pd_prompt_exceeds_block_capacity(size_t num_prompt_tokens,
-                                      size_t block_size,
-                                      size_t num_blocks) {
+bool pd_prompt_exceeds_decode_block_capacity(size_t num_prompt_tokens,
+                                             size_t block_size,
+                                             size_t num_blocks) {
   if (block_size == 0) {
     return true;
   }
@@ -544,13 +544,13 @@ void DisaggPDScheduler::dispatch_requests() {
     }
     for (size_t i = 0; i < requests.size(); ++i) {
       if (resps.resps()[i].status_code() != 200) {
-        if (decode_add_new_failure_is_terminal(
+        if (is_decode_add_request_failure_terminal(
                 resps.resps()[i].status_code())) {
           LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
                      << requests[i]->request_id() << ", prompt_tokens="
                      << requests[i]->state().prompt_tokens.size()
                      << ", selected_instance=" << selected_instance;
-          fail_request_exceeding_decode_capacity(requests[i]);
+          fail_request_rejected_by_decode_capacity(requests[i]);
           continue;
         }
         // push back to prefill_request_queue_
@@ -1095,7 +1095,7 @@ bool DisaggPDScheduler::try_allocate(Sequence* sequence) {
   }
 }
 
-bool DisaggPDScheduler::prompt_exceeds_block_capacity(
+bool DisaggPDScheduler::prompt_exceeds_decode_block_capacity(
     Sequence* sequence) const {
   CHECK(sequence != nullptr);
   const BlockManagerPool* block_manager = engine_->block_manager_pool();
@@ -1107,13 +1107,13 @@ bool DisaggPDScheduler::prompt_exceeds_block_capacity(
        options_.instance_role() != InstanceRole::DECODE)) {
     return false;
   }
-  return pd_prompt_exceeds_block_capacity(
+  return pd_prompt_exceeds_decode_block_capacity(
       sequence->num_prompt_tokens(),
       static_cast<size_t>(block_manager->block_size()),
       static_cast<size_t>(block_manager->num_blocks()));
 }
 
-void DisaggPDScheduler::fail_request_exceeding_decode_capacity(
+void DisaggPDScheduler::fail_request_rejected_by_decode_capacity(
     const std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   response_processor_->process_failed_request(
