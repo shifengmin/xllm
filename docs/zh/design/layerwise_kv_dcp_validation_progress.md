@@ -23,6 +23,13 @@
 ### 0. 上下文恢复记录
 
 - 2026-08-12：首次上下文压缩后已重新阅读本文档，并复核工作区、验证脚本、16 张 NPU、模型路径及构建修复状态；继续执行第三次完整 NPU 构建。
+- 2026-08-12：第二次上下文压缩后重新阅读全文并复核原始响应日志。DCP2 与 DCP 关闭基线的事实题、算术题和技术题语义一致；两条 2504-token 并发请求均为 HTTP 200。此前唯一 HTTP 500 来自 13004-token 测试输入超过 4096 限制，属于预期拒绝。构建与验证修复已分别提交为 `702f1cd23` 和 `d3718eb59`，16 张 NPU 当前均健康且无运行进程；继续 review/profile host metadata 热路径。
+- 2026-08-12：第三次上下文压缩后重新阅读全文并复核当前未提交 diff。完整 NPU 构建已由独立 build agent 在当前快照上通过；继续检查 prepare stream/compute stream 同步、metadata 生命周期及 decode/spec-verify/空 batch 分支，测试 agent 正在执行最终功能与性能回归。
+- 2026-08-12：第四次上下文压缩后重新阅读全文。冻结优化代码的完整 NPU 构建已通过；测试 agent 已完成 11/11 placement/config/mapping、12/12 KV transfer/Mooncake、WORLD16 DP2/TP8/DCP2 长请求及语义回归，服务期间全 rank 新增异常为 0，停机后 16 张 NPU 均无进程。继续完成代码审查和优化前后性能量化，尚未将功能回归等同于性能优化完成。
+- 2026-08-12：第五次上下文压缩后重新阅读全文并复核工作区。原始功能/语义基线与第一轮优化冻结快照的完整构建、聚焦测试、WORLD16 回归和全 rank 日志审计均保持通过；继续完成 prepare/forward 边界、流同步、tensor 生命周期和全执行分支审查，并量化优化前后 host metadata 开销后再提交。
+- 2026-08-12：第六次上下文压缩后重新阅读全文并复核未提交文件。第一轮优化的构建和功能冻结结果保持有效，当前仍未把功能通过等同于性能优化完成；继续分块审查全部调用链，并以相同 DCP2 配置量化优化前后 host metadata 开销，完成后再形成独立 `perf:` 提交。
+- 2026-08-12：第七次上下文压缩后重新阅读全文并复核分支与未提交文件。完整构建、聚焦测试、WORLD16 DP2/TP8/DCP2 长请求、语义和全 rank 审计结果保持有效；本轮继续闭环异步流与 tensor 生命周期审查，并使用同一 DCP2 工作负载量化优化前后 host metadata 开销，所有门禁通过后再提交第一轮 `perf:` 优化。
+- 2026-08-12：第八次上下文压缩后重新阅读全文并复核工作区及子 agent 状态。A/B profile 已完成，prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`；最终代码已移除临时打点并包含 `EMPTY` 占位输入的 dummy metadata 修复。当前由 build agent 执行最终完整 NPU 构建，主 agent 同步完成最终 diff 审查，构建通过后再由 test agent 执行最终聚焦测试、WORLD16 语义回归和全 rank/设备释放审计。
 
 ### 1. 仓库与机器预检
 
@@ -36,8 +43,8 @@
 - [x] 执行真实请求，覆盖 prefill 和 decode。
 - [x] 与 DCP 关闭基线完成语义一致性对比。
 - [x] 停止测试进程并确认设备释放。
-- [ ] Review 并 profile host 侧 metadata 准备瓶颈。
-- [ ] 优化 metadata 准备，回归构建和功能并量化收益。
+- [x] Review 并 profile host 侧 metadata 准备瓶颈。
+- [x] 优化 metadata 准备，回归构建和功能并量化收益。
 
 ## 问题记录
 
@@ -86,6 +93,27 @@
 
 16. DCP2 和 DCP 关闭实例均稳定复现 multiprocessing 关联子进程不响应 TERM 的问题，说明它与 DCP 功能无关。验证脚本现分别统计 rank 主进程与全部关联进程；主 rank 全部退出后会立即 KILL 精确匹配相同 binary/master 地址的残留进程，并等待确认清理完成，避免显存泄漏到下一轮测试。
 
+17. 第一轮 host metadata review 定位到三个同源问题：同一 batch 的 decode metadata 在 78 层重复构造；每层新建 3 个 host vector、执行 3 次 CPU→NPU tensor 转换并分配 2 个 device buffer；layerwise prefill 每层重复读取 block table 并构造 history slots。该设计的 metadata 完全是 step 级数据，已开始改为 Worker prepare stream 在模型 `forward` 前一次准备，并由所有 layer 共享；layer forward 内不再允许 metadata 构造、H2D/D2H 或临时 buffer 分配。
+
+18. 第一轮优化冻结快照已通过完整构建和功能回归：`python setup.py build --device npu` 退出码 0，`xllm` 70/70、`export_module` 4/4、`all_tests` 37/37；placement/config/mapping 11/11、KV transfer/Mooncake 12/12；WORLD16 DP2/TP8/DCP2 两条并发 2504-token 请求均 HTTP 200，语义题输出 `Paris`、`107`，技术题正确描述 KV cache、prefill、decode。服务期间全 rank 新增 `ERROR/FATAL/traceback` 为 0，停机后 rank 和关联进程均为 0。构建日志为 `perf_round1_final_build_npu.log`，功能日志使用 `perf_round1_reviewed_*` 前缀。性能收益仍待量化。
+
+19. 第一轮 host metadata A/B profile 已完成。基线使用独立 worktree `xllm-dcp-perf-baseline-d3718` 的 `d3718eb59`，只增加逐层函数计时并按 78 层聚合；优化侧在 worker prepare 函数计时。两侧均为 WORLD16、DP2、TP8、DCP2、layerwise=true、ATB eager、graph=false、schedule-overlap=false，先 warmup 1 条，再执行 5 条相同的 `19 prompt + 96 completion` 请求，并在所有 16 个 rank 上按 warmup 后日志 offset 取样。每侧得到 80 个 prefill 样本和 7600 个 decode 样本：
+    - baseline 二进制 SHA `993d0a61994a90ecf8769898983e355dbf75eda6db3edf654f3aed89166824c1`；prefill 均值 `101760.637 us`、p50 `99701 us`、p95 `117626 us`，decode 均值 `102083.787 us`、p50 `101809 us`、p95 `113916 us`。
+    - optimized profile 二进制 SHA `d1305fcdc2e6085ec6ccc5725a40df103531780bfb0073f345cfec6413124465`；prefill 均值 `78.300 us`、p50 `73 us`、p95 `118 us`，decode 均值 `137.564 us`、p50 `135 us`、p95 `159 us`。
+    - prefill metadata 均值减少 `99.923%`（`1299.62x`），decode metadata 均值减少 `99.865%`（`742.08x`）。客户端 5 请求均值由 `15.201734 s` 降至 `7.552816 s`，中位数由 `15.328810 s` 降至 `7.417507 s`；业务时延只作为辅助结果，metadata 直接计时作为优化收益主证据。
+    - 原始日志为 `perf_round1_profile_baseline_{profile_lines,raw_elapsed_us,stats}.tsv/log`、`perf_round1_profile_optimized_{profile_lines,raw_elapsed_us,stats}.tsv/log` 和两侧 `requests.jsonl`。两侧 profile 二进制每 step 各保留一条 INFO 计时日志，最终源码已移除该临时打点，因此最终运行时开销不高于上述优化侧结果。
+
+20. 完整代码审查确认 step 级 tensor 由 `ForwardInput` 持有，prepare stream 通过 `metadata_ready_event` 与 compute stream 建立依赖；普通非 overlap 路径在输入析构前同步默认流，overlap/spec no-sync 路径由 retained input 保持生命周期，graph 模式被 DCP eager 检查拒绝；同一 step 的共享 buffer 只在同一 ATB compute stream 上按层顺序复用，不存在并发覆盖。审查同时发现一个真实边界回归：真正的 `EMPTY` 输入会在 worker prepare 提前返回，但 NPU 模型随后仍可能用占位 token 进入 prefill forward，导致共享 metadata 未初始化。已在提前返回前准备 dummy DCP 输入，并让 `_mtp` 模型与 layer 侧禁用 DCP metadata 的判断保持一致。最终源码中的 layer forward 只绑定已准备的 tensor，不再构造 DCP host vector、执行 DCP metadata H2D/D2H 或分配 DCP 临时 device buffer；临时 profile 日志也已移除。
+
+21. 最终快照完成全部门禁并形成提交：
+    - 最终机器可读汇总为 `perf_round1_final_review_validation.log`，其中 `VALIDATION_EXIT_CODE=0`。
+    - 完整执行 `python setup.py build --device npu`，退出码 0；`xllm`、`export_module`、`all_tests` 分别完成 `[3/3]`、`[2/2]`、`[32/32]`，日志为 `perf_round1_final_review_build_npu.log`。最终二进制 SHA-256 为 `282bee5d822cea28c49a71d06efe9eeee9ec72e06356fe08ace1635df7367d19`。
+    - placement/config/mapping 11/11、KV transfer/Mooncake 12/12 通过，日志分别为 `perf_round1_final_review_focused_ctest.log`、`perf_round1_final_review_kv_transfer_ctest.log`。
+    - WORLD16、DP2、attention TP8、DCP2、layerwise=true 启动后 16/16 rank 就绪。两条并发长请求均 HTTP 200，每条 `2504 prompt + 16 completion`；合计 5008 个 prefill token 超过单 replica 的 4096 上限，且两条请求在同一 15.304 秒窗口内完成，确认两个 DP replica 均参与。
+    - 最终语义回归中事实题为 `Paris`、算术题为 `107`，技术题正确说明 KV cache 避免历史 K/V 重算、prefill 并行填充 cache、decode 逐 token 读取和追加 cache；与优化前 DCP1/DCP2 基线语义一致。响应保存在 `perf_round1_final_review_semantic_dcp2_full.jsonl`。
+    - 服务窗口全 16 rank 新增 `ERROR/FATAL/traceback` 为 0。停机脚本因 `/proc/56334/cmdline` 消失竞态返回 1，随后只按最终 binary 路径和 `--master_node_addr=11.87.191.98:22998` 精确执行 TERM/KILL；最终 `ALIVE_RANKS=0/16`、关联进程为 0、匹配进程为 0、NPU process table 全空且 16 卡 HBM 回到空闲基线，记录于 `perf_round1_final_review_cleanup_note.log`。
+    - 优化源码提交为 `cb2e88bb6 perf: prepare shared dcp metadata before forward.`；pre-commit clang-format 检查通过。
+
 ## 上下文恢复检查点
 
-上下文压缩后从本节恢复：完整 NPU 构建成功，两组聚焦测试分别 11/11、12/12 通过。单机 WORLD=16、DP=2、attention TP=8、DCP=2 已完成短请求、两个并发 2504-token 长请求及三条语义问答；DCP 关闭基线用相同三条请求复验，`Paris`、`107` 和 KV cache/prefill/decode 技术结论均一致。所有服务及关联进程已停止。下一步将已验证的构建和运行 bugfix 形成本地 commit，然后 review/profile host metadata 瓶颈；每个有量化进展的优化阶段形成独立本地 `perf:` commit。
+上下文压缩后从本节恢复：全部目标已完成。完整 NPU 构建成功，两组聚焦测试分别 11/11、12/12 通过；单机 WORLD=16、DP=2、attention TP=8、DCP=2 完成真实长请求和语义回归，全 rank 服务期异常为 0，停止后所有进程和 NPU context 均已释放。DCP 关闭基线与 DCP2 的 `Paris`、`107` 和 KV cache/prefill/decode 技术结论语义一致。第一轮 host metadata A/B profile 量化出 prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`，代码审查已闭环并修复 `EMPTY` 输入边界问题；最终优化提交为 `cb2e88bb6`，构建与验证修复提交为 `702f1cd23`、`d3718eb59`。
