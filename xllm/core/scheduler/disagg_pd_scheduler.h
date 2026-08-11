@@ -38,14 +38,14 @@ namespace xllm {
 
 inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
 
-bool is_decode_add_request_failure_terminal(int32_t status_code);
+bool is_permanent_rejection(int32_t status_code);
 
 // Flat KV managers reserve block 0 for padding, so only num_blocks - 1 blocks
 // can belong to a request. Returns true only when the prompt can never fit,
 // independent of current cache pressure.
-bool pd_prompt_exceeds_decode_block_capacity(size_t num_prompt_tokens,
-                                             size_t block_size,
-                                             size_t num_blocks);
+bool exceeds_decode_capacity(size_t num_prompt_tokens,
+                             size_t block_size,
+                             size_t num_blocks);
 
 class DisaggPDScheduler : public ContinuousScheduler {
  public:
@@ -94,7 +94,7 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // Classifies a failed allocation as permanently oversized.
   // DSV4 multi-manager and XTensor layouts conservatively return false because
   // their effective token capacity cannot be derived from the flat KV count.
-  bool prompt_exceeds_decode_block_capacity(Sequence* sequence) const;
+  bool exceeds_decode_capacity(Sequence* sequence) const;
 
   bool enable_schedule_overlap() { return options_.enable_schedule_overlap(); };
 
@@ -116,8 +116,7 @@ class DisaggPDScheduler : public ContinuousScheduler {
                        const int32_t src_kv_split_size);
 
  protected:
-  void fail_request_rejected_by_decode_capacity(
-      const std::shared_ptr<Request>& request);
+  void do_permanent_rejection(const std::shared_ptr<Request>& request);
 
   // Pre-execute prefill requests of different lengths at startup and obtain the
   // corresponding TTFT for calculating the estimated TTFT of requests.

@@ -1471,13 +1471,12 @@ void PDOOCScheduler::dispatch_requests() {
     for (size_t i = 0; i < requests.size(); ++i) {
       CHECK(!requests[i]->offline());
       if (resps.resps()[i].status_code() != 200) {
-        if (is_decode_add_request_failure_terminal(
-                resps.resps()[i].status_code())) {
+        if (is_permanent_rejection(resps.resps()[i].status_code())) {
           LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
                      << requests[i]->request_id() << ", prompt_tokens="
                      << requests[i]->state().prompt_tokens.size()
                      << ", selected_instance=" << selected_instance;
-          fail_request_rejected_by_decode_capacity(requests[i]);
+          do_permanent_rejection(requests[i]);
           continue;
         }
         // push back to prefill_request_queue_
@@ -1958,13 +1957,13 @@ void PDOOCScheduler::dispatch_offline_requests() {
     // Check response and handle accordingly
     const bool prompt_too_long =
         !cntl.Failed() && !resps.resps().empty() &&
-        is_decode_add_request_failure_terminal(resps.resps()[0].status_code());
+        is_permanent_rejection(resps.resps()[0].status_code());
     if (prompt_too_long) {
       LOG(ERROR) << "Decode rejected an oversized offline prompt, request_id="
                  << request->request_id()
                  << ", prompt_tokens=" << request->state().prompt_tokens.size()
                  << ", target_instance=" << target_instance;
-      fail_request_rejected_by_decode_capacity(request);
+      do_permanent_rejection(request);
       continue;
     }
     if (cntl.Failed() || resps.resps().empty() ||

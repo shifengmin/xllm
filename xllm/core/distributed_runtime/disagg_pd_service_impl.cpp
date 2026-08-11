@@ -160,7 +160,7 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
     Sequence* sequence = sequences[0].get();
 
     if (!scheduler_->try_allocate(sequence)) {
-      if (scheduler_->prompt_exceeds_decode_block_capacity(sequence)) {
+      if (scheduler_->exceeds_decode_capacity(sequence)) {
         LOG(ERROR) << "Decode cannot fit request prompt at any load, "
                    << "request_id=" << req.req_id()
                    << ", prompt_tokens=" << sequence->num_prompt_tokens();
