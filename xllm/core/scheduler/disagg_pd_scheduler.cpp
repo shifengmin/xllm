@@ -1105,7 +1105,7 @@ bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {
        options_.instance_role() != InstanceRole::DECODE)) {
     return false;
   }
-  return exceeds_decode_capacity(
+  return ::xllm::exceeds_decode_capacity(
       sequence->num_prompt_tokens(),
       static_cast<size_t>(block_manager->block_size()),
       static_cast<size_t>(block_manager->num_blocks()));
