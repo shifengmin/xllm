@@ -290,6 +290,12 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
   for (int64_t layer_index = 0;
        layer_index < static_cast<int64_t>(layer_registered_caches.size());
        ++layer_index) {
+    // Wait for the KV cache computation of this layer to complete.
+    if (!layer_synchronizer->synchronize_layer(layer_index)) {
+      result = false;
+      continue;
+    }
+
     std::vector<std::string> layer_keys;
     layer_keys.reserve(keys.size());
     for (const std::string& key : keys) {
@@ -299,11 +305,6 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
       }
     }
     if (layer_keys.empty()) {
-      continue;
-    }
-    // Wait for the KV cache computation of this layer to complete.
-    if (!layer_synchronizer->synchronize_layer(layer_index)) {
-      result = false;
       continue;
     }
     for (const std::string& key : layer_keys) {
