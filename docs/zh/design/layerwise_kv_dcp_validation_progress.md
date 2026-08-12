@@ -178,10 +178,26 @@
     - DCP2 事实题、算术题和技术题均为 HTTP 200，结论分别为 `Paris`、`107`，以及 KV cache 在 prefill 中为完整 prompt 生成并保存 K/V、decode 中只计算新 token 并追加 K/V；日志为 `perf_round2_workspace_fix_semantic_dcp2_full.jsonl` 和 `perf_round2_workspace_fix_semantic_dcp2_completion.jsonl`。
     - 双并发长上下文请求均为 HTTP 200，每条 `3133 prompt + 16 completion`，两条在约 `3.59 s` 的同一窗口完成，日志为 `perf_round2_workspace_fix_dp2_long_context.jsonl`。ready 之后的全 rank 增量异常审计为空；启动早期完整日志仍保留历史 Python traceback，因此不将完整文件误报为全程零异常。
     - 相同 2504-token prompt、双并发、256-token decode 的无 profiler A/B 中，DCP1 平均 TPOT 为 `57.400 ms`，DCP2 为 `66.290 ms`，DCP2 仍有 `+8.890 ms`、`+15.49%` 开销；相比优化前 DCP2 的 `78.410 ms`，降低 `12.120 ms`、`15.46%`，DCP2 相对 DCP1 的净 overhead 从 `20.550 ms` 降到 `8.890 ms`，减少 `56.74%`。汇总为 `perf_round2_workspace_fix_tpot_ab_summary.log`。
-    - 停止脚本因 `/proc` 消失竞态返回 1，随后按 binary/master 精确清理，`FINAL_LEFT=0`；最终 `npu-smi` process table 无运行进程。优化后 DCP2 `msprof` 尚待按用户要求复采，用于确认旧 5 gather、block-table 行展开和 fp32 cast/mul/add 链已消失，并重新拆解剩余 broadcast 与 pack/unpack 开销。
+    - 停止脚本因 `/proc` 消失竞态返回 1，随后按 binary/master 精确清理，`FINAL_LEFT=0`；最终 `npu-smi` process table 无运行进程。该阶段优化后 DCP2 `msprof` 尚待复采，结果记录在下一项。
+
+28. 融合优化后的 DCP2 `msprof` 复采和 overhead 拆解完成。采集对象为 rank 0/device 0，原始 profile 位于 `build/dcp-kv-validation/msprof/optimized_dcp2_rank0/PROF_000001_20260812195243978_00030306PRAGMDHA/`；有效请求为 `3338 prompt + 256 completion`、HTTP 200，记录在 `perf_round2_optimized_msprof_direct_profiled_request.json`。导出窗口完整包含 `19,968 = 78 x 256` 次 decode layer invocation，其中 owner/non-owner 各 `9,984` 次。
+    - 旧 mapping 链的 5 个 gather、`[packed_topk, num_blocks]` block-table 行展开和 fp32 cast/mul/add/cast 索引 hack 已从 DCP layer 邻接序列中完全消失。新 `topk_logical_to_physical_slots_kernel__bs128` 恰好执行 `19,968` 次，累计 `362.924 ms`，均值 `18.175 us/layer`、p50 `18.240 us`、p95 `19.280 us`，折算 `1.418 ms/token`。
+    - 优化前 logical top-k 到 physical slot mapping 为 `16.391 ms/token`；融合后降至 `1.418 ms/token`，减少 `14.973 ms/token`、`91.35%`。
+
+    | 优化后 DCP2 可识别设备工作 | 折算单 token | Profile 分布或组成 |
+    | --- | ---: | --- |
+    | fused logical-to-physical mapping | `1.418 ms` | `18.175 us/layer` mean，`18.240 us` p50，`19.280 us` p95 |
+    | INT32 top-k broadcast | `3.054 ms` | `39.154 us/layer` mean，`5.440 us` p50，`90.301 us` p95；存在 profiler/HCCL 同步长尾 |
+    | BF16 selected-KV broadcast | `3.658 ms` | `46.896 us/layer` mean，`40.420 us` p50，`67.021 us` p95 |
+    | owner/non-owner pack、copy、unpack、scatter | `2.959 ms` | owner gather `0.723`、concat `0.290`、全层 copy `0.783`、non-owner split `0.282`、scatter `0.881 ms/token` |
+    | 合计 | `11.088 ms` | 仅统计源码和每层邻接序列可严格识别的 DCP2 新增设备工作 |
+
+    - 优化前同口径合计为 `23.231 ms/token`，优化后减少 `12.143 ms/token`、`52.27%`。该变化与无 profiler 的 DCP2 TPOT 从 `78.410 ms` 降到 `66.290 ms`、改善 `12.120 ms/token` 基本一致；DCP2 相对 DCP1 的净 TPOT overhead 从 `20.550 ms` 降到 `8.890 ms`，减少 `56.74%`。
+    - 本次 `msprof` 请求的服务端 TPOT 为 `176.6 ms`，明显高于无 profiler DCP2 的 `66.290 ms`，不能作为端到端性能口径。尤其 INT32 broadcast 的 p50 仅 `5.440 us/layer`，但少量同步长尾最高达到 `8.476 ms/layer`，将累计值拉高到 `3.054 ms/token`；因此通信项用于定位依赖和剩余优化方向，不应被解释为稳定的纯链路带宽成本。
+    - 优化后的主要剩余 DCP 工作已从 slot mapping 转为两次同步通信。下一轮候选方向是取消 selected-KV broadcast，改为把 decode Q 路由到 layer owner，由 owner 使用本地完整 KV 执行 attention，再把 attention output 路由回原 rank；实施前必须先确认 Q/output shape、TP 语义、owner 轮转、batch 路由和 collective 配对，不能只按 payload 大小替换通信。
 
 ## 上下文恢复检查点
 
 上下文压缩后从本节恢复：第一轮 host metadata 优化和第二轮 fused slot mapping 均已实现并形成本地提交。主仓提交为 `702f1cd23`、`d3718eb59`、`cb2e88bb6`、`112da23e1`、`b4078c760`、`c394b76d9`、`115e16921`、`9e5680f9f`，ATB 子仓提交为 `23b40c6`、`9cd2088`。最终提交源码的完整 NPU 构建、wrapper/int32 聚焦测试、WORLD16 DP2/TP8/DCP2 功能语义、DCP1/DCP2 TPOT A/B 和资源清理均已通过。融合后 DCP2 TPOT 从 `78.410 ms` 降到 `66.290 ms`，相对 DCP1 的 overhead 从 `20.550 ms` 降到 `8.890 ms`，减少 `56.74%`；DCP2 仍比 DCP1 慢 `15.49%`。
 
-当前暂停点：先将 ATB 子仓和引用它的 xLLM 主仓提交推送到 `shifengmin` 远端分支。推送完成后只剩最后一轮优化后 DCP2 `msprof`：确认 fused mapping 取代旧 5 gather、block-table 行展开和 fp32 cast/mul/add 链，量化新 mapping kernel、两次 broadcast、owner/non-owner pack/unpack 及其他剩余 overhead，并补充优化前后 profile 对比。`third_party/torch_npu_ops` 的既有用户状态不得清理或提交。
+当前暂停点：第二轮 fused slot mapping 的功能、TPOT 和优化后 `msprof` 均已完成；可识别 DCP 设备工作从 `23.231` 降到 `11.088 ms/token`。当前开始确认下一种 decode 数据流：取消 selected-KV broadcast，改为 Q 路由到 layer owner、owner 执行 attention、attention output 路由回原 rank。`third_party/torch_npu_ops` 的既有用户状态不得清理或提交。
