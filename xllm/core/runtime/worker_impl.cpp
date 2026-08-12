@@ -499,108 +499,40 @@ void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
         << "Decode DCP requires a non-empty execution input.";
     CHECK_LE(query_count,
              static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-    const int32_t execution_query_count = static_cast<int32_t>(query_count);
-
-    std::vector<int32_t> visible_lengths;
-    std::vector<int32_t> query_block_rows;
-    visible_lengths.reserve(query_count);
-    query_block_rows.reserve(query_count);
-    if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
-      CHECK_EQ(input_params.graph.expanded_kv_seq_lens_vec.size(),
-               static_cast<size_t>(query_count));
-      visible_lengths = input_params.graph.expanded_kv_seq_lens_vec;
-      for (int32_t query_idx = 0; query_idx < execution_query_count;
-           ++query_idx) {
-        query_block_rows.emplace_back(query_idx);
-      }
-    } else {
-      const std::vector<int32_t>& q_seq_lens =
-          input_params.attention.host.q_seq_lens;
-      const std::vector<int32_t>& kv_seq_lens =
-          input_params.attention.host.kv_seq_lens;
-      const bool empty_batch = input_params.meta.num_sequences == 0;
-      if (empty_batch || q_seq_lens.empty() || kv_seq_lens.empty()) {
-        visible_lengths.assign(query_count, 1);
-        query_block_rows.assign(query_count, 0);
-      } else {
-        CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
-            << "Decode DCP expects one q_len and kv_len per sequence.";
-        int64_t expanded_query_count = 0;
-        for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
-             ++sequence_idx) {
-          const int32_t q_len = q_seq_lens[sequence_idx];
-          const int32_t kv_len = kv_seq_lens[sequence_idx];
-          CHECK_GT(q_len, 0);
-          CHECK_GE(kv_len, q_len);
-          for (int32_t token_idx = 0; token_idx < q_len; ++token_idx) {
-            visible_lengths.emplace_back(kv_len - q_len + token_idx + 1);
-            query_block_rows.emplace_back(static_cast<int32_t>(sequence_idx));
-            ++expanded_query_count;
-          }
-        }
-        CHECK_EQ(expanded_query_count, query_count)
-            << "Decode DCP query metadata does not match the execution input.";
-      }
-    }
-
     const int32_t index_topk = model_args.index_topk();
-    const int64_t max_position_embeddings =
-        model_args.max_position_embeddings();
     CHECK_GT(index_topk, 0);
-    CHECK_GT(max_position_embeddings, 0);
-    CHECK_LE(
-        query_count,
-        static_cast<int64_t>(std::numeric_limits<int32_t>::max()) / index_topk)
-        << "Decode DCP flattened top-k index exceeds int32 range.";
-    std::vector<int32_t> valid_topk_counts(query_count);
-    int64_t packed_key_count = 0;
-    for (int32_t query_idx = 0; query_idx < execution_query_count;
-         ++query_idx) {
-      const int32_t visible_len = visible_lengths[query_idx];
-      CHECK_GT(visible_len, 0);
-      CHECK_LE(static_cast<int64_t>(visible_len), max_position_embeddings)
-          << "Decode DCP logical position exceeds the model limit.";
-      valid_topk_counts[query_idx] = std::min(index_topk, visible_len);
-      packed_key_count += valid_topk_counts[query_idx];
-    }
-    CHECK_GT(packed_key_count, 0);
-    CHECK_LE(packed_key_count,
-             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-
-    // Only the leading min(index_topk, visible_len) entries are meaningful.
-    // Pack those entries so cache gather, broadcast and scratch scatter use
-    // the same compact row ordering on every DCP rank.
-    std::vector<int32_t> packed_gather_indices;
-    std::vector<int32_t> packed_query_block_rows;
-    std::vector<int32_t> expanded_query_cu_seq_lens(query_count);
-    packed_gather_indices.reserve(packed_key_count);
-    packed_query_block_rows.reserve(packed_key_count);
-    for (int32_t query_idx = 0; query_idx < execution_query_count;
-         ++query_idx) {
-      expanded_query_cu_seq_lens[query_idx] = query_idx + 1;
-      for (int32_t topk_idx = 0; topk_idx < valid_topk_counts[query_idx];
-           ++topk_idx) {
-        packed_gather_indices.emplace_back(query_idx * index_topk + topk_idx);
-        packed_query_block_rows.emplace_back(query_block_rows[query_idx]);
-      }
-    }
-
     NpuDecodeDcpInput& dcp_input = input_params.npu_decode_dcp;
-    dcp_input.packed_gather_indices =
-        torch::tensor(packed_gather_indices, torch::kInt32).to(device_);
-    dcp_input.packed_query_block_rows =
-        torch::tensor(packed_query_block_rows, torch::kInt32).to(device_);
-    dcp_input.expanded_query_cu_seq_lens =
-        torch::tensor(expanded_query_cu_seq_lens, torch::kInt32).to(device_);
+    if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+      dcp_input.expanded_query_cu_seq_lens = torch::arange(
+          1,
+          query_count + 1,
+          torch::TensorOptions().device(device_).dtype(torch::kInt32));
+    }
 
-    const int64_t selected_cache_width =
-        model_args.kv_lora_rank() + model_args.qk_rope_head_dim();
-    dcp_input.selected_cache_buffer =
-        torch::empty({packed_key_count, 1, selected_cache_width},
+    const int32_t attention_tp_size =
+        parallel_args_.world_size() /
+        (parallel_args_.dp_size() * parallel_args_.cp_size());
+    CHECK_GT(attention_tp_size, 0);
+    CHECK_EQ(parallel_args_.world_size(),
+             parallel_args_.dp_size() * parallel_args_.cp_size() *
+                 attention_tp_size);
+    CHECK_LE(parallel_args_.decode_dcp_size(), attention_tp_size);
+    CHECK_EQ(attention_tp_size % parallel_args_.decode_dcp_size(), 0);
+    CHECK_EQ(model_args.n_heads() % attention_tp_size, 0);
+    const int64_t local_head_count = model_args.n_heads() / attention_tp_size;
+    const int64_t dcp_head_count =
+        local_head_count * parallel_args_.decode_dcp_size();
+    dcp_input.attention_output_buffer =
+        torch::empty({query_count, dcp_head_count, model_args.kv_lora_rank()},
                      torch::TensorOptions().device(device_).dtype(dtype_));
-    dcp_input.topk_buffer = torch::empty(
-        {query_count, 1, index_topk},
-        torch::TensorOptions().device(device_).dtype(torch::kInt32));
+
+    const bool has_topk_share = !model_args.index_topk_pattern().empty() ||
+                                model_args.index_topk_freq() > 1;
+    if (has_topk_share) {
+      dcp_input.topk_receive_buffer = torch::empty(
+          {query_count, 1, index_topk},
+          torch::TensorOptions().device(device_).dtype(torch::kInt32));
+    }
     return;
   }
 

@@ -910,10 +910,8 @@ struct GraphInput {
 
 #if defined(USE_NPU)
 struct NpuDecodeDcpInput {
-  torch::Tensor selected_cache_buffer;
-  torch::Tensor topk_buffer;
-  torch::Tensor packed_gather_indices;
-  torch::Tensor packed_query_block_rows;
+  torch::Tensor attention_output_buffer;
+  torch::Tensor topk_receive_buffer;
   // Cumulative query lengths for spec-verify, where every query token is
   // expanded into its own block-table row of length one.
   torch::Tensor expanded_query_cu_seq_lens;

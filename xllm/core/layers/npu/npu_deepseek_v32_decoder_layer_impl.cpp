@@ -595,13 +595,7 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
       param.isPrefill && !is_mtp_draft_model &&
       parallel_args.decode_dcp_size() > 1 &&
       parallel_args.enable_decode_dcp_layerwise_kv_cache();
-  param.decodeDcpBlockSize = ::xllm::KVCacheConfig::get_instance().block_size();
   if (param.enableDecodeDcpLayerOwner) {
-    CHECK(param.decodeDcpBlockSize == 16 || param.decodeDcpBlockSize == 32 ||
-          param.decodeDcpBlockSize == 64 || param.decodeDcpBlockSize == 128 ||
-          param.decodeDcpBlockSize == 256)
-        << "Decode DCP fused slot mapping supports block_size in "
-        << "{16, 32, 64, 128, 256}, got " << param.decodeDcpBlockSize;
     CHECK_LE(param.index_topk, 2048)
         << "Decode DCP LightningIndexer selected count must not exceed 2048.";
   }
@@ -1084,11 +1078,13 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
        input_params_new.graph.use_expanded_decode_for_spec_verify_attention);
   if (use_decode_dcp) {
     const NpuDecodeDcpInput& dcp_inputs = input_params_new.npu_decode_dcp;
-    CHECK(dcp_inputs.selected_cache_buffer.defined());
-    CHECK(dcp_inputs.topk_buffer.defined());
-    CHECK(dcp_inputs.packed_gather_indices.defined());
-    CHECK(dcp_inputs.packed_query_block_rows.defined());
-    CHECK(dcp_inputs.expanded_query_cu_seq_lens.defined());
+    CHECK(dcp_inputs.attention_output_buffer.defined());
+    if (output_topk_) {
+      CHECK(dcp_inputs.topk_receive_buffer.defined());
+    }
+    if (input_params_new.graph.use_expanded_decode_for_spec_verify_attention) {
+      CHECK(dcp_inputs.expanded_query_cu_seq_lens.defined());
+    }
     build_node_variant_pack(decode_node_,
                             x,
                             cos_pos,
@@ -1443,13 +1439,11 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
 
   if (dcp_inputs != nullptr) {
     node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->selected_cache_buffer);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->topk_buffer);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_gather_indices);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_query_block_rows);
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->attention_output_buffer);
+    if (output_topk) {
+      node.variantPack.inTensors.at(cp_input_index++) =
+          atb_speed::Utils::AtTensor2Tensor(dcp_inputs->topk_receive_buffer);
+    }
   }
 
   if (cp_size_ > 1 && is_prefill) {
