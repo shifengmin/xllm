@@ -31,6 +31,7 @@
 - 2026-08-12：第七次上下文压缩后重新阅读全文并复核分支与未提交文件。完整构建、聚焦测试、WORLD16 DP2/TP8/DCP2 长请求、语义和全 rank 审计结果保持有效；本轮继续闭环异步流与 tensor 生命周期审查，并使用同一 DCP2 工作负载量化优化前后 host metadata 开销，所有门禁通过后再提交第一轮 `perf:` 优化。
 - 2026-08-12：第八次上下文压缩后重新阅读全文并复核工作区及子 agent 状态。A/B profile 已完成，prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`；最终代码已移除临时打点并包含 `EMPTY` 占位输入的 dummy metadata 修复。当前由 build agent 执行最终完整 NPU 构建，主 agent 同步完成最终 diff 审查，构建通过后再由 test agent 执行最终聚焦测试、WORLD16 语义回归和全 rank/设备释放审计。
 - 2026-08-12：第九次上下文压缩后重新阅读全文并复核最终构建、功能、语义、性能和提交状态。原验收项均已完成；用户新增要求是在相同单机 DP2/TP8 拓扑与相同 decode 工作负载下对比开启 DCP2 和关闭 DCP（DCP1）的 TPOT，当前交由既有测试 agent 执行，完成后补记原始日志、统计口径和结论。
+- 2026-08-12：第十次上下文压缩后重新阅读全文并复核 DCP1/DCP2 TPOT、最终提交和工作区。DCP2 的 rank 0/device 0 `msprof` 动态采集与导出已完成；本轮按有效 decode layer invocation 归一化设备算子和 DCP 通信，拆解 DCP2 的 slot mapping、KV broadcast 及 owner/non-owner 搬运开销，并以无 profiler 的 DCP1/DCP2 TPOT A/B 作为端到端边界。
 
 ### 1. 仓库与机器预检
 
@@ -129,6 +130,25 @@
     - DCP1 原始请求和服务端指标分别为 `tpot_dcp_ab_dcp1_measured_requests.jsonl`、`tpot_dcp_ab_long_dcp1_measured_requests.jsonl`、`tpot_dcp_ab_dcp1_short_server_metrics.log`、`tpot_dcp_ab_dcp1_long_server_metrics.log`；DCP2 对应文件使用相同文件名并将 `dcp1` 替换为 `dcp2`，均位于 `build/dcp-kv-validation/command-logs/`。
     - 两侧服务窗口全 rank 新增 `ERROR/FATAL/Traceback` 均为 0。停止后两侧均为 `ALIVE_RANKS=0/16`、关联进程 0，两个 master 地址的匹配进程为 0，`npu-smi` process table 显示所有 NPU 均无运行进程。
 
+23. DCP2 `msprof` 动态采集完成并拆解设备侧 overhead。采集对象为 rank 0/device 0，配置与最终 DCP2 长 prompt 测试一致；明确有效请求为 `2504 prompt + 256 completion`、HTTP 200，响应记录在 `msprof_dcp2_profiled_request_valid.json`。原始 profile 位于 `build/dcp-kv-validation/msprof/dcp2_rank0/PROF_000001_20260812091014694_00136187GLDOGDQH/`，已导出 task、op、HCCL 和 communication analyzer 数据。
+    - `msprof` 使该请求的 TPOT 上升到 `103.7 ms`，而无 profiler 的同负载 DCP2 TPOT 均值为 `78.410 ms`；因此端到端 DCP 增量继续使用无 profiler A/B 的 `+20.550 ms/token`，`msprof` 只用于内部归因，不能把 profiled TPOT 当成正常性能。
+    - 导出窗口包含 `18,445` 次完整 DCP decode layer invocation；rank 0 其中 owner 层 `9,222` 次、non-owner 层 `9,223` 次。窗口首尾没有完整覆盖全部请求，故所有数据按 layer invocation 归一化，再按模型 `78` 层折算单 token 开销。
+
+    | DCP2 新增设备工作 | Profile 证据 | 折算单 token | 新增设备工作占比 |
+    | --- | --- | ---: | ---: |
+    | logical top-k 到 physical slot 映射 | 每层 5 个 `Gather32I32Kernel` 加 2 cast + mul + add + cast | `16.391 ms` | `70.56%` |
+    | 两次 DCP broadcast | 2048 个 INT32 top-k 与 `2048 x 576` BF16 selected KV | `3.807 ms` | `16.39%` |
+    | owner/non-owner KV pack/unpack | owner gather+concat、全层 copy、non-owner split+scatter | `3.033 ms` | `13.06%` |
+    | 合计 | 仅统计源码与调用数可严格识别的 DCP2 新增设备工作 | `23.231 ms` | `100%` |
+
+    - 最大单项是 block-table 行展开。当前每层先把一个 query 的 block-table row 从 `[1, num_blocks]` 按 2048 个 top-k entry 重复 gather 成 `[2048, num_blocks]`，再执行一次 batched gather 得到 physical block。profile 中 `num_blocks=20/21/22` 的行展开单次分别约 `79.414/156.406/156.313 us`；按窗口分布折算，行展开约 `11.246 ms/token`，后续 physical-block gather 约 `1.639 ms/token`。两项合计 `12.885 ms/token`，约为无 profiler DCP2-DCP1 长 prompt TPOT 差值的 `62.7%`。
+    - slot mapping 的其余开销为：两个 logical-position LUT gather 约 `2.065 ms/token`，top-k compact gather 约 `0.902 ms/token`，int32/fp32 cast 及 mul/add 约 `0.538 ms/token`。整个 mapping 链约 `16.391 ms/token`，是 DCP2 的首要瓶颈。
+    - DCP 专属通信不是 profile 中累计更大的 reduce-scatter/all-gather；那些属于原有 attention/FFN TP 路径。与源码 `ATTN_DECODE_DCP` 严格对应的是 group size 2 的两次 `hcom_broadcast_`：top-k payload 为 `8 KiB/layer`，约 `0.687 ms/token`；selected KV payload 为 `2.25 MiB/layer`，约 `3.120 ms/token`。通信与后续 attention 存在数据依赖并在同一执行序列中，当前没有可利用的关键路径重叠。
+    - owner/non-owner 搬运合计约 `3.033 ms/token`：owner 的两次 cache gather 和 concat 约 `0.992 ms/token`，top-k 与 selected-cache 的全层 copy 约 `0.924 ms/token`，non-owner split 和 scratch scatter 约 `1.117 ms/token`。
+    - 上述新增设备工作合计略高于无 profiler 的净 TPOT 差值，是因为 DCP2 同时让 non-owner 跳过了 layer-local indexer/top-k 计算，存在抵消收益；此外 `msprof` 自身显著扰动执行时延。profile 中 `LightningIndexer` 只有约一半 layer invocation，验证了 owner-only 计算路径。
+    - 已优化的 host metadata 不是当前主要矛盾：decode metadata 直接计时均值仅 `137.564 us/step`，相比 `20.550 ms/token` 的 DCP2 净增量不足 `0.7%`。
+    - 优化顺序：第一优先级是消除 `[batch, num_blocks] -> [packed_topk, num_blocks]` 的 block-table 行展开，可用 flattened block-table gather 加 forward 前准备的 row base offset，或用单个 NPU kernel 融合 logical block/offset/physical slot 解析；第二优先级是进一步融合 top-k compact、两个 LUT gather 和 slot arithmetic；第三优先级才是压缩 selected-KV broadcast payload或融合 gather/copy/split/scatter。源码确认每层 top-k 由该层 indexer 生成，因此不能把整个 slot 解析错误地前移到模型 forward 之前，只有与 layer 无关的 row-base 等静态 metadata 可以前移。
+
 ## 上下文恢复检查点
 
-上下文压缩后从本节恢复：全部目标已完成。完整 NPU 构建成功，两组聚焦测试分别 11/11、12/12 通过；单机 WORLD=16、DP=2、attention TP=8、DCP=2 完成真实长请求和语义回归，全 rank 服务期异常为 0，停止后所有进程和 NPU context 均已释放。DCP 关闭基线与 DCP2 的 `Paris`、`107` 和 KV cache/prefill/decode 技术结论语义一致。第一轮 host metadata A/B profile 量化出 prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`，代码审查已闭环并修复 `EMPTY` 输入边界问题；最终优化提交为 `cb2e88bb6`，构建与验证修复提交为 `702f1cd23`、`d3718eb59`。补充 TPOT A/B 表明，在相同双并发 256-token decode 工作负载下，DCP2 相对 DCP1 的短/长 prompt 平均 TPOT 分别增加 `27.22%`/`35.52%`，该结果与 DCP 扩容功能定位不冲突。
+上下文压缩后从本节恢复：构建、功能、语义、资源释放和第一轮 host metadata 优化均已完成；最终优化提交为 `cb2e88bb6`，构建与验证修复提交为 `702f1cd23`、`d3718eb59`。DCP1/DCP2 TPOT A/B 表明短/长 prompt 平均 TPOT 分别增加 `27.22%`/`35.52%`。最新 DCP2 `msprof` 拆解显示，新增设备工作约 `23.231 ms/token`：slot mapping `16.391 ms`、两次 broadcast `3.807 ms`、owner/non-owner KV pack/unpack `3.033 ms`；其中 block-table 行展开与后续 physical-block gather 合计约 `12.885 ms/token`，是下一轮优化的第一目标。profile 只用于归因，端到端收益必须继续用无 profiler 的相同负载 A/B 验证。
