@@ -30,6 +30,7 @@
 - 2026-08-12：第六次上下文压缩后重新阅读全文并复核未提交文件。第一轮优化的构建和功能冻结结果保持有效，当前仍未把功能通过等同于性能优化完成；继续分块审查全部调用链，并以相同 DCP2 配置量化优化前后 host metadata 开销，完成后再形成独立 `perf:` 提交。
 - 2026-08-12：第七次上下文压缩后重新阅读全文并复核分支与未提交文件。完整构建、聚焦测试、WORLD16 DP2/TP8/DCP2 长请求、语义和全 rank 审计结果保持有效；本轮继续闭环异步流与 tensor 生命周期审查，并使用同一 DCP2 工作负载量化优化前后 host metadata 开销，所有门禁通过后再提交第一轮 `perf:` 优化。
 - 2026-08-12：第八次上下文压缩后重新阅读全文并复核工作区及子 agent 状态。A/B profile 已完成，prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`；最终代码已移除临时打点并包含 `EMPTY` 占位输入的 dummy metadata 修复。当前由 build agent 执行最终完整 NPU 构建，主 agent 同步完成最终 diff 审查，构建通过后再由 test agent 执行最终聚焦测试、WORLD16 语义回归和全 rank/设备释放审计。
+- 2026-08-12：第九次上下文压缩后重新阅读全文并复核最终构建、功能、语义、性能和提交状态。原验收项均已完成；用户新增要求是在相同单机 DP2/TP8 拓扑与相同 decode 工作负载下对比开启 DCP2 和关闭 DCP（DCP1）的 TPOT，当前交由既有测试 agent 执行，完成后补记原始日志、统计口径和结论。
 
 ### 1. 仓库与机器预检
 
@@ -45,6 +46,7 @@
 - [x] 停止测试进程并确认设备释放。
 - [x] Review 并 profile host 侧 metadata 准备瓶颈。
 - [x] 优化 metadata 准备，回归构建和功能并量化收益。
+- [x] 使用相同 decode 工作负载对比开启与关闭 DCP 的 TPOT。
 
 ## 问题记录
 
@@ -114,6 +116,19 @@
     - 服务窗口全 16 rank 新增 `ERROR/FATAL/traceback` 为 0。停机脚本因 `/proc/56334/cmdline` 消失竞态返回 1，随后只按最终 binary 路径和 `--master_node_addr=11.87.191.98:22998` 精确执行 TERM/KILL；最终 `ALIVE_RANKS=0/16`、关联进程为 0、匹配进程为 0、NPU process table 全空且 16 卡 HBM 回到空闲基线，记录于 `perf_round1_final_review_cleanup_note.log`。
     - 优化源码提交为 `cb2e88bb6 perf: prepare shared dcp metadata before forward.`；pre-commit clang-format 检查通过。
 
+22. DCP 开关 TPOT A/B 已完成。两侧使用同一最终二进制 SHA-256 `282bee5d822cea28c49a71d06efe9eeee9ec72e06356fe08ace1635df7367d19`，均为 WORLD16、DP2、attention TP8、ATB eager、graph=false、schedule-overlap=false、prefix-cache=false；唯一功能差异是开启侧使用 `DCP_SIZE=2`、layerwise=true，关闭侧使用 `DCP_SIZE=1`、layerwise=false。每档负载先执行 1 组双并发 warmup，再执行 5 组双并发正式请求，共 10 个有效样本；请求均为 `temperature=0`、`max_tokens=256`，全部 HTTP 200、实际生成 256 tokens，并使用服务端 `(total_latency - ttft) / (generated_tokens - 1)` 的 `avg tpot` 作为主口径。p95 使用 nearest-rank 定义。
+
+    | Prompt tokens | 配置 | 样本数 | TPOT mean | TPOT p50 | TPOT p95 | DCP2 相对 DCP1 |
+    | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+    | 26 | DCP1 / layerwise=false | 10 | `53.960 ms` | `54.400 ms` | `56.700 ms` | 基线 |
+    | 26 | DCP2 / layerwise=true | 10 | `68.650 ms` | `68.100 ms` | `71.400 ms` | `+14.690 ms` / `+27.22%` |
+    | 2504 | DCP1 / layerwise=false | 10 | `57.860 ms` | `57.750 ms` | `62.400 ms` | 基线 |
+    | 2504 | DCP2 / layerwise=true | 10 | `78.410 ms` | `78.900 ms` | `82.300 ms` | `+20.550 ms` / `+35.52%` |
+
+    - 结果表明，在当前单机 DP2/TP8、双并发、256-token decode 工作负载下，开启 DCP2 没有降低 TPOT，反而因额外 KV 分片通信与同步使短/长 prompt 的平均 TPOT 分别增加 `27.22%`/`35.52%`。DCP 的主要收益是提高每个 attention TP group 的有效 KV 容量，不能将前述 host metadata 开销下降直接解释为 DCP 端到端 TPOT 收益。
+    - DCP1 原始请求和服务端指标分别为 `tpot_dcp_ab_dcp1_measured_requests.jsonl`、`tpot_dcp_ab_long_dcp1_measured_requests.jsonl`、`tpot_dcp_ab_dcp1_short_server_metrics.log`、`tpot_dcp_ab_dcp1_long_server_metrics.log`；DCP2 对应文件使用相同文件名并将 `dcp1` 替换为 `dcp2`，均位于 `build/dcp-kv-validation/command-logs/`。
+    - 两侧服务窗口全 rank 新增 `ERROR/FATAL/Traceback` 均为 0。停止后两侧均为 `ALIVE_RANKS=0/16`、关联进程 0，两个 master 地址的匹配进程为 0，`npu-smi` process table 显示所有 NPU 均无运行进程。
+
 ## 上下文恢复检查点
 
-上下文压缩后从本节恢复：全部目标已完成。完整 NPU 构建成功，两组聚焦测试分别 11/11、12/12 通过；单机 WORLD=16、DP=2、attention TP=8、DCP=2 完成真实长请求和语义回归，全 rank 服务期异常为 0，停止后所有进程和 NPU context 均已释放。DCP 关闭基线与 DCP2 的 `Paris`、`107` 和 KV cache/prefill/decode 技术结论语义一致。第一轮 host metadata A/B profile 量化出 prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`，代码审查已闭环并修复 `EMPTY` 输入边界问题；最终优化提交为 `cb2e88bb6`，构建与验证修复提交为 `702f1cd23`、`d3718eb59`。
+上下文压缩后从本节恢复：全部目标已完成。完整 NPU 构建成功，两组聚焦测试分别 11/11、12/12 通过；单机 WORLD=16、DP=2、attention TP=8、DCP=2 完成真实长请求和语义回归，全 rank 服务期异常为 0，停止后所有进程和 NPU context 均已释放。DCP 关闭基线与 DCP2 的 `Paris`、`107` 和 KV cache/prefill/decode 技术结论语义一致。第一轮 host metadata A/B profile 量化出 prefill/decode metadata 均值分别减少 `99.923%`/`99.865%`，代码审查已闭环并修复 `EMPTY` 输入边界问题；最终优化提交为 `cb2e88bb6`，构建与验证修复提交为 `702f1cd23`、`d3718eb59`。补充 TPOT A/B 表明，在相同双并发 256-token decode 工作负载下，DCP2 相对 DCP1 的短/长 prompt 平均 TPOT 分别增加 `27.22%`/`35.52%`，该结果与 DCP 扩容功能定位不冲突。
