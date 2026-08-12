@@ -157,11 +157,17 @@ tilelang_register_runtime_kernel(
   WRAPPER_SRCS fused_sigmoid_gating_delta_rule_wrapper.cpp
 )
 
+tilelang_register_runtime_kernel(
+  NAME topk_logical_to_physical_slots
+  WRAPPER_SRCS topk_logical_to_physical_slots_wrapper.cpp
+)
+
 cc_library(
   NAME
     tilelang_kernels
   HDRS
     dispatch_registry.h
+    tilelang_atb_ops_api.h
     tilelang_ops_api.h
   SRCS
     ${TILELANG_KERNEL_SRCS}
@@ -188,3 +194,5 @@ target_link_libraries(tilelang_kernels
     m
     dl
 )
+
+target_link_libraries(xllm_atb_layers PUBLIC tilelang_kernels)

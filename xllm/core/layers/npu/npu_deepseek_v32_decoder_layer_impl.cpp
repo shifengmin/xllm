@@ -21,7 +21,6 @@ limitations under the License.
 #include <boost/algorithm/string.hpp>
 #include <cctype>
 #include <iostream>
-#include <limits>
 #include <numeric>
 #include <optional>
 #include <utility>
@@ -390,15 +389,6 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_, model_args, parallel_args, /*is_prefill=*/true);
   param_from_args(
       decode_param_, model_args, parallel_args, /*is_prefill=*/false);
-  if (decode_param_.enableDecodeDcpLayerOwner) {
-    CHECK_GT(model_args.max_position_embeddings(), 0);
-    CHECK_LE(model_args.max_position_embeddings(),
-             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
-    max_position_embeddings_ =
-        static_cast<int32_t>(model_args.max_position_embeddings());
-    decode_dcp_block_size_ = ::xllm::KVCacheConfig::get_instance().block_size();
-    CHECK_GT(decode_dcp_block_size_, 0);
-  }
   has_mtp_topk_fallback_ =
       skip_topk_ && model_args.index_share_for_mtp_iteration() &&
       model_args.model_type().find("_mtp") != std::string::npos;
@@ -444,20 +434,6 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_tensors(
   block_tables_placeholder_ =
       torch::zeros({1, 1}).to(torch::kInt32).to(device_);
   tensor_placeholder_ = torch::zeros({1}).to(options);
-
-  if (decode_param_.enableDecodeDcpLayerOwner) {
-    std::vector<int32_t> logical_block_lut(max_position_embeddings_);
-    std::vector<int32_t> block_offset_lut(max_position_embeddings_);
-    for (int32_t position = 0; position < max_position_embeddings_;
-         ++position) {
-      logical_block_lut[position] = position / decode_dcp_block_size_;
-      block_offset_lut[position] = position % decode_dcp_block_size_;
-    }
-    decode_dcp_logical_block_lut_ =
-        torch::tensor(logical_block_lut, torch::kInt32).to(device_);
-    decode_dcp_block_offset_lut_ =
-        torch::tensor(block_offset_lut, torch::kInt32).to(device_);
-  }
 
   expert_group_ = torch::arange(1024, torch::kInt32).to(device_);
   one_hot_ = torch::tensor({1}, torch::kInt32).to(device_);
@@ -621,6 +597,11 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
       parallel_args.enable_decode_dcp_layerwise_kv_cache();
   param.decodeDcpBlockSize = ::xllm::KVCacheConfig::get_instance().block_size();
   if (param.enableDecodeDcpLayerOwner) {
+    CHECK(param.decodeDcpBlockSize == 16 || param.decodeDcpBlockSize == 32 ||
+          param.decodeDcpBlockSize == 64 || param.decodeDcpBlockSize == 128 ||
+          param.decodeDcpBlockSize == 256)
+        << "Decode DCP fused slot mapping supports block_size in "
+        << "{16, 32, 64, 128, 256}, got " << param.decodeDcpBlockSize;
     CHECK_LE(param.index_topk, 2048)
         << "Decode DCP LightningIndexer selected count must not exceed 2048.";
   }
@@ -1465,10 +1446,6 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->selected_cache_buffer);
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->topk_buffer);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(decode_dcp_logical_block_lut_);
-    node.variantPack.inTensors.at(cp_input_index++) =
-        atb_speed::Utils::AtTensor2Tensor(decode_dcp_block_offset_lut_);
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(dcp_inputs->packed_gather_indices);
     node.variantPack.inTensors.at(cp_input_index++) =

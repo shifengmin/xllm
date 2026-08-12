@@ -174,8 +174,6 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   int32_t v_head_dim_;
   int32_t kv_lora_rank_;
   int32_t qk_rope_head_dim_;
-  int32_t max_position_embeddings_ = 0;
-  int32_t decode_dcp_block_size_ = 0;
   bool skip_topk_ = false;
   bool output_topk_ = false;
   bool has_mtp_topk_fallback_ = false;
@@ -222,8 +220,6 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   torch::Tensor tensor_placeholder_;
   torch::Tensor slot_tensor_placeholder_;
   torch::Tensor int_tensor_placeholder_;
-  torch::Tensor decode_dcp_logical_block_lut_;
-  torch::Tensor decode_dcp_block_offset_lut_;
   torch::Tensor decode_attn_mask_;
   torch::Tensor expert_group_;
   torch::Tensor one_hot_;

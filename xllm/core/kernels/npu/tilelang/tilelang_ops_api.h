@@ -25,6 +25,16 @@ limitations under the License.
 namespace xllm::kernel::npu::tilelang {
 
 // Public TileLang kernel APIs exported to the xLLM NPU runtime.
+
+// Map compacted logical top-k positions to physical paged-cache slots.
+// All inputs and the output use int32. The top-k tensor may have any
+// contiguous shape and is addressed through packed_gather_indices.
+torch::Tensor topk_logical_to_physical_slots(
+    const torch::Tensor& topk_positions,
+    const torch::Tensor& block_tables,
+    const torch::Tensor& packed_gather_indices,
+    const torch::Tensor& packed_query_block_rows,
+    int64_t block_size);
 //
 // Apply TileLang RoPE kernel in-place on a single input tensor.
 // Invalid inputs trigger CHECK failures.
