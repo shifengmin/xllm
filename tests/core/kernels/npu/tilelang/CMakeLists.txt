@@ -64,3 +64,18 @@ cc_test(
     glog::glog
     unified_dlog
 )
+
+cc_test(
+  NAME
+    topk_logical_to_physical_slots_wrapper_test
+  SRCS
+    topk_logical_to_physical_slots_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    xllm_atb_layers
+    atb
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)

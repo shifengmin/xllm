@@ -548,6 +548,10 @@ void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
         model_args.max_position_embeddings();
     CHECK_GT(index_topk, 0);
     CHECK_GT(max_position_embeddings, 0);
+    CHECK_LE(
+        query_count,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max()) / index_topk)
+        << "Decode DCP flattened top-k index exceeds int32 range.";
     std::vector<int32_t> valid_topk_counts(query_count);
     int64_t packed_key_count = 0;
     for (int32_t query_idx = 0; query_idx < execution_query_count;

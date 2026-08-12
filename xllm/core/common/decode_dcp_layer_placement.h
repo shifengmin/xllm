@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <cstdint>
+#include <limits>
 
 #include "common/types.h"
 
@@ -47,12 +48,10 @@ inline void validate_decode_dcp_layerwise_kv_cache_config(
       << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
 }
 
-// The decode DCP graph turns a logical top-k position into a physical cache
-// slot with ATB Elewise ops, which take floating point only, so the slot index
-// round-trips through fp32. That is exact while the value fits the 24-bit
-// mantissa; past it a slot would silently resolve to the wrong block instead of
-// failing, so the cache pool is capped here rather than at the first bad read.
-inline constexpr int64_t kDecodeDcpMaxExactSlotCount = 1LL << 24;
+// Fused decode DCP slot mapping uses int32 indices throughout. The largest
+// addressable cache therefore contains INT32_MAX + 1 slots, numbered from zero.
+inline constexpr int64_t kDecodeDcpMaxSlotCount =
+    static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
 
 inline void validate_decode_dcp_slot_addressing(int32_t decode_dcp_size,
                                                 int64_t n_blocks,
@@ -60,12 +59,12 @@ inline void validate_decode_dcp_slot_addressing(int32_t decode_dcp_size,
   if (decode_dcp_size <= 1) {
     return;
   }
-  CHECK_LE(n_blocks * block_size, kDecodeDcpMaxExactSlotCount)
-      << "Decode DCP resolves cache slots through an fp32 round-trip that is "
-         "only exact below "
-      << kDecodeDcpMaxExactSlotCount << " slots, but n_blocks=" << n_blocks
-      << " and block_size=" << block_size << " need " << n_blocks * block_size
-      << ".";
+  CHECK_GT(n_blocks, 0);
+  CHECK_GT(block_size, 0);
+  CHECK_LE(n_blocks, kDecodeDcpMaxSlotCount / block_size)
+      << "Decode DCP int32 slot addressing supports at most "
+      << kDecodeDcpMaxSlotCount << " slots, but n_blocks=" << n_blocks
+      << " and block_size=" << block_size << " exceed that limit.";
 }
 
 [[nodiscard]] inline bool resolve_decode_dcp_layerwise_kv_cache_enabled(
@@ -76,12 +75,8 @@ inline void validate_decode_dcp_slot_addressing(int32_t decode_dcp_size,
 
 class DecodeDcpLayerPlacement final {
  public:
-  DecodeDcpLayerPlacement(bool enabled,
-                          int32_t group_size,
-                          int32_t local_rank)
-      : enabled_(enabled),
-        group_size_(group_size),
-        local_rank_(local_rank) {
+  DecodeDcpLayerPlacement(bool enabled, int32_t group_size, int32_t local_rank)
+      : enabled_(enabled), group_size_(group_size), local_rank_(local_rank) {
     CHECK_GT(group_size_, 0) << "Decode DCP group size must be positive.";
     CHECK_GE(local_rank_, 0) << "Decode DCP local rank must be non-negative.";
     CHECK_LT(local_rank_, group_size_)

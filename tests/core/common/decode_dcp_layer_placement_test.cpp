@@ -41,19 +41,26 @@ TEST(DecodeDcpLayerPlacementTest, SlotAddressingIgnoresSingleRankDcp) {
                                           /*block_size=*/128));
 }
 
-TEST(DecodeDcpLayerPlacementTest, SlotAddressingAcceptsRepresentablePool) {
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingAcceptsInt32SlotRange) {
   EXPECT_NO_FATAL_FAILURE(validate_decode_dcp_slot_addressing(
       /*decode_dcp_size=*/2,
-      /*n_blocks=*/kDecodeDcpMaxExactSlotCount / 128,
+      /*n_blocks=*/kDecodeDcpMaxSlotCount / 128,
       /*block_size=*/128));
 }
 
-TEST(DecodeDcpLayerPlacementTest, SlotAddressingRejectsPoolBeyondFp32Mantissa) {
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingAcceptsBeyondFp32Mantissa) {
+  EXPECT_NO_FATAL_FAILURE(validate_decode_dcp_slot_addressing(
+      /*decode_dcp_size=*/2,
+      /*n_blocks=*/(1LL << 24) / 128 + 1,
+      /*block_size=*/128));
+}
+
+TEST(DecodeDcpLayerPlacementTest, SlotAddressingRejectsBeyondInt32Range) {
   EXPECT_DEATH(validate_decode_dcp_slot_addressing(
                    /*decode_dcp_size=*/2,
-                   /*n_blocks=*/kDecodeDcpMaxExactSlotCount / 128 + 1,
+                   /*n_blocks=*/kDecodeDcpMaxSlotCount / 128 + 1,
                    /*block_size=*/128),
-               "fp32 round-trip");
+               "int32 slot addressing");
 }
 
 #if defined(USE_NPU)
