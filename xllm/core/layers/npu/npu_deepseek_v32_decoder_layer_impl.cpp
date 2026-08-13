@@ -554,7 +554,7 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
 void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
     atb_speed::deepseekV2::DecoderLayerParam& param,
     const ModelArgs& args,
-    const ParallelArgs& parallel_args) {
+    const ParallelArgs& /*parallel_args*/) {
   param.qLoraRank = args.q_lora_rank();
   // NOTE: The operation in this conditional is theoretically compatible with
   // DeepSeek, but we add this specific check to ensure DeepSeek behavior
@@ -1071,7 +1071,8 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             output_topk_);
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "execute prefill layer fail, error code: " << st;
+                           << " execute decode layer failed, error code: "
+                           << st;
   } else {
     build_node_variant_pack(prefill_node_,
                             x,

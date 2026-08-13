@@ -99,4 +99,22 @@ TEST(TestMappingNPU, ToJsonUsesHcclBuffsizeEnv) {
   EXPECT_EQ(mlp_tp_buffer_size, 128);
 }
 
+TEST(TestMappingNPU, SplitsEachAttentionTpGroupContiguously) {
+  std::string rank_table_file;
+  MappingNPU::Options options = get_mapping_options();
+  options.layerwise_split_size(2);
+
+  MappingNPU rank_six_mapping(rank_table_file, 16, 6, options);
+  nlohmann::json rank_six_split = rank_six_mapping.to_json()["attnLayerwiseSplit"];
+  EXPECT_EQ(rank_six_split["groupId"].get<int32_t>(), 3);
+  EXPECT_EQ(rank_six_split["rank"].get<int32_t>(), 0);
+  EXPECT_EQ(rank_six_split["rankIds"], nlohmann::json::array({6, 7}));
+
+  MappingNPU rank_seven_mapping(rank_table_file, 16, 7, options);
+  nlohmann::json rank_seven_split = rank_seven_mapping.to_json()["attnLayerwiseSplit"];
+  EXPECT_EQ(rank_seven_split["groupId"].get<int32_t>(), 3);
+  EXPECT_EQ(rank_seven_split["rank"].get<int32_t>(), 1);
+  EXPECT_EQ(rank_seven_split["rankIds"], nlohmann::json::array({6, 7}));
+}
+
 }  // namespace xllm
