@@ -389,6 +389,10 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_, model_args, parallel_args, /*is_prefill=*/true);
   param_from_args(
       decode_param_, model_args, parallel_args, /*is_prefill=*/false);
+  if (prefill_param_.enableLayerwisePrefillHistory) {
+    prefill_no_history_param_ = prefill_param_;
+    prefill_no_history_param_.enableLayerwisePrefillHistory = false;
+  }
   has_mtp_topk_fallback_ =
       skip_topk_ && model_args.index_share_for_mtp_iteration() &&
       model_args.model_type().find("_mtp") != std::string::npos;
@@ -581,8 +585,24 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_attention_parameters(
   param.index_head_dim = args.index_head_dim();
   param.index_n_heads = args.index_n_heads();
   param.index_topk = args.index_topk();
+  CHECK_GT(param.index_topk, 0);
   param.skipTopk = skip_topk_;
   param.outputTopk = output_topk_;
+  const bool is_mtp_draft_model =
+      args.model_type().find("_mtp") != std::string::npos;
+  param.enableDecodeDcpLayerOwner = !param.isPrefill && !is_mtp_draft_model &&
+                                    parallel_args.decode_dcp_size() > 1;
+  // Prefill only needs the history exchange when the persistent cache is really
+  // sharded by layer owner; with a full cache on every rank the local history
+  // is already correct.
+  param.enableLayerwisePrefillHistory =
+      param.isPrefill && !is_mtp_draft_model &&
+      parallel_args.decode_dcp_size() > 1 &&
+      parallel_args.enable_decode_dcp_layerwise_kv_cache();
+  if (param.enableDecodeDcpLayerOwner) {
+    CHECK_LE(param.index_topk, 2048)
+        << "Decode DCP LightningIndexer selected count must not exceed 2048.";
+  }
 }
 
 void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
@@ -946,6 +966,10 @@ void NpuDeepseekV32DecoderLayerImpl::update_expert_weight() {
     atb_weight_tensors_[index] =
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[index]);
     prefill_node_.inTensors.at(index) = &atb_weight_tensors_[index];
+    if (prefill_param_.enableLayerwisePrefillHistory) {
+      prefill_no_history_node_.inTensors.at(index) =
+          &atb_weight_tensors_[index];
+    }
     decode_node_.inTensors.at(index) = &atb_weight_tensors_[index];
     if (has_mtp_topk_fallback_) {
       mtp_prefill_fallback_node_.inTensors.at(index) =
@@ -963,6 +987,10 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
   name_ = "deepseek_v2_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "DeepSeek_V2";
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
+  if (prefill_param_.enableLayerwisePrefillHistory) {
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(prefill_no_history_node_, prefill_no_history_param_));
+  }
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
   if (has_mtp_topk_fallback_) {
     CHECK_OPERATION_STATUS_RETURN(
@@ -1056,7 +1084,37 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
   atb::Status st;
   ModelInputParams& input_params_new =
       const_cast<ModelInputParams&>(input_params);
-  if (input_params_new.meta.batch_forward_type.is_decode()) {
+  const bool use_decode_dcp =
+      decode_param_.enableDecodeDcpLayerOwner &&
+      (input_params_new.meta.batch_forward_type.is_decode() ||
+       input_params_new.graph.use_expanded_decode_for_spec_verify_attention);
+  if (use_decode_dcp) {
+    const NpuDecodeDcpInput& dcp_inputs = input_params_new.npu_decode_dcp;
+    CHECK(dcp_inputs.attention_output_buffer.defined());
+    if (output_topk_) {
+      CHECK(dcp_inputs.topk_receive_buffer.defined());
+    }
+    if (input_params_new.graph.use_expanded_decode_for_spec_verify_attention) {
+      CHECK(dcp_inputs.expanded_query_cu_seq_lens.defined());
+    }
+    build_node_variant_pack(decode_node_,
+                            x,
+                            cos_pos,
+                            sin_pos,
+                            attn_mask,
+                            kv_cache,
+                            input_params_new,
+                            false,
+                            shared_topk_indices,
+                            output_topk_indices,
+                            skip_topk_,
+                            output_topk_,
+                            &dcp_inputs);
+    st = execute_node(decode_node_, node_id, event, event_flag);
+    LOG_IF(FATAL, st != 0) << model_name_
+                           << " execute decode DCP layer failed, error code: "
+                           << st;
+  } else if (input_params_new.meta.batch_forward_type.is_decode()) {
     build_node_variant_pack(decode_node_,
                             x,
                             cos_pos,
@@ -1071,9 +1129,23 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             output_topk_);
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "execute prefill layer fail, error code: " << st;
+                           << " execute decode layer failed, error code: "
+                           << st;
   } else {
-    build_node_variant_pack(prefill_node_,
+    atb_speed::Model::Node* prefill_node = &prefill_node_;
+    const NpuLayerwisePrefillInput* prefill_inputs = nullptr;
+    if (prefill_param_.enableLayerwisePrefillHistory) {
+      const NpuLayerwisePrefillInput& prepared_inputs =
+          input_params_new.npu_layerwise_prefill;
+      if (prepared_inputs.history_slots.defined()) {
+        CHECK(prepared_inputs.history_kv_buffer.defined());
+        CHECK(prepared_inputs.history_indexer_buffer.defined());
+        prefill_inputs = &prepared_inputs;
+      } else {
+        prefill_node = &prefill_no_history_node_;
+      }
+    }
+    build_node_variant_pack(*prefill_node,
                             x,
                             cos_pos,
                             sin_pos,
@@ -1084,8 +1156,10 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             shared_topk_indices,
                             output_topk_indices,
                             skip_topk_,
-                            output_topk_);
-    st = execute_node(prefill_node_, node_id, event, event_flag);
+                            output_topk_,
+                            /*dcp_inputs=*/nullptr,
+                            prefill_inputs);
+    st = execute_node(*prefill_node, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
   }
@@ -1158,7 +1232,9 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     const torch::Tensor& shared_topk_indices,
     torch::Tensor* output_topk_indices,
     bool skip_topk,
-    bool output_topk) {
+    bool output_topk,
+    const NpuDecodeDcpInput* dcp_inputs,
+    const NpuLayerwisePrefillInput* prefill_inputs) {
   internal_tensor_ = atb_speed::Utils::AtTensor2Tensor(x);
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
@@ -1167,6 +1243,9 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   const CpAttentionMeta& cp_attention_meta =
       input_params.parallel.cp_plan.attention_meta();
   const bool use_cp_ep_padding = (cp_size_ > 1 && is_prefill);
+  const bool use_expanded_decode_dcp =
+      dcp_inputs != nullptr &&
+      input_params.graph.use_expanded_decode_for_spec_verify_attention;
 
   if (dp_size_ <= 1 && ep_size_ <= 1 || cp_size_ > 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
@@ -1197,9 +1276,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
-  if ((!input_params.attention.device.block_tables.defined() ||
-       input_params.attention.device.block_tables.storage().data() ==
-           nullptr)) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.graph.expanded_kv_seq_lens);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
+        const_cast<int32_t*>(
+            input_params.graph.expanded_kv_seq_lens_vec.data());
+  } else if ((!input_params.attention.device.block_tables.defined() ||
+              input_params.attention.device.block_tables.storage().data() ==
+                  nullptr)) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
@@ -1221,8 +1307,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
 
-  if (!input_params.attention.device.block_tables.defined() ||
-      input_params.attention.device.block_tables.storage().data() == nullptr) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.graph.expanded_block_tables);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.new_cache_slots);
+  } else if (!input_params.attention.device.block_tables.defined() ||
+             input_params.attention.device.block_tables.storage().data() ==
+                 nullptr) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
         atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
@@ -1328,7 +1422,11 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   const bool use_q_cu_seq_lens =
       !empty_batch && input_params.attention.device.q_cu_seq_lens.defined() &&
       input_params.attention.device.q_cu_seq_lens.numel() != 0;
-  if (use_q_cu_seq_lens) {
+  if (use_expanded_decode_dcp) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
+        atb_speed::Utils::AtTensor2Tensor(
+            dcp_inputs->expanded_query_cu_seq_lens);
+  } else if (use_q_cu_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.q_cu_seq_lens);
@@ -1343,6 +1441,25 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
         << "DSA top-k sharing requires previous top-k indices.";
     node.variantPack.inTensors.at(cp_input_index++) =
         atb_speed::Utils::AtTensor2Tensor(shared_topk_indices);
+  }
+
+  if (prefill_inputs != nullptr) {
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_inputs->history_slots);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_inputs->history_kv_buffer);
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(
+            prefill_inputs->history_indexer_buffer);
+  }
+
+  if (dcp_inputs != nullptr) {
+    node.variantPack.inTensors.at(cp_input_index++) =
+        atb_speed::Utils::AtTensor2Tensor(dcp_inputs->attention_output_buffer);
+    if (output_topk) {
+      node.variantPack.inTensors.at(cp_input_index++) =
+          atb_speed::Utils::AtTensor2Tensor(dcp_inputs->topk_receive_buffer);
+    }
   }
 
   if (cp_size_ > 1 && is_prefill) {

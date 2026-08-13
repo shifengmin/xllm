@@ -44,6 +44,8 @@ struct KVCacheEstimateOptions {
   bool is_draft_engine = false;
   bool enable_prefix_cache = false;
   bool enable_rdma_scale_padding = false;
+  bool enable_decode_dcp_layerwise_kv_cache = false;
+  int32_t decode_dcp_size = 1;
   const ModelArgs* draft_model_args = nullptr;
   const KVCacheEstimateOptions* draft_options = nullptr;
 };
@@ -60,6 +62,16 @@ struct Dsv4KVCacheEstimateCost {
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers);
+
+// Common block count across a decode DCP group. Each rank pays for the layers
+// it owns plus one shared scratch layer of the same per-block cost, so the
+// group settles on the smallest count any rank can afford.
+int64_t estimate_decode_dcp_layerwise_block_count(
+    const ModelArgs& model_args,
+    int32_t decode_dcp_size,
+    const KVCacheCapacity& kv_cache_cap,
+    int64_t available_bytes,
+    int64_t additional_block_bytes);
 
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,

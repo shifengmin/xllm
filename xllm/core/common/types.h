@@ -226,6 +226,8 @@ struct InstanceInfo {
   std::vector<std::string> addrs;
   int32_t dp_size = 1;
   int32_t kv_split_size = 1;
+  bool enable_decode_dcp_layerwise_kv_cache = false;
+  int32_t decode_dcp_size = 1;
   // transfer listen ports
   std::vector<uint16_t> ports;
   // ttft profiling data

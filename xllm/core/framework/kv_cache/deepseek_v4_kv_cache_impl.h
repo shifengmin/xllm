@@ -76,6 +76,12 @@ class DeepSeekV4KVCacheImpl final : public KVCacheImpl {
   void swap_blocks(torch::Tensor& src_tensor,
                    torch::Tensor& dst_tensor) override;
 
+  std::unique_ptr<KVCacheImpl> create_view() const override {
+    LOG(FATAL) << "DeepSeek V4 KV cache does not support layerwise shared "
+                  "views.";
+    return nullptr;
+  }
+
  private:
   torch::Tensor key_cache_;
   torch::Tensor index_cache_;

@@ -200,4 +200,9 @@ void KVCacheImpl::swap_blocks(torch::Tensor& src_tensor,
   }
 }
 
+std::unique_ptr<KVCacheImpl> KVCacheImpl::create_view() const {
+  return std::make_unique<KVCacheImpl>(
+      KVCacheTensors{key_cache_, value_cache_});
+}
+
 }  // namespace xllm

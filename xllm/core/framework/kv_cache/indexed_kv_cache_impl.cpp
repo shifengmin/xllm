@@ -219,4 +219,13 @@ void IndexedKVCacheImpl::swap_blocks(torch::Tensor& src_tensor,
   }
 }
 
+std::unique_ptr<KVCacheImpl> IndexedKVCacheImpl::create_view() const {
+  return std::make_unique<IndexedKVCacheImpl>(
+      IndexedKVCacheTensors{KVCacheTensors{key_cache_, value_cache_},
+                            index_cache_,
+                            index_cache_scale_,
+                            key_cache_scale_,
+                            value_cache_scale_});
+}
+
 }  // namespace xllm

@@ -68,7 +68,8 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
                                 ModelInputParams& input_params,
                                 aclrtEvent* event,
                                 std::atomic<bool>* event_flag) {
-    if (input_params.block_copy.src_block_indices.numel() > 0) {
+    if (kv_cache.owns_layer_cache() &&
+        input_params.block_copy.src_block_indices.numel() > 0) {
       block_copy_(kv_cache.get_k_cache(),
                   kv_cache.get_v_cache(),
                   input_params.block_copy.src_block_indices,
