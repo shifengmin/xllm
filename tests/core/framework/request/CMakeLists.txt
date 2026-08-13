@@ -97,3 +97,14 @@ target_link_libraries(sequence_mtp_bootstrap_test
 target_link_options(sequence_mtp_bootstrap_test
                     PRIVATE
                     $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    request_decode_add_new_retry_test
+  SRCS
+    request_decode_add_new_retry_test.cpp
+  DEPS
+    :request
+    GTest::gtest
+    GTest::gtest_main
+)

@@ -51,7 +51,9 @@ class DisaggPDConfig final {
          "instance_role",
          "kv_cache_transfer_type",
          "kv_cache_transfer_mode",
-         "transfer_listen_port"}};
+         "transfer_listen_port",
+         "disagg_pd_add_new_max_retries",
+         "disagg_pd_add_new_retry_interval_ms"}};
     return kOptionCategory;
   }
 
@@ -70,6 +72,10 @@ class DisaggPDConfig final {
   PROPERTY(int32_t, transfer_listen_port) = 26000;
 
   PROPERTY(bool, kv_push_dst_rotate) = false;
+
+  PROPERTY(int32_t, disagg_pd_add_new_max_retries) = -1;
+
+  PROPERTY(int32_t, disagg_pd_add_new_retry_interval_ms) = 1000;
 };
 
 }  // namespace xllm

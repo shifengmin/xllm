@@ -163,6 +163,22 @@ class Request : public RequestBase {
 
   size_t num_prefix_cache_tokens() const { return num_prefix_cache_tokens_; }
 
+  // Prefill→Decode AddNew failure tracking (retry storm control).
+  int32_t decode_add_new_retries() const { return decode_add_new_retries_; }
+
+  absl::Time decode_add_new_next_retry_time() const {
+    return decode_add_new_next_retry_time_;
+  }
+
+  bool can_decode_add_new_retry(absl::Time now) const {
+    return now >= decode_add_new_next_retry_time_;
+  }
+
+  // Count one failed AddNew and schedule the earliest next attempt.
+  // interval_ms <= 0 means retry immediately (still subject to max_retries;
+  // max_retries < 0 means unlimited).
+  void bump_decode_add_new_retry(int32_t interval_ms);
+
  private:
   RequestState state_;
   std::shared_ptr<RequestFailureState> failure_state_ =
@@ -183,6 +199,12 @@ class Request : public RequestBase {
   bool starved_ = false;
 
   size_t num_prefix_cache_tokens_ = 0;
+
+  // Number of Decode AddNew non-200 responses for this request.
+  int32_t decode_add_new_retries_ = 0;
+
+  // Earliest time Prefill may attempt AddNew again. UnixEpoch => immediate.
+  absl::Time decode_add_new_next_retry_time_ = absl::UnixEpoch();
 
   void create_sequences_group();
 };

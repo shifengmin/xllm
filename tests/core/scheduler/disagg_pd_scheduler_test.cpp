@@ -323,4 +323,62 @@ TEST(DisaggPDSchedulerTest, StructuredOutputFieldsPreserveWireTags) {
   EXPECT_EQ(proto::DisaggRequest::kJsonReasoningEnabledFieldNumber, 41);
 }
 
+TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
+  EXPECT_FALSE(pd_prompt_exceeds_block_capacity(
+      /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
+}
+
+TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
+  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/404));
+  EXPECT_TRUE(
+      decode_add_new_failure_is_terminal(kDecodeAddNewPromptTooLongStatusCode));
+  EXPECT_FALSE(decode_add_new_failure_is_terminal(/*status_code=*/500));
+}
+
+TEST(DisaggPDSchedulerTest, DecodeAddNewMaxRetriesCountsRetryAttempts) {
+  EXPECT_FALSE(
+      decode_add_new_should_retry(/*failed_attempts=*/1, /*max_retries=*/0));
+  EXPECT_TRUE(
+      decode_add_new_should_retry(/*failed_attempts=*/1, /*max_retries=*/1));
+  EXPECT_TRUE(
+      decode_add_new_should_retry(/*failed_attempts=*/3, /*max_retries=*/3));
+  EXPECT_FALSE(
+      decode_add_new_should_retry(/*failed_attempts=*/4, /*max_retries=*/3));
+  EXPECT_TRUE(
+      decode_add_new_should_retry(/*failed_attempts=*/100, /*max_retries=*/-1));
+}
+
+TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
+  EXPECT_TRUE(pd_prompt_exceeds_block_capacity(
+      /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
+}
+
+TEST(DisaggPDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  std::shared_ptr<Request> holder = make_request({1, 2, 3, 4, 5, 6});
+  ASSERT_TRUE(block_manager->try_allocate(holder->sequences()[0].get()));
+  std::shared_ptr<Request> request = make_request({7, 8});
+  Sequence* sequence = request->sequences()[0].get();
+
+  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_FALSE(scheduler.prompt_exceeds_block_capacity(sequence));
+
+  block_manager->deallocate(holder.get());
+}
+
+TEST(DisaggPDSchedulerTest, OversizedDecodePromptIsPermanent) {
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4, 5, 6, 7});
+  Sequence* sequence = request->sequences()[0].get();
+
+  EXPECT_FALSE(scheduler.try_allocate(sequence));
+  EXPECT_TRUE(scheduler.prompt_exceeds_block_capacity(sequence));
+
+  block_manager->deallocate(request.get());
+}
+
 }  // namespace xllm

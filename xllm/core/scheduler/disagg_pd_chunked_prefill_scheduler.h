@@ -59,8 +59,8 @@ size_t pd_prefill_remaining_blocks(size_t num_prompt_tokens,
 // near-capacity prompts: it stops new starts from outrunning completions, which
 // is the actual cause of the hold-and-wait deadlock (the PD prefill hang). The
 // caller bypasses this check for an already in-flight request (must continue)
-// and for the sole request in flight (so a lone oversized prompt reaches the
-// exceeds_block_capacity failure path instead of hanging).
+// and for one fresh probe when nobody owns KV blocks (so a queue of oversized
+// prompts reaches the exceeds_block_capacity failure path instead of hanging).
 bool pd_prefill_footprint_fits(size_t reserved_blocks,
                                size_t request_full_blocks,
                                size_t total_blocks);
@@ -83,6 +83,7 @@ class DisaggPDChunkedPrefillScheduler final : public DisaggPDScheduler {
                                 size_t& remaining_seq_budget,
                                 size_t total_blocks,
                                 size_t& reserved_blocks,
+                                bool& fresh_probe_used,
                                 std::vector<std::shared_ptr<Request>>& done);
   void update_metrics();
 };

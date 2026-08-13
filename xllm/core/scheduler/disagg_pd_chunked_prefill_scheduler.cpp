@@ -165,6 +165,7 @@ void DisaggPDChunkedPrefillScheduler::schedule_waiting_prefill(
     size_t& remaining_seq_budget,
     size_t total_blocks,
     size_t& reserved_blocks,
+    bool& fresh_probe_used,
     std::vector<std::shared_ptr<Request>>& done) {
   // Full-footprint admission. `reserved_blocks` (supplied by the caller and
   // SHARED across the online and offline queues) is the complete footprint
@@ -208,24 +209,27 @@ void DisaggPDChunkedPrefillScheduler::schedule_waiting_prefill(
     // already counted in reserved_blocks, and evicting its partial KV is a
     // preemption decision made elsewhere.
     const bool is_in_flight = held_blocks > 0;
-    // The sole fresh request in the whole system is admitted so that an
-    // oversized prompt (footprint > total) reaches the exceeds_block_capacity
-    // failure path below instead of being deferred forever.
-    const bool is_sole_fresh_request =
-        running_sequences_.empty() && deferred.empty() &&
-        (waiting_priority_queue_->size() +
-         waiting_priority_queue_offline_->size()) == 1;
     // Complete footprint of the whole prompt, independent of how much is held.
     const size_t full_blocks = pd_prefill_remaining_blocks(
         sequence->num_prompt_tokens(), /*held_blocks=*/0, block_size);
+    bool can_probe_fresh_request = false;
     // Every other fresh request starts only if the whole reserved set plus its
-    // complete footprint still fits total capacity.
-    if (!is_in_flight && !is_sole_fresh_request &&
-        !pd_prefill_footprint_fits(
-            reserved_blocks, full_blocks, total_blocks)) {
-      queue.pop_top();
-      deferred.emplace_back(request);
-      continue;
+    // complete footprint still fits total capacity. When nobody owns KV, admit
+    // one probe so a queue of oversized prompts can fail cleanly instead of
+    // waiting forever.
+    if (!is_in_flight) {
+      const bool footprint_fits =
+          pd_prefill_footprint_fits(reserved_blocks, full_blocks, total_blocks);
+      can_probe_fresh_request = !footprint_fits && reserved_blocks == 0 &&
+                                running_sequences_.empty() && !fresh_probe_used;
+      if (!footprint_fits && !can_probe_fresh_request) {
+        queue.pop_top();
+        deferred.emplace_back(request);
+        continue;
+      }
+      if (can_probe_fresh_request) {
+        fresh_probe_used = true;
+      }
     }
 
     size_t actual_tokens = 0;
@@ -365,17 +369,20 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
   // starts cannot each reserve the full capacity independently.
   const size_t total_blocks =
       static_cast<size_t>(kv_cache_manager_->num_blocks());
+  bool fresh_probe_used = false;
   schedule_waiting_prefill(*waiting_priority_queue_,
                            remaining_token_budget,
                            remaining_seq_budget,
                            total_blocks,
                            reserved_blocks,
+                           fresh_probe_used,
                            done);
   schedule_waiting_prefill(*waiting_priority_queue_offline_,
                            remaining_token_budget,
                            remaining_seq_budget,
                            total_blocks,
                            reserved_blocks,
+                           fresh_probe_used,
                            done);
 
   if (!done.empty()) {

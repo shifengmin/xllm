@@ -21,8 +21,10 @@ limitations under the License.
 #include <brpc/server.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
 #include <random>
+#include <thread>
 
 #include "common/global_flags.h"
 #include "common/macros.h"
@@ -35,6 +37,7 @@ limitations under the License.
 #include "disagg_pd_scheduler.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/block/block_manager_pool.h"
 #include "framework/kv_cache_transfer/pd_topology_guard.h"
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
@@ -47,6 +50,25 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+
+bool decode_add_new_failure_is_terminal(int32_t status_code) {
+  return status_code == kDecodeAddNewPromptTooLongStatusCode;
+}
+
+bool decode_add_new_should_retry(int32_t failed_attempts, int32_t max_retries) {
+  return max_retries < 0 || failed_attempts <= max_retries;
+}
+
+bool pd_prompt_exceeds_block_capacity(size_t num_prompt_tokens,
+                                      size_t block_size,
+                                      size_t num_blocks) {
+  if (block_size == 0) {
+    return true;
+  }
+  const size_t needed_blocks = util::ceil_div(num_prompt_tokens, block_size);
+  const size_t usable_blocks = num_blocks == 0 ? 0 : num_blocks - 1;
+  return needed_blocks > usable_blocks;
+}
 
 DisaggPDScheduler::DisaggPDScheduler(Engine* engine, const Options& options)
     : ChunkedPrefillScheduler(engine, options), server_name_("DisaggPDServer") {
@@ -348,8 +370,45 @@ bool DisaggPDScheduler::add_request(std::shared_ptr<Request>& request) {
   return true;
 }
 
+namespace {
+
+void enqueue_prefill_dispatch_request(
+    moodycamel::BlockingConcurrentQueue<std::shared_ptr<Request>>& online_queue,
+    moodycamel::BlockingConcurrentQueue<std::shared_ptr<Request>>&
+        offline_queue,
+    const std::shared_ptr<Request>& request) {
+  if (request->offline()) {
+    offline_queue.enqueue(request);
+  } else {
+    online_queue.enqueue(request);
+  }
+}
+
+// Returns true if the request should keep retrying AddNew.
+bool handle_decode_add_new_failure(const std::shared_ptr<Request>& request,
+                                   int32_t status_code,
+                                   const std::string& selected_instance) {
+  const DisaggPDConfig& config = DisaggPDConfig::get_instance();
+  const int32_t max_retries = config.disagg_pd_add_new_max_retries();
+  const int32_t interval_ms = config.disagg_pd_add_new_retry_interval_ms();
+  request->bump_decode_add_new_retry(interval_ms);
+  const int32_t retries = request->decode_add_new_retries();
+  const bool will_retry = decode_add_new_should_retry(retries, max_retries);
+  LOG(WARNING) << "Decode AddNew non-200, request_id=" << request->request_id()
+               << ", status_code=" << status_code << ", retries=" << retries
+               << ", max_retries=" << max_retries
+               << ", interval_ms=" << interval_ms
+               << ", prompt_tokens=" << request->state().prompt_tokens.size()
+               << ", selected_instance=" << selected_instance
+               << ", action=" << (will_retry ? "retry" : "fail");
+  return will_retry;
+}
+
+}  // namespace
+
 // prefill send new request to remote instance
 void DisaggPDScheduler::dispatch_requests() {
+  int32_t consecutive_not_ready = 0;
   while (true) {
     const auto timeout = std::chrono::milliseconds(100);
     // Wait for online request until timeout.
@@ -367,6 +426,32 @@ void DisaggPDScheduler::dispatch_requests() {
       // nullptr is a signal to exit
       break;
     }
+
+    const absl::Time now = absl::Now();
+    if (!request->can_decode_add_new_retry(now)) {
+      const absl::Time next_retry = request->decode_add_new_next_retry_time();
+      enqueue_prefill_dispatch_request(
+          prefill_request_queue_, prefill_request_queue_offline_, request);
+      ++consecutive_not_ready;
+      // Avoid busy-spin when every pending request is waiting for retry.
+      if (consecutive_not_ready >= 4) {
+        const absl::Duration remain = next_retry - absl::Now();
+        if (remain > absl::ZeroDuration()) {
+          int64_t sleep_ms = absl::ToInt64Milliseconds(remain);
+          const int32_t interval_ms =
+              DisaggPDConfig::get_instance()
+                  .disagg_pd_add_new_retry_interval_ms();
+          if (interval_ms > 0) {
+            sleep_ms = std::min(sleep_ms, static_cast<int64_t>(interval_ms));
+          }
+          sleep_ms = std::max<int64_t>(sleep_ms, 1);
+          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        }
+        consecutive_not_ready = 0;
+      }
+      continue;
+    }
+    consecutive_not_ready = 0;
 
     if (request->state().decode_address.empty()) {
       // No decode address provided to the prefill instance, just finish the
@@ -545,13 +630,30 @@ void DisaggPDScheduler::dispatch_requests() {
     }
     for (size_t i = 0; i < requests.size(); ++i) {
       if (resps.resps()[i].status_code() != 200) {
-        // push back to prefill_request_queue_
-        if (requests[i]->offline()) {
-          prefill_request_queue_offline_.enqueue(requests[i]);
-        } else {
-          prefill_request_queue_.enqueue(requests[i]);
+        if (decode_add_new_failure_is_terminal(
+                resps.resps()[i].status_code())) {
+          LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
+                     << requests[i]->request_id() << ", prompt_tokens="
+                     << requests[i]->state().prompt_tokens.size()
+                     << ", selected_instance=" << selected_instance;
+          fail_request_exceeding_decode_capacity(requests[i]);
+          continue;
         }
-
+        if (handle_decode_add_new_failure(requests[i],
+                                          resps.resps()[i].status_code(),
+                                          selected_instance)) {
+          enqueue_prefill_dispatch_request(prefill_request_queue_,
+                                           prefill_request_queue_offline_,
+                                           requests[i]);
+        } else {
+          kv_cache_manager_->deallocate(requests[i].get());
+          response_processor_->process_failed_request(
+              requests[i],
+              {StatusCode::RESOURCE_EXHAUSTED,
+               "Decode AddNew failed after max retries"});
+          std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+          req_to_channel_map_.erase(requests[i]->request_id());
+        }
       } else {
         for (auto& sequence : requests[i]->sequences()) {
           TransferKVInfo info;
@@ -930,6 +1032,38 @@ bool DisaggPDScheduler::try_allocate(Sequence* sequence) {
   } else {
     return false;
   }
+}
+
+bool DisaggPDScheduler::prompt_exceeds_block_capacity(
+    Sequence* sequence) const {
+  CHECK(sequence != nullptr);
+  const BlockManagerPool* block_manager = engine_->block_manager_pool();
+  CHECK(block_manager != nullptr);
+  const BlockManagerPool::Options& block_options = block_manager->options();
+  const bool is_decode =
+      options_.instance_role().has_value() &&
+      options_.instance_role().value() == InstanceRole::DECODE;
+  if (block_options.enable_xtensor() ||
+      !block_options.manager_types().empty() ||
+      (block_options.host_num_blocks() > 0 && !is_decode)) {
+    return false;
+  }
+  return pd_prompt_exceeds_block_capacity(
+      sequence->num_prompt_tokens(),
+      static_cast<size_t>(block_manager->block_size()),
+      static_cast<size_t>(block_manager->num_blocks()));
+}
+
+void DisaggPDScheduler::fail_request_exceeding_decode_capacity(
+    const std::shared_ptr<Request>& request) {
+  CHECK(request != nullptr);
+  kv_cache_manager_->deallocate(request.get());
+  response_processor_->process_failed_request(
+      request,
+      {StatusCode::RESOURCE_EXHAUSTED,
+       "Request prompt exceeds decode KV cache capacity"});
+  std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+  req_to_channel_map_.erase(request->request_id());
 }
 
 void DisaggPDScheduler::update_token_latency_metrics(

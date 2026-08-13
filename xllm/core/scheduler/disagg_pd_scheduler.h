@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,6 +35,19 @@ limitations under the License.
 #include "util/threadpool.h"
 
 namespace xllm {
+
+inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
+
+bool decode_add_new_failure_is_terminal(int32_t status_code);
+
+bool decode_add_new_should_retry(int32_t failed_attempts, int32_t max_retries);
+
+// Flat KV managers reserve block 0 for padding, so only num_blocks - 1 blocks
+// can belong to a request. Returns true only when the prompt can never fit,
+// independent of current cache pressure.
+bool pd_prompt_exceeds_block_capacity(size_t num_prompt_tokens,
+                                      size_t block_size,
+                                      size_t num_blocks);
 
 class DisaggPDScheduler : public ChunkedPrefillScheduler {
  public:
@@ -79,6 +94,11 @@ class DisaggPDScheduler : public ChunkedPrefillScheduler {
   // decode allocate blocks with prefix cache.
   bool try_allocate(Sequence* sequence);
 
+  // Classifies a failed allocation as permanently oversized.
+  // DSV4 multi-manager and XTensor layouts conservatively return false because
+  // their effective token capacity cannot be derived from the flat KV count.
+  bool prompt_exceeds_block_capacity(Sequence* sequence) const;
+
   bool enable_schedule_overlap() { return options_.enable_schedule_overlap(); };
 
   void get_latency_metrics(std::vector<int64_t>& ttft,
@@ -99,6 +119,9 @@ class DisaggPDScheduler : public ChunkedPrefillScheduler {
                        const int32_t src_kv_split_size);
 
  protected:
+  void fail_request_exceeding_decode_capacity(
+      const std::shared_ptr<Request>& request);
+
   // Pre-execute prefill requests of different lengths at startup and obtain the
   // corresponding TTFT for calculating the estimated TTFT of requests.
   void profile_ttft();

@@ -370,6 +370,37 @@ TEST(DisaggPDChunkedPrefillSchedulerTest, AdmitsSoleRequestExceedingCapacity) {
   }
 }
 
+// A queue of oversized prompts must still admit one probe. The old
+// size()==1 bypass left every request deferred forever when waiting>1.
+TEST(DisaggPDChunkedPrefillSchedulerTest, ProbesOneWhenManyOversizedWait) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(&engine,
+                                            make_options(
+                                                /*max_tokens_per_batch=*/2,
+                                                /*max_chunk=*/2,
+                                                /*max_seqs=*/2));
+  std::shared_ptr<Request> first = make_request(
+      {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20});
+  std::shared_ptr<Request> second =
+      make_request({21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                    31, 32, 33, 34, 35, 36, 37, 38, 39, 40});
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(first));
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(second));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  (void)batches;
+
+  EXPECT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_waiting_requests().size(), 1u);
+
+  for (const auto& running : scheduler.get_running_requests()) {
+    block_manager->deallocate(running.get());
+  }
+}
+
 // Regression test: in disagg PD mode, expansion of best_of_n sequences must
 // be deferred to the DECODE instance (where prefix cache lets seq[1..N-1]
 // share seq[0]'s prompt KV). Expanding on the PREFILL instance would waste

@@ -218,4 +218,14 @@ void Request::update_connection_status() {
   set_cancel();
 }
 
+void Request::bump_decode_add_new_retry(int32_t interval_ms) {
+  ++decode_add_new_retries_;
+  if (interval_ms > 0) {
+    decode_add_new_next_retry_time_ =
+        absl::Now() + absl::Milliseconds(interval_ms);
+  } else {
+    decode_add_new_next_retry_time_ = absl::UnixEpoch();
+  }
+}
+
 }  // namespace xllm
