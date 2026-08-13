@@ -205,11 +205,13 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   std::vector<int32_t> attn_linear_quant_types_;
 
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_;
+  atb_speed::deepseekV2::DecoderLayerParam prefill_no_history_param_;
   atb_speed::deepseekV2::DecoderLayerParam decode_param_;
   atb_speed::deepseekV2::DecoderLayerParam mtp_prefill_fallback_param_;
   atb_speed::deepseekV2::DecoderLayerParam mtp_decode_fallback_param_;
 
   atb_speed::Model::Node prefill_node_;
+  atb_speed::Model::Node prefill_no_history_node_;
   atb_speed::Model::Node decode_node_;
   atb_speed::Model::Node mtp_prefill_fallback_node_;
   atb_speed::Model::Node mtp_decode_fallback_node_;

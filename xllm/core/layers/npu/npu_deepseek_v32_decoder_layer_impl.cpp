@@ -389,6 +389,10 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_, model_args, parallel_args, /*is_prefill=*/true);
   param_from_args(
       decode_param_, model_args, parallel_args, /*is_prefill=*/false);
+  if (prefill_param_.enableLayerwisePrefillHistory) {
+    prefill_no_history_param_ = prefill_param_;
+    prefill_no_history_param_.enableLayerwisePrefillHistory = false;
+  }
   has_mtp_topk_fallback_ =
       skip_topk_ && model_args.index_share_for_mtp_iteration() &&
       model_args.model_type().find("_mtp") != std::string::npos;
@@ -962,6 +966,10 @@ void NpuDeepseekV32DecoderLayerImpl::update_expert_weight() {
     atb_weight_tensors_[index] =
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[index]);
     prefill_node_.inTensors.at(index) = &atb_weight_tensors_[index];
+    if (prefill_param_.enableLayerwisePrefillHistory) {
+      prefill_no_history_node_.inTensors.at(index) =
+          &atb_weight_tensors_[index];
+    }
     decode_node_.inTensors.at(index) = &atb_weight_tensors_[index];
     if (has_mtp_topk_fallback_) {
       mtp_prefill_fallback_node_.inTensors.at(index) =
@@ -979,6 +987,10 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
   name_ = "deepseek_v2_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "DeepSeek_V2";
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
+  if (prefill_param_.enableLayerwisePrefillHistory) {
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(prefill_no_history_node_, prefill_no_history_param_));
+  }
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
   if (has_mtp_topk_fallback_) {
     CHECK_OPERATION_STATUS_RETURN(
@@ -1120,16 +1132,20 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                            << " execute decode layer failed, error code: "
                            << st;
   } else {
+    atb_speed::Model::Node* prefill_node = &prefill_node_;
     const NpuLayerwisePrefillInput* prefill_inputs = nullptr;
     if (prefill_param_.enableLayerwisePrefillHistory) {
       const NpuLayerwisePrefillInput& prepared_inputs =
           input_params_new.npu_layerwise_prefill;
-      CHECK(prepared_inputs.history_slots.defined());
-      CHECK(prepared_inputs.history_kv_buffer.defined());
-      CHECK(prepared_inputs.history_indexer_buffer.defined());
-      prefill_inputs = &prepared_inputs;
+      if (prepared_inputs.history_slots.defined()) {
+        CHECK(prepared_inputs.history_kv_buffer.defined());
+        CHECK(prepared_inputs.history_indexer_buffer.defined());
+        prefill_inputs = &prepared_inputs;
+      } else {
+        prefill_node = &prefill_no_history_node_;
+      }
     }
-    build_node_variant_pack(prefill_node_,
+    build_node_variant_pack(*prefill_node,
                             x,
                             cos_pos,
                             sin_pos,
@@ -1143,7 +1159,7 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             output_topk_,
                             /*dcp_inputs=*/nullptr,
                             prefill_inputs);
-    st = execute_node(prefill_node_, node_id, event, event_flag);
+    st = execute_node(*prefill_node, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
   }

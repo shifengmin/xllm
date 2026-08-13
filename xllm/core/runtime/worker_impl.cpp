@@ -587,10 +587,11 @@ void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
       }
     }
   }
-  // All DCP ranks must enter the same broadcasts with the same shape. Use one
-  // dummy slot when this step has no history instead of skipping collectives.
+  // A full first prefill has no history to materialize. All ranks in a DCP
+  // group belong to the same DP shard, so they can consistently select the
+  // no-history prefill plan without entering the history collectives.
   if (history_slots.empty()) {
-    history_slots.emplace_back(0);
+    return;
   }
 
   const KVCache& cache = kv_caches_.front();
