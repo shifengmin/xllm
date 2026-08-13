@@ -32,6 +32,7 @@ limitations under the License.
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,6 +43,7 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -262,6 +264,10 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
   }
+  parallel_args_.enable_decode_dcp_layerwise_kv_cache(
+      resolve_decode_dcp_layerwise_kv_cache_enabled(
+          parallel_args_.enable_decode_dcp_layerwise_kv_cache(),
+          options_.is_draft_engine() || is_spec_draft_));
 
   // first worker is the driver
   driver_ = parallel_args.rank() == 0;
@@ -345,6 +351,13 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
+  std::vector<bool> layer_cache_owned;
+  if (decode_dcp_layerwise_kv_cache_enabled()) {
+    layer_cache_owned.reserve(static_cast<size_t>(num_layers));
+    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      layer_cache_owned.emplace_back(owns_decode_dcp_layer(layer_id));
+    }
+  }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
 
@@ -395,6 +408,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .enable_sleep_mode(options_.enable_sleep_mode())
       .enable_linear_attention(enable_linear_attention)
       .enable_lighting_indexer(enable_lighting_indexer)
+      .layer_cache_owned(std::move(layer_cache_owned))
       .indexer_cache_enabled_layers(std::move(indexer_cache_enabled_layers))
       .enable_kv_cache_quant(enable_kv_cache_quant)
       .enable_indexer_cache_quant(enable_indexer_cache_quant)
@@ -420,6 +434,177 @@ bool WorkerImpl::allocate_kv_cache_storage(
 
   return true;
 }
+
+bool WorkerImpl::decode_dcp_layerwise_kv_cache_enabled() const {
+  return parallel_args_.enable_decode_dcp_layerwise_kv_cache() &&
+         is_decode_dcp_layerwise_kv_cache_supported_model(
+             context_.get_model_args().model_type());
+}
+
+bool WorkerImpl::owns_decode_dcp_layer(int64_t layer_id) const {
+  const DecodeDcpLayerPlacement placement(
+      decode_dcp_layerwise_kv_cache_enabled(),
+      parallel_args_.decode_dcp_size(),
+      parallel_args_.decode_dcp_rank());
+  return placement.owns(layer_id);
+}
+
+#if defined(USE_NPU)
+void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
+  ModelInputParams& input_params = processed_input.input_params;
+  input_params.npu_decode_dcp = NpuDecodeDcpInput();
+  input_params.npu_layerwise_prefill = NpuLayerwisePrefillInput();
+
+  const bool is_draft_model = options_.is_draft_engine() || is_spec_draft_;
+  if (model_executor_ == nullptr || is_draft_model ||
+      options_.npu_kernel_backend() != "ATB" ||
+      parallel_args_.decode_dcp_size() <= 1) {
+    return;
+  }
+  const ModelArgs& model_args = context_.get_model_args();
+  if (!is_decode_dcp_layerwise_kv_cache_supported_model(
+          model_args.model_type())) {
+    return;
+  }
+  const bool has_dsa_indexer = model_args.index_n_heads() > 0 &&
+                               model_args.index_head_dim() > 0 &&
+                               model_args.index_topk() > 0;
+  if (!has_dsa_indexer) {
+    return;
+  }
+
+  const bool use_decode_dcp =
+      input_params.meta.batch_forward_type.is_decode() ||
+      input_params.graph.use_expanded_decode_for_spec_verify_attention;
+  const int32_t block_size = ::xllm::KVCacheConfig::get_instance().block_size();
+  CHECK_GT(block_size, 0);
+
+  if (use_decode_dcp) {
+    CHECK(!input_params.enable_graph)
+        << "Decode layer-owner DCP currently supports eager ATB only.";
+    const int64_t query_count = processed_input.token_ids.numel();
+    CHECK_GT(query_count, 0)
+        << "Decode DCP requires a non-empty execution input.";
+    CHECK_LE(query_count,
+             static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+    const int32_t index_topk = model_args.index_topk();
+    CHECK_GT(index_topk, 0);
+    NpuDecodeDcpInput& dcp_input = input_params.npu_decode_dcp;
+    if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+      dcp_input.expanded_query_cu_seq_lens = torch::arange(
+          1,
+          query_count + 1,
+          torch::TensorOptions().device(device_).dtype(torch::kInt32));
+    }
+
+    const int32_t attention_tp_size =
+        parallel_args_.world_size() /
+        (parallel_args_.dp_size() * parallel_args_.cp_size());
+    CHECK_GT(attention_tp_size, 0);
+    CHECK_EQ(parallel_args_.world_size(),
+             parallel_args_.dp_size() * parallel_args_.cp_size() *
+                 attention_tp_size);
+    CHECK_LE(parallel_args_.decode_dcp_size(), attention_tp_size);
+    CHECK_EQ(attention_tp_size % parallel_args_.decode_dcp_size(), 0);
+    CHECK_EQ(model_args.n_heads() % attention_tp_size, 0);
+    const int64_t local_head_count = model_args.n_heads() / attention_tp_size;
+    const int64_t dcp_head_count =
+        local_head_count * parallel_args_.decode_dcp_size();
+    dcp_input.attention_output_buffer =
+        torch::empty({query_count, dcp_head_count, model_args.kv_lora_rank()},
+                     torch::TensorOptions().device(device_).dtype(dtype_));
+
+    const bool has_topk_share = !model_args.index_topk_pattern().empty() ||
+                                model_args.index_topk_freq() > 1;
+    if (has_topk_share) {
+      dcp_input.topk_receive_buffer = torch::empty(
+          {query_count, 1, index_topk},
+          torch::TensorOptions().device(device_).dtype(torch::kInt32));
+    }
+    return;
+  }
+
+  if (!decode_dcp_layerwise_kv_cache_enabled()) {
+    return;
+  }
+  CHECK(!input_params.enable_graph)
+      << "Layerwise prefill history currently supports eager ATB only.";
+  CHECK(!kv_caches_.empty());
+  const std::vector<int32_t>& q_seq_lens =
+      input_params.attention.host.q_seq_lens;
+  const std::vector<int32_t>& kv_seq_lens =
+      input_params.attention.host.kv_seq_lens;
+  const torch::Tensor& block_tables = input_params.attention.host.block_tables;
+  std::vector<int32_t> history_slots;
+  if (!q_seq_lens.empty() && block_tables.defined() &&
+      block_tables.dim() == 2) {
+    CHECK(block_tables.device().is_cpu())
+        << "Layerwise prefill requires host block tables during preparation.";
+    CHECK_EQ(block_tables.scalar_type(), torch::kInt32);
+    CHECK_EQ(q_seq_lens.size(), kv_seq_lens.size())
+        << "Layerwise prefill expects one q_len and kv_len per sequence.";
+    CHECK_EQ(block_tables.size(0), static_cast<int64_t>(q_seq_lens.size()))
+        << "Layerwise prefill expects one block-table row per sequence.";
+    const torch::Tensor block_tables_cpu = block_tables.contiguous();
+    const auto block_table_rows = block_tables_cpu.accessor<int32_t, 2>();
+    const int64_t max_blocks_per_row = block_tables_cpu.size(1);
+
+    // History excludes the current chunk, so full first-prefill requests have
+    // no real history while chunked and prefix-cache requests include their
+    // existing prefix slots.
+    int64_t total_history = 0;
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      total_history += kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+    }
+    CHECK_GE(total_history, 0);
+    history_slots.reserve(total_history);
+    for (size_t sequence_idx = 0; sequence_idx < q_seq_lens.size();
+         ++sequence_idx) {
+      const int32_t history_len =
+          kv_seq_lens[sequence_idx] - q_seq_lens[sequence_idx];
+      CHECK_GE(history_len, 0)
+          << "Layerwise prefill requires kv_len to include the current chunk.";
+      for (int32_t position = 0; position < history_len; ++position) {
+        const int64_t logical_block = position / block_size;
+        CHECK_LT(logical_block, max_blocks_per_row)
+            << "Layerwise prefill history exceeds the block table.";
+        history_slots.emplace_back(
+            block_table_rows[sequence_idx][logical_block] * block_size +
+            position % block_size);
+      }
+    }
+  }
+  // A full first prefill has no history to materialize. All ranks in a DCP
+  // group belong to the same DP shard, so they can consistently select the
+  // no-history prefill plan without entering the history collectives.
+  if (history_slots.empty()) {
+    return;
+  }
+
+  const KVCache& cache = kv_caches_.front();
+  const auto index_cache_it =
+      std::find_if(kv_caches_.begin(), kv_caches_.end(), [](const KVCache& c) {
+        return c.get_index_cache().defined();
+      });
+  CHECK(index_cache_it != kv_caches_.end())
+      << "Layerwise DSA prefill requires an index cache buffer.";
+  NpuLayerwisePrefillInput& prefill_input = input_params.npu_layerwise_prefill;
+  prefill_input.history_slots =
+      torch::tensor(history_slots, torch::kInt32).to(device_);
+  const int64_t history_count = static_cast<int64_t>(history_slots.size());
+  const int64_t history_kv_width =
+      model_args.kv_lora_rank() + model_args.qk_rope_head_dim();
+  prefill_input.history_kv_buffer =
+      torch::empty({history_count, 1, history_kv_width},
+                   torch::TensorOptions().device(device_).dtype(
+                       cache.get_k_cache().scalar_type()));
+  prefill_input.history_indexer_buffer =
+      torch::empty({history_count, 1, model_args.index_head_dim()},
+                   torch::TensorOptions().device(device_).dtype(
+                       index_cache_it->get_index_cache().scalar_type()));
+}
+#endif
 
 bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   if (!allocate_kv_cache_storage(kv_cache_shape)) {
@@ -802,6 +987,11 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
       empty_shard = false;
     }
     if (empty_shard) {
+#if defined(USE_NPU)
+      // NPU model forwards materialize a placeholder token for an EMPTY batch.
+      // Prepare the matching dummy DCP inputs before that forward as well.
+      prepare_npu_dcp_inputs(processed_input);
+#endif
       return;
     }
 
@@ -865,6 +1055,8 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                                            kv_caches_,
                                            processed_input.input_params);
     }
+
+    prepare_npu_dcp_inputs(processed_input);
 
 #endif
   };

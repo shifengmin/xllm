@@ -20,6 +20,7 @@ limitations under the License.
 #include <limits>
 #include <vector>
 
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
@@ -137,6 +138,70 @@ int64_t standard_full_cache_block_size_in_bytes(
        indexer_layers * kv_cache_cap.index_slot_size());
   CHECK_GT(logical_block_bytes, 0) << "logical block bytes must be positive";
   return logical_block_bytes;
+}
+
+int64_t decode_dcp_layerwise_block_count(const ModelArgs& model_args,
+                                         int32_t decode_dcp_size,
+                                         const KVCacheCapacity& kv_cache_cap,
+                                         int64_t available_bytes,
+                                         int64_t additional_block_bytes) {
+  CHECK_GT(decode_dcp_size, 1)
+      << "Decode DCP layerwise KV cache requires decode_dcp_size > 1.";
+  CHECK_EQ(kv_cache_cap.num_linear_attention_layers(), 0)
+      << "Decode DCP layerwise KV cache supports full-attention models only.";
+  CHECK_GT(available_bytes, 0);
+  CHECK_GE(additional_block_bytes, 0);
+
+  const DecodeDcpLayerPlacement placement(
+      /*enabled=*/true, decode_dcp_size, /*local_rank=*/0);
+  std::vector<int64_t> owner_bytes(static_cast<size_t>(decode_dcp_size), 0);
+  const std::vector<bool> indexer_layer_mask =
+      resolve_indexer_cache_enabled_layers(model_args, kv_cache_cap.n_layers());
+
+  bool any_indexer_layer = false;
+  for (int64_t layer_id = 0; layer_id < kv_cache_cap.n_layers(); ++layer_id) {
+    CHECK(is_full_attention_layer(model_args, layer_id));
+    const bool has_indexer =
+        kv_cache_cap.index_slot_size() > 0 &&
+        (indexer_layer_mask.empty() ||
+         indexer_layer_mask[static_cast<size_t>(layer_id)]);
+    any_indexer_layer = any_indexer_layer || has_indexer;
+    const int64_t layer_bytes =
+        kv_cache_cap.block_size() *
+        (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
+         (has_indexer ? kv_cache_cap.index_slot_size() : 0));
+    CHECK_GT(layer_bytes, 0);
+    const int32_t owner_rank = placement.owner_rank(layer_id);
+    owner_bytes[static_cast<size_t>(owner_rank)] += layer_bytes;
+  }
+
+  // Every rank also holds one shared scratch layer at the same block capacity
+  // as an owned layer, so non-owner layers can be addressed with the real block
+  // table. It exposes the superset cache ABI, hence the indexer cost whenever
+  // any layer carries indexer tensors.
+  const int64_t scratch_bytes_per_block =
+      kv_cache_cap.block_size() *
+      (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +
+       (any_indexer_layer ? kv_cache_cap.index_slot_size() : 0));
+  CHECK_GT(scratch_bytes_per_block, 0);
+
+  int64_t common_block_count = std::numeric_limits<int64_t>::max();
+  for (int32_t dcp_rank = 0; dcp_rank < decode_dcp_size; ++dcp_rank) {
+    const int64_t owned_bytes = owner_bytes[static_cast<size_t>(dcp_rank)];
+    if (owned_bytes == 0) {
+      continue;
+    }
+    const int64_t per_block_bytes =
+        owned_bytes + scratch_bytes_per_block + additional_block_bytes;
+    common_block_count =
+        std::min(common_block_count, available_bytes / per_block_bytes);
+  }
+
+  CHECK_NE(common_block_count, std::numeric_limits<int64_t>::max())
+      << "No decode DCP rank owns a model layer.";
+  CHECK_GT(common_block_count, 0)
+      << "No memory for one decode DCP layerwise KV cache block.";
+  return common_block_count;
 }
 
 size_t standard_full_cache_allocation_bytes(const KVCacheCapacity& kv_cache_cap,
@@ -530,6 +595,18 @@ void init_standard_counts(const ModelArgs& model_args,
   CHECK_GT(available_full_cache_size_in_bytes, 0)
       << "no memory left for full-attention kv cache after reserving linear "
          "state cache";
+  if (options.enable_decode_dcp_layerwise_kv_cache) {
+    CHECK(!use_rdma_indexer_scale_padding(options, *kv_cache_cap))
+        << "Decode DCP layerwise KV cache does not support RDMA scale "
+           "padding.";
+    kv_cache_cap->n_blocks(
+        decode_dcp_layerwise_block_count(model_args,
+                                         options.decode_dcp_size,
+                                         *kv_cache_cap,
+                                         available_full_cache_size_in_bytes,
+                                         /*additional_block_bytes=*/0));
+    return;
+  }
   const int64_t logical_n_blocks =
       available_full_cache_size_in_bytes / full_cache_block_size_in_bytes;
   const bool enable_rdma_scale_padding =
@@ -599,6 +676,19 @@ std::vector<bool> resolve_indexer_cache_enabled_layers(
     return {};
   }
   return layer::get_dsa_indexer_layer_mask(model_args, num_cache_layers);
+}
+
+int64_t estimate_decode_dcp_layerwise_block_count(
+    const ModelArgs& model_args,
+    int32_t decode_dcp_size,
+    const KVCacheCapacity& kv_cache_cap,
+    int64_t available_bytes,
+    int64_t additional_block_bytes) {
+  return decode_dcp_layerwise_block_count(model_args,
+                                          decode_dcp_size,
+                                          kv_cache_cap,
+                                          available_bytes,
+                                          additional_block_bytes);
 }
 
 KVCacheCapacity estimate_kv_cache_capacity(

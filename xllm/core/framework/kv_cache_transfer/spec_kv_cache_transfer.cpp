@@ -122,6 +122,7 @@ bool SpecKVCacheTransfer::push_kv_blocks(
     return push_kv_blocks_internal(merged_kv_infos,
                                    layer_synchronizer,
                                    layer_registered_caches_,
+                                   /*is_spec_draft=*/false,
                                    kv_split_rank,
                                    kv_split_size);
   }
@@ -135,6 +136,7 @@ bool SpecKVCacheTransfer::push_kv_blocks_spec(
   return push_kv_blocks_internal(merged_kv_infos,
                                  layer_synchronizer,
                                  spec_layer_registered_caches_,
+                                 /*is_spec_draft=*/true,
                                  kv_split_rank,
                                  kv_split_size);
 }
@@ -143,11 +145,13 @@ bool SpecKVCacheTransfer::push_kv_blocks_internal(
     std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
     std::shared_ptr<NPULayerSynchronizerImpl>& layer_synchronizer,
     const LayerRegisteredCaches& layer_registered_caches,
+    bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
   return push_layer_registered_caches(layer_registered_caches,
                                       merged_kv_infos,
                                       layer_synchronizer,
+                                      is_spec_draft,
                                       kv_split_rank,
                                       kv_split_size);
 }

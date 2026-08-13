@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/global_flags.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kv_cache_config.h"
 
@@ -128,6 +129,18 @@ std::vector<std::string> KVCacheTransfer::rotate_dst_rank(
   return rotated_keys;
 }
 
+bool KVCacheTransfer::should_push_layer_to_destination(
+    const KVCacheInfo& kv_info,
+    int64_t layer_id,
+    bool is_spec_draft) {
+  if (is_spec_draft || !kv_info.enable_decode_dcp_layerwise_kv_cache) {
+    return true;
+  }
+  const DecodeDcpLayerPlacement placement(
+      /*enabled=*/true, kv_info.decode_dcp_size, kv_info.decode_dcp_rank);
+  return placement.owns(layer_id);
+}
+
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
 folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
     const std::vector<TransferKVInfo>& transfer_kv_infos,
@@ -218,6 +231,15 @@ void KVCacheTransfer::merge_kv_blocks(
     int32_t dst_dp_size = info.remote_instance_info.dp_size;
     int32_t dst_world_size = info.remote_instance_info.cluster_ids.size();
     int32_t dst_tp_size = dst_world_size / dst_dp_size;
+    const bool enable_decode_dcp_layerwise_kv_cache =
+        info.remote_instance_info.enable_decode_dcp_layerwise_kv_cache;
+    const int32_t decode_dcp_size = info.remote_instance_info.decode_dcp_size;
+    if (enable_decode_dcp_layerwise_kv_cache) {
+      CHECK_GT(decode_dcp_size, 1)
+          << "Remote decode layerwise KV cache requires decode_dcp_size > 1.";
+      CHECK_EQ(dst_tp_size % decode_dcp_size, 0)
+          << "Remote decode TP size must be divisible by decode_dcp_size.";
+    }
     // Get the DP groups of the destination instance connected to the current
     // worker.
     std::unordered_set<int32_t> linked_dp_ranks;
@@ -246,6 +268,12 @@ void KVCacheTransfer::merge_kv_blocks(
         KVCacheInfo kv_info;
         kv_info.dst_cluster_id = dst_cluster_id;
         kv_info.dst_addr = dst_addr;
+        kv_info.enable_decode_dcp_layerwise_kv_cache =
+            enable_decode_dcp_layerwise_kv_cache;
+        kv_info.decode_dcp_size = decode_dcp_size;
+        kv_info.decode_dcp_rank =
+            DecodeDcpLayerPlacement::local_rank_from_tp_rank(i % dst_tp_size,
+                                                             decode_dcp_size);
         kv_info.src_blocks.insert(kv_info.src_blocks.end(),
                                   info.local_blocks_ids.begin(),
                                   info.local_blocks_ids.end());
@@ -269,6 +297,12 @@ void KVCacheTransfer::merge_kv_blocks(
 
         merged_kv_infos[key] = std::move(kv_info);
       } else {
+        CHECK_EQ(merged_kv_infos[key].enable_decode_dcp_layerwise_kv_cache,
+                 enable_decode_dcp_layerwise_kv_cache);
+        CHECK_EQ(merged_kv_infos[key].decode_dcp_size, decode_dcp_size);
+        CHECK_EQ(merged_kv_infos[key].decode_dcp_rank,
+                 DecodeDcpLayerPlacement::local_rank_from_tp_rank(
+                     i % dst_tp_size, decode_dcp_size));
         merged_kv_infos[key].src_blocks.insert(
             merged_kv_infos[key].src_blocks.end(),
             info.local_blocks_ids.begin(),

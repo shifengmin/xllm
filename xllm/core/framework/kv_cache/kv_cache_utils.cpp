@@ -39,6 +39,15 @@ extern "C" aclError aclrtHostUnregister(void* ptr);
 namespace xllm {
 namespace {
 
+#if defined(USE_NPU)
+torch::Tensor cast_npu_cache_format(torch::Tensor tensor, aclFormat format) {
+  if (!tensor.device().is_privateuseone()) {
+    return tensor;
+  }
+  return at_npu::native::npu_format_cast(tensor, format);
+}
+#endif
+
 size_t get_tensor_nbytes(const std::vector<int64_t>& dims,
                          torch::ScalarType dtype) {
   size_t count = 1;
@@ -165,12 +174,12 @@ KVCacheTensors create_kv_cache_tensors(
                                    create_options.dtype(),
                                    npu_format_type);
   } else {
-    tensors.key_cache = at_npu::native::npu_format_cast(
+    tensors.key_cache = cast_npu_cache_format(
         torch::empty(kv_cache_shape.key_cache_shape(),
                      torch::dtype(create_options.dtype())
                          .device(create_options.device())),
         npu_format_type);
-    tensors.value_cache = at_npu::native::npu_format_cast(
+    tensors.value_cache = cast_npu_cache_format(
         torch::empty(kv_cache_shape.value_cache_shape(),
                      torch::dtype(create_options.dtype())
                          .device(create_options.device())),
@@ -227,7 +236,7 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
                                    create_options.dtype(),
                                    npu_format_type);
   } else {
-    tensors.index_cache = at_npu::native::npu_format_cast(
+    tensors.index_cache = cast_npu_cache_format(
         torch::empty(kv_cache_shape.index_cache_shape(),
                      torch::dtype(create_options.dtype())
                          .device(create_options.device())),
@@ -334,12 +343,12 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
                                    ACL_FORMAT_ND);
     tensors.ssm_cache.zero_();
   } else {
-    tensors.conv_cache = at_npu::native::npu_format_cast(
+    tensors.conv_cache = cast_npu_cache_format(
         torch::zeros(kv_cache_shape.conv_cache_shape(),
                      torch::dtype(create_options.dtype())
                          .device(create_options.device())),
         ACL_FORMAT_ND);
-    tensors.ssm_cache = at_npu::native::npu_format_cast(
+    tensors.ssm_cache = cast_npu_cache_format(
         torch::zeros(kv_cache_shape.ssm_cache_shape(),
                      torch::dtype(create_options.ssm_dtype())
                          .device(create_options.device())),

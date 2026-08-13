@@ -207,10 +207,10 @@ bool LlmDataDistTransfer::push_kv_blocks(
     bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
-  (void)is_spec_draft;
   return push_layer_registered_caches(layer_registered_caches_,
                                       merged_kv_infos,
                                       layer_synchronizer,
+                                      is_spec_draft,
                                       kv_split_rank,
                                       kv_split_size);
 }
@@ -255,7 +255,16 @@ void LlmDataDistTransfer::register_layer_registered_caches(
   layer_registered_caches.clear();
   layer_registered_caches.resize(kv_caches.size());
 
+  bool registered_any_layer = false;
   for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    // Layerwise KV cache: a non-owner layer only views the shared scratch,
+    // which never takes part in transfer. Registering it would map the same
+    // memory once per layer and let a peer write into the scratch. Leaving the
+    // entry empty also gives the source side of a PUSH its own ownership
+    // filter, on top of the destination filter applied per key below.
+    if (!kv_caches[layer_id].owns_layer_cache()) {
+      continue;
+    }
     for (const KVCacheTensor& cache_tensor :
          kv_caches[layer_id].get_cache_tensors()) {
       if (!cache_tensor.sequence_scoped &&
@@ -267,13 +276,16 @@ void LlmDataDistTransfer::register_layer_registered_caches(
     }
     CHECK(!layer_registered_caches[layer_id].empty())
         << "No cache tensor registered at layer " << layer_id;
+    registered_any_layer = true;
   }
+  CHECK(registered_any_layer) << "No KV cache layer registered for transfer.";
 }
 
 bool LlmDataDistTransfer::push_layer_registered_caches(
     const LayerRegisteredCaches& layer_registered_caches,
     std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
     std::shared_ptr<NPULayerSynchronizerImpl>& layer_synchronizer,
+    bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
   std::vector<std::string> keys;
@@ -294,7 +306,19 @@ bool LlmDataDistTransfer::push_layer_registered_caches(
       result = false;
       continue;
     }
+
+    std::vector<std::string> layer_keys;
+    layer_keys.reserve(keys.size());
     for (const std::string& key : keys) {
+      if (should_push_layer_to_destination(
+              merged_kv_infos.at(key), layer_index, is_spec_draft)) {
+        layer_keys.emplace_back(key);
+      }
+    }
+    if (layer_keys.empty()) {
+      continue;
+    }
+    for (const std::string& key : layer_keys) {
       const KVCacheInfo& kv_info = merged_kv_infos.at(key);
       if (kv_info.src_blocks.empty() && kv_info.src_linear_state_ids.empty() &&
           kv_info.block_transfer_groups.empty()) {

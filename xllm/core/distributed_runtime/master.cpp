@@ -33,7 +33,9 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/xllm_build_info.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -68,6 +70,42 @@ DECLARE_bool(graceful_quit_on_sighup);
 
 namespace xllm {
 namespace {
+
+void validate_decode_dcp_layerwise_kv_cache_startup_config(
+    const Options& options) {
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const bool enabled = parallel_config.enable_decode_dcp_layerwise_kv_cache();
+  validate_decode_dcp_layerwise_kv_cache_config(
+      enabled, options.instance_role(), parallel_config.decode_dcp_size());
+  if (!enabled) {
+    return;
+  }
+
+  CHECK_EQ(options.npu_kernel_backend(), "ATB")
+      << "Decode DCP layerwise KV cache requires the NPU ATB backend.";
+  CHECK_LE(options.host_blocks_factor(), 1.0)
+      << "Decode DCP layerwise KV cache does not support hierarchy host "
+         "cache.";
+  // Context parallelism shards a layer along tokens while layer ownership
+  // shards the model along layers. Expressing both at once needs a
+  // two-dimensional placement that capacity, block metadata and PD routing do
+  // not carry yet.
+  CHECK_EQ(parallel_config.cp_size(), 1)
+      << "Decode DCP layerwise KV cache does not support context parallelism.";
+  CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+      << "Decode DCP layerwise KV cache does not support KV split.";
+  if (!options.enable_disagg_pd()) {
+    return;
+  }
+
+  CHECK_EQ(options.kv_cache_transfer_mode(), "PUSH")
+      << "Decode DCP layerwise KV cache only supports PUSH transfer mode.";
+  CHECK_EQ(DisaggPDConfig::get_instance().kv_cache_transfer_type(),
+           "LlmDataDist")
+      << "Decode DCP layerwise KV cache currently requires LlmDataDist.";
+  CHECK(!options.enable_pd_ooc())
+      << "Decode DCP layerwise KV cache does not support PD-OOC.";
+}
 
 std::optional<std::string> validate_model_cp(const Options& options,
                                              EngineType engine_type,
@@ -353,6 +391,7 @@ Master::Master(const Options& options, EngineType type)
   }
   resolve_npu_kernel_backend_for_options(&options_);
 #endif
+  validate_decode_dcp_layerwise_kv_cache_startup_config(options_);
   ParallelConfig::get_instance().enable_multi_stream_parallel(
       options.enable_multi_stream_parallel() && (options.nnodes() > 1));
   if (ParallelConfig::get_instance().enable_multi_stream_parallel()) {

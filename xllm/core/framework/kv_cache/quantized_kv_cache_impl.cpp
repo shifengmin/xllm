@@ -68,4 +68,11 @@ void QuantizedKVCacheImpl::swap_blocks(torch::Tensor& src_tensor,
   }
 }
 
+std::unique_ptr<KVCacheImpl> QuantizedKVCacheImpl::create_view() const {
+  return std::make_unique<QuantizedKVCacheImpl>(
+      QuantizedKVCacheTensors{KVCacheTensors{key_cache_, value_cache_},
+                              key_cache_scale_,
+                              value_cache_scale_});
+}
+
 }  // namespace xllm

@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/interruption_bus.h"
 #include "common/metrics.h"
 #include "common/options.h"
+#include "core/common/decode_dcp_layer_placement.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
@@ -61,12 +62,40 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+void validate_decode_dcp_layerwise_kv_cache_model(bool enabled,
+                                                  const ModelArgs& model_args) {
+  if (!enabled) {
+    return;
+  }
+  CHECK(!has_linear_attention_layers(model_args))
+      << "Decode DCP layerwise KV cache supports full-attention models only.";
+  CHECK(
+      is_decode_dcp_layerwise_kv_cache_supported_model(model_args.model_type()))
+      << "Decode DCP layerwise KV cache is only implemented for DeepSeek V3.2 "
+         "and GLM DSA models, got model_type="
+      << model_args.model_type();
+  CHECK_GT(model_args.index_n_heads(), 0)
+      << "Decode DCP layerwise KV cache requires an indexer-enabled model.";
+  CHECK_GT(model_args.index_head_dim(), 0)
+      << "Decode DCP layerwise KV cache requires a positive index head dim.";
+  CHECK_GT(model_args.index_topk(), 0)
+      << "Decode DCP layerwise KV cache requires a positive index top-k.";
+}
+
+}  // namespace
+
 // Extra weight pages reserved for mapping/alignment overhead.
 constexpr size_t kXTensorWeightPageSafetyMargin = 20;
 
 LLMEngine::LLMEngine(const runtime::Options& options,
                      std::shared_ptr<DistManager> dist_manager)
     : options_(options), dist_manager_(dist_manager) {
+  enable_decode_dcp_layerwise_kv_cache_ =
+      resolve_decode_dcp_layerwise_kv_cache_enabled(
+          ParallelConfig::get_instance().enable_decode_dcp_layerwise_kv_cache(),
+          options_.is_draft_engine());
   InterruptionBus::get_instance().subscribe([this](bool interrupted) {
     this->layer_forward_interrupted_ = interrupted;
   });
@@ -189,6 +218,8 @@ bool LLMEngine::init_model(MasterStatus master_status) {
 
   args_ = model_loader->model_args();
   quant_args_ = model_loader->quant_args();
+  validate_decode_dcp_layerwise_kv_cache_model(
+      enable_decode_dcp_layerwise_kv_cache_, args_);
 
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.
@@ -470,6 +501,10 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
   estimate_options.enable_rdma_scale_padding =
       options_.instance_role() != InstanceRole::DEFAULT;
+  estimate_options.enable_decode_dcp_layerwise_kv_cache =
+      enable_decode_dcp_layerwise_kv_cache_;
+  estimate_options.decode_dcp_size =
+      ::xllm::ParallelConfig::get_instance().decode_dcp_size();
   if (options_.enable_mtp_draft_body_tp1() && options_.is_draft_engine()) {
     estimate_options.world_size = 1;
     estimate_options.n_local_kv_heads =

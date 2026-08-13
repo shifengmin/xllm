@@ -148,18 +148,21 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   int64_t init_node(atb_speed::Model::Node& node,
                     atb_speed::deepseekV2::DecoderLayerParam& param);
 
-  void build_node_variant_pack(atb_speed::Model::Node& node,
-                               torch::Tensor& x,
-                               torch::Tensor& cos_pos,
-                               torch::Tensor& sin_pos,
-                               torch::Tensor& attn_mask,
-                               KVCache& kv_cache,
-                               ModelInputParams& input_params,
-                               bool is_prefill,
-                               const torch::Tensor& shared_topk_indices,
-                               torch::Tensor* output_topk_indices,
-                               bool skip_topk,
-                               bool output_topk);
+  void build_node_variant_pack(
+      atb_speed::Model::Node& node,
+      torch::Tensor& x,
+      torch::Tensor& cos_pos,
+      torch::Tensor& sin_pos,
+      torch::Tensor& attn_mask,
+      KVCache& kv_cache,
+      ModelInputParams& input_params,
+      bool is_prefill,
+      const torch::Tensor& shared_topk_indices,
+      torch::Tensor* output_topk_indices,
+      bool skip_topk,
+      bool output_topk,
+      const NpuDecodeDcpInput* dcp_inputs = nullptr,
+      const NpuLayerwisePrefillInput* prefill_inputs = nullptr);
 
   torch::Tensor block_tables_placeholder_;
   std::string model_name_;
@@ -202,11 +205,13 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   std::vector<int32_t> attn_linear_quant_types_;
 
   atb_speed::deepseekV2::DecoderLayerParam prefill_param_;
+  atb_speed::deepseekV2::DecoderLayerParam prefill_no_history_param_;
   atb_speed::deepseekV2::DecoderLayerParam decode_param_;
   atb_speed::deepseekV2::DecoderLayerParam mtp_prefill_fallback_param_;
   atb_speed::deepseekV2::DecoderLayerParam mtp_decode_fallback_param_;
 
   atb_speed::Model::Node prefill_node_;
+  atb_speed::Model::Node prefill_no_history_node_;
   atb_speed::Model::Node decode_node_;
   atb_speed::Model::Node mtp_prefill_fallback_node_;
   atb_speed::Model::Node mtp_decode_fallback_node_;

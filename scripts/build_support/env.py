@@ -158,6 +158,12 @@ def set_npu_envs() -> None:
     if not NPU_TOOLKIT_HOME:
         os.environ["NPU_TOOLKIT_HOME"] = "/usr/local/Ascend/ascend-toolkit/latest"
         NPU_TOOLKIT_HOME = "/usr/local/Ascend/ascend-toolkit/latest"
+    for path in (
+        os.path.join(NPU_TOOLKIT_HOME, "lib64"),
+        os.path.join(NPU_TOOLKIT_HOME, "tools", "mstx", "lib64"),
+    ):
+        if os.path.isdir(path):
+            prepend_path_env("LIBRARY_PATH", path)
     LD_LIBRARY_PATH = os.getenv("LD_LIBRARY_PATH", "")
     arch = platform.machine()
     LD_LIBRARY_PATH = NPU_TOOLKIT_HOME+"/lib64" + ":" + \

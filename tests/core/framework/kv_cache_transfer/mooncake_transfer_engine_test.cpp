@@ -201,6 +201,24 @@ TEST(MooncakeTransferEngineServiceTest, CloseSessionWithoutHandleReturnsTrue) {
   EXPECT_TRUE(response.ok());
 }
 
+TEST(KVCacheTransferTest, LayerwisePushUsesDestinationOwnerAndKeepsDraftFull) {
+  KVCacheTransfer::KVCacheInfo kv_info;
+  kv_info.enable_decode_dcp_layerwise_kv_cache = true;
+  kv_info.decode_dcp_size = 2;
+  kv_info.decode_dcp_rank = 1;
+
+  EXPECT_FALSE(KVCacheTransfer::should_push_layer_to_destination(
+      kv_info, /*layer_id=*/0, /*is_spec_draft=*/false));
+  EXPECT_TRUE(KVCacheTransfer::should_push_layer_to_destination(
+      kv_info, /*layer_id=*/1, /*is_spec_draft=*/false));
+  EXPECT_TRUE(KVCacheTransfer::should_push_layer_to_destination(
+      kv_info, /*layer_id=*/2, /*is_spec_draft=*/true));
+
+  kv_info.enable_decode_dcp_layerwise_kv_cache = false;
+  EXPECT_TRUE(KVCacheTransfer::should_push_layer_to_destination(
+      kv_info, /*layer_id=*/0, /*is_spec_draft=*/false));
+}
+
 #if defined(USE_MLU)
 TEST(MooncakeKVCacheTransferDefaultTest, OwnerRankMergesSingleDst) {
   MooncakeKVCacheTransferDefault transfer(
