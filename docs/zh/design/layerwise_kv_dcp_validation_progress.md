@@ -254,8 +254,20 @@
     - 服务停止返回 `OWNER_ATTENTION_WORLD16_STOP_EXIT_CODE=0`；脚本因部分关联进程未在 TERM 窗口内退出而执行精确强制清理，随后 workspace 相关进程为 0，`npu-smi` 的 16 卡 process table 均为空。
     - 本轮动态覆盖的是 GLM-5 当前普通 decode 路径和 owner 轮换下的 collective 执行。expanded speculative decode、空 DP shard、`outputTopk -> skipTopk` 跨 owner 的专门请求，以及 fused/non-fused MLA 两种配置尚未分别动态覆盖；它们已通过静态 shape/顺序审查，但后续不能描述为实跑通过。新路径的 DCP1/DCP2 TPOT A/B 与 `msprof` 也尚未执行。
 
+35. 新 owner-attention 路径的同机 DCP1/DCP2 TPOT A/B 已完成。
+    - 两侧使用同一二进制 SHA-256 `3e1147a578f7677a0e156c8175457c2ec3fe2b465cc6d2fcc58f996b929670a5`，均为 WORLD16、DP2、attention TP8、ATB eager、graph=false、schedule-overlap=false、prefix-cache=false；DCP2 为 `decode_dcp_size=2, layerwise=true`，DCP1 为 `decode_dcp_size=1, layerwise=false`。每侧先执行 1 组双并发 warmup，再执行 5 组双并发正式请求；每条正式请求均为 `2504 prompt + 256 completion`、HTTP 200。
+
+    | 配置 | 样本数 | TPOT mean | TPOT p50 | TPOT p95 |
+    | --- | ---: | ---: | ---: | ---: |
+    | DCP1 / layerwise=false | 10 | `54.430 ms` | `54.250 ms` | `56.600 ms` |
+    | DCP2 / layerwise=true | 10 | `59.970 ms` | `59.850 ms` | `65.400 ms` |
+
+    - 新路径下 DCP2 相对同机 DCP1 的 mean TPOT overhead 为 `+5.540 ms/token`、`+10.18%`。上一版 fused-slot DCP2 在相同 2504-token、双并发、256-token 口径下为 `66.290 ms`，因此新 owner-attention DCP2 再降低 `6.320 ms/token`、`9.53%`；DCP2 相对 DCP1 的净 overhead 从上一轮 `8.890 ms` 降到本轮 `5.540 ms`，减少 `3.350 ms`、`37.68%`。跨轮绝对值会受运行窗口波动影响，主要结论以本轮同二进制 DCP1/DCP2 A/B 为准。
+    - DCP2 原始请求、服务端指标和统计分别为 `owner_attention_tpot_dcp2_requests_2504.jsonl`、`owner_attention_tpot_dcp2_server_metrics.log`、`owner_attention_tpot_dcp2_stats.log`；DCP1 对应文件将文件名中的 `dcp2` 替换为 `dcp1`。两侧 readiness 后请求窗口新增 Traceback/ERROR/FATAL 均为 0。
+    - 两侧停止均为 `STOPPED=FORCED`、退出码 0；精确 master/binary 关联进程已清零。DCP1 清理后出现外部 NPU context `1621831..1621846`，这些 PID 在当前容器 `/proc` 中不可见且不匹配本 workspace。为避免 profile 污染，不清理未知 context，也不在其存在时启动本轮 `msprof`；待设备再次空闲后复采并拆解剩余 `5.540 ms/token` overhead。
+
 ## 上下文恢复检查点
 
 上下文压缩后从本节恢复：第一轮 host metadata 优化和第二轮 fused slot mapping 均已实现并形成本地提交。主仓提交为 `702f1cd23`、`d3718eb59`、`cb2e88bb6`、`112da23e1`、`b4078c760`、`c394b76d9`、`115e16921`、`9e5680f9f`，ATB 子仓提交为 `23b40c6`、`9cd2088`。最终提交源码的完整 NPU 构建、wrapper/int32 聚焦测试、WORLD16 DP2/TP8/DCP2 功能语义、DCP1/DCP2 TPOT A/B、优化后 `msprof` 和资源清理均已通过。融合后 DCP2 TPOT 从 `78.410 ms` 降到 `66.290 ms`，相对 DCP1 的 overhead 从 `20.550 ms` 降到 `8.890 ms`，减少 `56.74%`；可识别 DCP 设备工作从 `23.231` 降到 `11.088 ms/token`，DCP2 仍比 DCP1 慢 `15.49%`。
 
-当前暂停点：`AllGather(Q) + owner SFA + Broadcast(output)` 验证版的代码、完整 NPU 构建、第二轮独立静态 review、12/12 聚焦测试以及 WORLD16 DP2/TP8/DCP2 普通 decode 功能语义回归均已通过，ATB/主仓源码提交分别为 `4f8377c`、`a63dfed07`，详见第 33、34 项。WORLD16 已验证 16/16 rank ready、真实语义请求、两个 DP shard 并发工作、non-owner AllGather 不被运行时裁剪、请求期全 rank 新增错误为 0，并已清理全部测试进程。expanded speculative decode、空 DP shard、跨 owner index-share 专门用例和 fused/non-fused MLA 两种配置仍只有静态审查结论；新路径的 DCP1/DCP2 TPOT A/B 与 `msprof` 尚未执行。下次恢复先检查环境，再补动态覆盖或开始性能验证，不要把静态覆盖项描述为实跑通过。`third_party/torch_npu_ops` 和未跟踪文件 `0` 的既有用户状态不得清理或提交。
+当前暂停点：`AllGather(Q) + owner SFA + Broadcast(output)` 验证版的代码、完整 NPU 构建、第二轮独立静态 review、12/12 聚焦测试、WORLD16 DP2/TP8/DCP2 普通 decode 功能语义和同机 DCP1/DCP2 TPOT A/B 均已通过，ATB/主仓源码提交分别为 `4f8377c`、`a63dfed07`，详见第 33 至 35 项。新 DCP2 mean TPOT 为 `59.970 ms`，同机 DCP1 为 `54.430 ms`，净 overhead 为 `5.540 ms`、`10.18%`；相对上一版 fused-slot DCP2 的 `66.290 ms` 再降低 `6.320 ms/token`。expanded speculative decode、空 DP shard、跨 owner index-share 专门用例和 fused/non-fused MLA 两种配置仍只有静态审查结论。DCP1 清理后出现不属于本 workspace、当前容器 `/proc` 不可见的外部 NPU context `1621831..1621846`，因此新路径的 `msprof` 尚未启动。下次恢复先检查设备，空闲后直接复采 DCP2 rank0/device0 `msprof` 并拆解剩余 overhead；不要清理未知 context，也不要把静态覆盖项描述为实跑通过。`third_party/torch_npu_ops` 和未跟踪文件 `0` 的既有用户状态不得清理或提交。
