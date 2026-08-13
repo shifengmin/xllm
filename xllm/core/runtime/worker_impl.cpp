@@ -35,6 +35,7 @@ limitations under the License.
 #endif
 
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +48,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/common/constants.h"
+#include "core/common/layerwise_split_placement.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -384,6 +386,9 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
   }
+  if (options_.is_draft_engine() || is_spec_draft_) {
+    parallel_args_.layerwise_split_size(1);
+  }
 
   // first worker is the driver
   driver_ = parallel_args.rank() == 0;
@@ -463,6 +468,22 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
+  const int32_t layerwise_split_size = effective_layerwise_split_size(
+      parallel_args_.layerwise_split_size(),
+      /*is_draft_model=*/false,
+      args.model_type());
+  std::vector<bool> layer_cache_owned;
+  if (layerwise_split_size > 1) {
+    CHECK_EQ(parallel_args_.attn_tp_size() % layerwise_split_size, 0)
+        << "attn tp size (" << parallel_args_.attn_tp_size()
+        << ") must be divisible by layerwise_split_size ("
+        << layerwise_split_size << ").";
+    const LayerwiseSplitPlacement placement(
+        /*enabled=*/true,
+        layerwise_split_size,
+        parallel_args_.layerwise_split_rank());
+    layer_cache_owned = build_layer_cache_owned(args, placement, num_layers);
+  }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
 
@@ -513,6 +534,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .enable_sleep_mode(options_.enable_sleep_mode())
       .enable_linear_attention(enable_linear_attention)
       .enable_lighting_indexer(enable_lighting_indexer)
+      .layer_cache_owned(std::move(layer_cache_owned))
       .indexer_cache_enabled_layers(std::move(indexer_cache_enabled_layers))
       .enable_kv_cache_quant(enable_kv_cache_quant)
       .enable_indexer_cache_quant(enable_indexer_cache_quant)

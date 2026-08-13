@@ -152,13 +152,35 @@ struct ParallelArgs {
   // cp size
   PROPERTY(int32_t, cp_size) = 1;
 
-  // Derived: CP rank of the current process within its DP group.
+  // Layer-owner KV group size inside attention TP. 1 disables layerwise split.
+  PROPERTY(int32_t, layerwise_split_size) = 1;
+
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
+  [[nodiscard]] int32_t attn_tp_size() const noexcept {
+    return world_size_ / dp_size_ / cp_size_;
+  }
+
+  [[nodiscard]] int32_t attn_tp_rank() const noexcept {
+    const int32_t tp = attn_tp_size();
+    if (tp <= 1) {
+      return 0;
+    }
+    return rank_ % tp;
+  }
+
+  [[nodiscard]] int32_t layerwise_split_rank() const noexcept {
+    if (layerwise_split_size_ <= 1) {
+      return 0;
+    }
+    return attn_tp_rank() % layerwise_split_size_;
+  }
+
+  // Derived: CP rank of the current process within its DP group.
   [[nodiscard]] int32_t cp_rank() const noexcept {
     if (cp_size_ <= 1) {
       return 0;
     }
-    int32_t tp_sz = world_size_ / dp_size_ / cp_size_;
+    int32_t tp_sz = attn_tp_size();
     return (rank_ % (cp_size_ * tp_sz)) / tp_sz;
   }
 
