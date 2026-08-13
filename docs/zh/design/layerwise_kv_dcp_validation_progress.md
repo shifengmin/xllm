@@ -264,10 +264,24 @@
 
     - 新路径下 DCP2 相对同机 DCP1 的 mean TPOT overhead 为 `+5.540 ms/token`、`+10.18%`。上一版 fused-slot DCP2 在相同 2504-token、双并发、256-token 口径下为 `66.290 ms`，因此新 owner-attention DCP2 再降低 `6.320 ms/token`、`9.53%`；DCP2 相对 DCP1 的净 overhead 从上一轮 `8.890 ms` 降到本轮 `5.540 ms`，减少 `3.350 ms`、`37.68%`。跨轮绝对值会受运行窗口波动影响，主要结论以本轮同二进制 DCP1/DCP2 A/B 为准。
     - DCP2 原始请求、服务端指标和统计分别为 `owner_attention_tpot_dcp2_requests_2504.jsonl`、`owner_attention_tpot_dcp2_server_metrics.log`、`owner_attention_tpot_dcp2_stats.log`；DCP1 对应文件将文件名中的 `dcp2` 替换为 `dcp1`。两侧 readiness 后请求窗口新增 Traceback/ERROR/FATAL 均为 0。
-    - 两侧停止均为 `STOPPED=FORCED`、退出码 0；精确 master/binary 关联进程已清零。DCP1 清理后出现外部 NPU context `1621831..1621846`，这些 PID 在当前容器 `/proc` 中不可见且不匹配本 workspace。为避免 profile 污染，不清理未知 context，也不在其存在时启动本轮 `msprof`；待设备再次空闲后复采并拆解剩余 `5.540 ms/token` overhead。
+    - 两侧停止均为 `STOPPED=FORCED`、退出码 0；精确 master/binary 关联进程已清零。DCP1 清理后出现外部 NPU context `1621831..1621846`，这些 PID 在当前容器 `/proc` 中不可见且不匹配本 workspace。用户确认它们是稳定的低显存背景负载，因此本轮保留、不纳入 workspace 清理目标；在该背景负载存在时仍完成了新的 `msprof` 采集。
+
+36. Owner-attention DCP2 的干净 `msprof` 复采和 overhead 拆解完成。采集对象为 rank 0/device 0，二进制 SHA 为 `3e1147a578f7677a0e156c8175457c2ec3fe2b465cc6d2fcc58f996b929670a5`，配置仍为 WORLD16、DP2、attention TP8、EP16、DCP2、layerwise=true。原始 profile 位于 `build/dcp-kv-validation/msprof/owner_attention_dcp2_rank0_clean_20260813/PROF_000001_20260813113351667_00142290IIHJNPGF/`，导出退出码为 0；导出期间只有 `Cluster Tuning did not complete` 非阻塞 warning。
+    - 采集窗口为 `03:36:27--03:38:27 UTC`。warmup 在窗口前完成；正式请求为 `2504 prompt + 256 completion`、HTTP 200，`fully_inside_window=true`，服务端 profile TPOT 为 `70.0 ms`。该数值受到 msprof 侵入式采集影响，端到端性能仍以无 profiler 的同机 A/B 为准：DCP1 `54.430 ms`、DCP2 `59.970 ms`、净 overhead `5.540 ms/token`。
+    - 新 DCP collective 的完整窗口调用数为 `19,890 = 78 x 255`，说明采集覆盖了 255 个完整 decode step：
+
+      | 新路径通信 | HCCL count | calls | HCCL device task 总耗时 | 折算单 token |
+      | --- | ---: | ---: | ---: | ---: |
+      | Q AllGather（BF16） | `4608` | `19,890` | `142.142 ms` | `0.557 ms` |
+      | attention output Broadcast（BF16） | `8192` | `19,890` | `654.472 ms` | `2.566 ms` |
+
+      `4608 = H_local x (kv_lora_rank + qk_rope_head_dim) x DCP`，`8192 = H_local x kv_lora_rank x DCP`，与源码中的 `[T,H_local,576] -> [DCP,T,H_local,576]` 和 owner 输出 `[T,DCP*H_local,512]` 一致。index-share 保留的 top-k broadcast 为 BF16 count `576` 和 `128`，各 `78` 次；它们不是 selected-KV 通信。
+    - 旧 selected-KV broadcast 的 BF16 count `1179648` 在新 profile 中为 0；旧 logical-to-physical slot mapping kernel 名称也不在新导出的 op summary 中。新 owner attention 的 `SparseFlashAttention` 在完整窗口有 `9,945 = 39 x 255` 次，表示每个 token 只有 39 个 owner layer invocation；排除窗口前的 78 次图/初始化样本后，均值约 `96.5 us`，折算 owner attention 计算 `3.764 ms/token`。对照旧路径每 token 78 次约 `7.299 ms/token`，owner-only 计算本身减少约 `3.535 ms/token`。
+    - owner 路径可直接识别的布局工作包括 `Transpose16Kernel`（约 `0.353 ms/token`，主要对应 owner Q rank-major -> token-major）、`SplitVF16Output3Kernel`（约 `0.159 ms/token`）和 Q pack 的 `ConcatF16Input2Kernel`（约 `0.501 ms/token`，该名称还包含非 DCP concat，故只作上界参考）。这些工作与 `0.557 + 2.566 = 3.123 ms/token` 的新 DCP 通信一起，替换了旧 selected-KV broadcast、旧 pack/copy/unpack/scatter 链；不能把所有同名算子总和直接当作 DCP 独占成本。
+    - profile 结论与无 profiler TPOT 方向一致：DCP2 相对 DCP1 的净开销已由上一版 `8.890 ms/token` 降到 `5.540 ms/token`，新 owner 路径的主要剩余 DCP 成本是 output broadcast，其次是 owner attention 关键路径和 Q AllGather。下一步若继续优化，应优先评估 root-only gather/scatter 或融合 Q pack/layout，而不是恢复 selected-KV 广播。
 
 ## 上下文恢复检查点
 
 上下文压缩后从本节恢复：第一轮 host metadata 优化和第二轮 fused slot mapping 均已实现并形成本地提交。主仓提交为 `702f1cd23`、`d3718eb59`、`cb2e88bb6`、`112da23e1`、`b4078c760`、`c394b76d9`、`115e16921`、`9e5680f9f`，ATB 子仓提交为 `23b40c6`、`9cd2088`。最终提交源码的完整 NPU 构建、wrapper/int32 聚焦测试、WORLD16 DP2/TP8/DCP2 功能语义、DCP1/DCP2 TPOT A/B、优化后 `msprof` 和资源清理均已通过。融合后 DCP2 TPOT 从 `78.410 ms` 降到 `66.290 ms`，相对 DCP1 的 overhead 从 `20.550 ms` 降到 `8.890 ms`，减少 `56.74%`；可识别 DCP 设备工作从 `23.231` 降到 `11.088 ms/token`，DCP2 仍比 DCP1 慢 `15.49%`。
 
-当前暂停点：`AllGather(Q) + owner SFA + Broadcast(output)` 验证版的代码、完整 NPU 构建、第二轮独立静态 review、12/12 聚焦测试、WORLD16 DP2/TP8/DCP2 普通 decode 功能语义和同机 DCP1/DCP2 TPOT A/B 均已通过，ATB/主仓源码提交分别为 `4f8377c`、`a63dfed07`，详见第 33 至 35 项。新 DCP2 mean TPOT 为 `59.970 ms`，同机 DCP1 为 `54.430 ms`，净 overhead 为 `5.540 ms`、`10.18%`；相对上一版 fused-slot DCP2 的 `66.290 ms` 再降低 `6.320 ms/token`。expanded speculative decode、空 DP shard、跨 owner index-share 专门用例和 fused/non-fused MLA 两种配置仍只有静态审查结论。DCP1 清理后出现不属于本 workspace、当前容器 `/proc` 不可见的外部 NPU context `1621831..1621846`，因此新路径的 `msprof` 尚未启动。下次恢复先检查设备，空闲后直接复采 DCP2 rank0/device0 `msprof` 并拆解剩余 overhead；不要清理未知 context，也不要把静态覆盖项描述为实跑通过。`third_party/torch_npu_ops` 和未跟踪文件 `0` 的既有用户状态不得清理或提交。
+当前暂停点：`AllGather(Q) + owner SFA + Broadcast(output)` 验证版的代码、完整 NPU 构建、第二轮独立静态 review、12/12 聚焦测试、WORLD16 DP2/TP8/DCP2 普通 decode 功能语义、同机 DCP1/DCP2 TPOT A/B 和干净 DCP2 `msprof` 复采均已通过，ATB/主仓源码提交分别为 `4f8377c`、`a63dfed07`，详见第 33 至 36 项。新 DCP2 mean TPOT 为 `59.970 ms`，同机 DCP1 为 `54.430 ms`，净 overhead 为 `5.540 ms`、`10.18%`；相对上一版 fused-slot DCP2 的 `66.290 ms` 再降低 `6.320 ms/token`。干净 profile 中 Q AllGather 为 `0.557 ms/token`、attention output Broadcast 为 `2.566 ms/token`、owner-only SFA 约 `3.764 ms/token`，旧 selected-KV broadcast 和 slot mapping 均未出现。expanded speculative decode、空 DP shard、跨 owner index-share 专门用例和 fused/non-fused MLA 两种配置仍只有静态审查结论。外部 NPU context `1621831..1621846` 是用户确认的稳定低显存背景负载，未被清理且不影响本轮采集；workspace 关联进程已清零。`third_party/torch_npu_ops` 和未跟踪文件 `0` 的既有用户状态不得清理或提交。
