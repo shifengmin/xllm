@@ -106,13 +106,11 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
       should_run_speculative_decode(input.input_params);
   if (input.input_params.meta.num_sequences == 0 ||
       input.token_ids.numel() == 0) {
-    if (input.input_params.meta.batch_forward_type.is_decode() &&
-        !run_speculative_decode) {
-      ForwardInput aligned_input = input;
-      aligned_input.input_params.meta.batch_forward_type =
-          BatchForwardType::EMPTY;
-      return step_empty(aligned_input);
-    }
+    // Keep the original DECODE type for an empty DP shard.  The leaf worker
+    // uses it to create a fake token and participate in the same EP/HCCL
+    // collectives as active shards.  `run_speculative_decode` still controls
+    // whether this worker takes the speculative path; it must not change the
+    // collective contract of the empty shard.
     return step_empty(input);
   }
 
