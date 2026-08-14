@@ -1096,6 +1096,9 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
     }
     if (input_params_new.graph.use_expanded_decode_for_spec_verify_attention) {
       CHECK(dcp_inputs.expanded_query_cu_seq_lens.defined());
+      CHECK_EQ(dcp_inputs.expanded_query_cu_seq_lens.numel(), x.size(0) + 1)
+          << "Expanded decode DCP requires one cumulative query boundary per "
+             "token plus the leading zero.";
     }
     build_node_variant_pack(decode_node_,
                             x,

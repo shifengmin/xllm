@@ -810,6 +810,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.dp_global_token_nums) {
       token_num *= 2;
     }
+    for (int32_t& token_num :
+         new_input.input_params.parallel.raw_dp_global_token_nums) {
+      token_num *= 2;
+    }
     draft_outputs.emplace_back(run_llm_no_sync_impl(*draft_impl_,
                                                     new_input,
                                                     *prepare_stream_,
@@ -829,6 +833,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     new_input = input;
     for (int32_t& token_num :
          new_input.input_params.parallel.dp_global_token_nums) {
+      token_num *= options_.num_speculative_tokens() + 1;
+    }
+    for (int32_t& token_num :
+         new_input.input_params.parallel.raw_dp_global_token_nums) {
       token_num *= options_.num_speculative_tokens() + 1;
     }
     ForwardOutput output = run_llm_no_sync_impl(*impl_,
@@ -912,9 +920,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
     if (bootstrap_embeddings.size(0) !=
         static_cast<int64_t>(
             input.input_params.embedding.embedding_ids.size())) {
-      torch::Tensor bootstrap_idxes =
-          input.sampling_params.selected_token_idxes.to(
-              torch::dtype(torch::kLong).device(bootstrap_embeddings.device()));
+      const torch::Tensor& bootstrap_idxes =
+          input.sampling_params.selected_token_idxes;
+      CHECK_EQ(bootstrap_idxes.device(), bootstrap_embeddings.device())
+          << "MTP prefill bootstrap indices must already be on the hidden "
+             "state device.";
+      CHECK(bootstrap_idxes.is_contiguous())
+          << "MTP prefill bootstrap indices must be contiguous.";
       bootstrap_embeddings =
           bootstrap_embeddings.index_select(/*dim=*/0, bootstrap_idxes);
     }
@@ -923,8 +935,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
         input.input_params.embedding.embedding_ids,
         input.input_params.embedding.request_ids,
         output.sample_output.next_tokens,
-        target_hidden,
-        input.sampling_params.selected_token_idxes);
+        bootstrap_embeddings);
     clear_selected_embeddings(output);
   } else {
     clear_all_output_embeddings(output);
@@ -1873,6 +1884,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
     token_num *= num_val_tokens;
   }
+  for (int32_t& token_num : input_params.parallel.raw_dp_global_token_nums) {
+    token_num *= num_val_tokens;
+  }
 
   if (use_chunked_prefill_spec_verify_path()) {
     input_params.embedding.input_embedding = torch::Tensor();
@@ -2106,14 +2120,26 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
         token_num *= 2;
       }
+      for (int32_t& token_num :
+           input_params.parallel.raw_dp_global_token_nums) {
+        token_num *= 2;
+      }
     } else if (dp_enabled) {
       constexpr int32_t num_extend_tokens = 2;
       for (int32_t& token_num : input_params.parallel.dp_global_token_nums) {
         token_num *= num_extend_tokens;
       }
+      for (int32_t& token_num :
+           input_params.parallel.raw_dp_global_token_nums) {
+        token_num *= num_extend_tokens;
+      }
     } else if (input_params.parallel.dp_global_token_nums.size() == 1) {
-      input_params.parallel.dp_global_token_nums[0] =
+      const int32_t output_count =
           static_cast<int32_t>(buf.out_positions.size());
+      input_params.parallel.dp_global_token_nums[0] = output_count;
+      if (input_params.parallel.raw_dp_global_token_nums.size() == 1) {
+        input_params.parallel.raw_dp_global_token_nums[0] = output_count;
+      }
     }
   }
 

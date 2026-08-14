@@ -44,9 +44,8 @@ class EmbeddingCache final {
     // current real position from this offset.
     int32_t token_id = -1;
     int32_t position_offset = 0;
-    // Store detached views into target outputs instead of cloning. The views
-    // keep their storage alive until replaced, trading short-lived HBM
-    // retention for avoiding per-step embedding copies.
+    // Keep independent tensors because schedule overlap can recycle the target
+    // output storage before the cached embedding is consumed.
     torch::Tensor embedding;
 
     // Previous accepted target token. Its position is derived as

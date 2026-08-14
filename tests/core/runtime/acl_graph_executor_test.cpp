@@ -1124,6 +1124,18 @@ TEST(SpeculativeWorkerDispatchTest, DecodeRequiresEveryDpRankToDecode) {
   EXPECT_FALSE(should_run_speculative_decode(params));
 }
 
+TEST(SpeculativeWorkerDispatchTest, EmptyShardUsesGlobalDecodeState) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = 0;
+  params.parallel.dp_global_token_nums = {1, 0};
+  params.parallel.dp_is_decode = {1, 0};
+  EXPECT_FALSE(should_run_speculative_decode(params));
+
+  params.parallel.dp_is_decode = {1, 1};
+  EXPECT_TRUE(should_run_speculative_decode(params));
+}
+
 TEST(SpeculativeWorkerDispatchTest, PreservesSingleDpRankBehavior) {
   ModelInputParams params;
   params.meta.batch_forward_type = BatchForwardType::DECODE;

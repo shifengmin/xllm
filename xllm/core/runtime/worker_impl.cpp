@@ -491,8 +491,9 @@ void WorkerImpl::prepare_npu_dcp_inputs(ForwardInput& processed_input) {
     CHECK_GT(index_topk, 0);
     NpuDecodeDcpInput& dcp_input = input_params.npu_decode_dcp;
     if (input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+      // TND attention expects cumulative query boundaries with a leading zero.
       dcp_input.expanded_query_cu_seq_lens = torch::arange(
-          1,
+          0,
           query_count + 1,
           torch::TensorOptions().device(device_).dtype(torch::kInt32));
     }
@@ -1013,9 +1014,19 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
               .device(torch::kCPU)
               .dtype(torch::kInt32)
               .pinned_memory(true));
+      const auto& raw_dp_token_nums =
+          processed_input.input_params.parallel.raw_dp_global_token_nums;
+      torch::Tensor raw_token_size_per_dp_group =
+          raw_dp_token_nums.empty() ? torch::Tensor()
+                                    : torch::tensor(raw_dp_token_nums,
+                                                    torch::TensorOptions()
+                                                        .device(torch::kCPU)
+                                                        .dtype(torch::kInt32)
+                                                        .pinned_memory(true));
       const bool is_prefill =
           processed_input.input_params.meta.batch_forward_type.no_decode();
       DpEpPadding dp_ep_padding(token_size_per_dp_group,
+                                raw_token_size_per_dp_group,
                                 context_.get_model_args().num_experts_per_tok(),
                                 context_.get_parallel_args().mapping_data(),
                                 device_,
