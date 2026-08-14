@@ -21,6 +21,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/common/layerwise_split_placement.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
 
 namespace xllm {
@@ -44,6 +45,7 @@ struct KVCacheEstimateOptions {
   bool is_draft_engine = false;
   bool enable_prefix_cache = false;
   bool enable_rdma_scale_padding = false;
+  int32_t layerwise_split_size = 1;
   const ModelArgs* draft_model_args = nullptr;
   const KVCacheEstimateOptions* draft_options = nullptr;
 };
@@ -60,6 +62,20 @@ struct Dsv4KVCacheEstimateCost {
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers);
+
+// Linear-attention layers stay owned on every rank.
+std::vector<bool> build_layer_cache_owned(
+    const ModelArgs& model_args,
+    const LayerwiseSplitPlacement& placement,
+    int64_t num_layers);
+
+// Worst-rank owned layers plus one scratch layer, then divide remaining bytes.
+int64_t estimate_layerwise_split_block_count(
+    const ModelArgs& model_args,
+    int32_t layerwise_split_size,
+    const KVCacheCapacity& kv_cache_cap,
+    int64_t available_bytes,
+    int64_t additional_block_bytes);
 
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,

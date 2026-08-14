@@ -60,6 +60,53 @@ TEST(KVCacheEstimationTest, EstimatesStandardAttentionBlocks) {
   EXPECT_EQ(capacity.n_blocks(), 128);
 }
 
+TEST(KVCacheEstimationTest, LayerwiseCapacityUsesLargestOwnerFootprint) {
+  ModelArgs model_args = make_standard_args();
+  model_args.n_layers(5);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.layerwise_split_size = 2;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+
+  // 1 MiB / (3 owned + scratch) = 1 MiB / (4 * 16 * 128 B).
+  EXPECT_EQ(capacity.n_blocks(), 128);
+}
+
+TEST(KVCacheEstimationTest, BuildsLayerCacheOwnedFromPlacement) {
+  ModelArgs model_args = make_standard_args();
+  const LayerwiseSplitPlacement placement(
+      /*enabled=*/true, /*group_size=*/2, /*local_rank=*/0);
+  const std::vector<bool> owned =
+      build_layer_cache_owned(model_args, placement, /*num_layers=*/4);
+  ASSERT_EQ(owned.size(), 4);
+  EXPECT_TRUE(owned[0]);
+  EXPECT_FALSE(owned[1]);
+  EXPECT_TRUE(owned[2]);
+  EXPECT_FALSE(owned[3]);
+}
+
+TEST(KVCacheEstimationTest, LayerwiseCapacityIncludesFullDraftCache) {
+  ModelArgs model_args = make_standard_args();
+  model_args.n_layers(5);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.layerwise_split_size = 2;
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  const int64_t draft_block_bytes =
+      capacity.block_size() * capacity.slot_size();
+
+  const int64_t block_count =
+      estimate_layerwise_split_block_count(model_args,
+                                           options.layerwise_split_size,
+                                           capacity,
+                                           options.cache_size_in_bytes,
+                                           draft_block_bytes);
+
+  // 1 MiB / (3 owned + scratch + draft) = 1 MiB / (5 * 16 * 128 B).
+  EXPECT_EQ(block_count, 102);
+}
+
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   ModelArgs model_args = make_standard_args();
   KVCacheEstimateOptions options = make_estimate_options();

@@ -18,8 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <vector>
 
 #include "common/metrics.h"
 #if defined(USE_MLU)
@@ -429,27 +431,26 @@ runtime::Options mtp_draft_options(const runtime::Options& options) {
 
 ParallelArgs MTPDraftParallelArgs(const ParallelArgs& parallel_args,
                                   const runtime::Options& options) {
-  if (!options.enable_mtp_draft_body_tp1()) {
-    return parallel_args;
-  }
-  CHECK(parallel_args.single_rank_group_ != nullptr)
-      << "MTP draft body TP1 requires a single-rank process group";
   ParallelArgs draft_args = parallel_args;
-  draft_args.rank(0)
-      .world_size(1)
-      .dp_size(1)
-      .ep_size(1)
-      .cp_size(1)
-      .tp_size(1)
-      .sp_size(1);
-  draft_args.mapping_data(nlohmann::json{});
-  draft_args.process_group_ = parallel_args.single_rank_group_;
-  draft_args.dp_local_process_group_ = parallel_args.single_rank_group_;
-  draft_args.lm_head_group_ = parallel_args.tp_group_;
-  draft_args.tp_group_ = parallel_args.single_rank_group_;
-  draft_args.cp_group_ = parallel_args.single_rank_group_;
-  draft_args.moe_ep_group_ = parallel_args.single_rank_group_;
-  draft_args.moe_tp_group_ = parallel_args.single_rank_group_;
+  if (options.enable_mtp_draft_body_tp1()) {
+    CHECK(parallel_args.single_rank_group_ != nullptr)
+        << "MTP draft body TP1 requires a single-rank process group";
+    draft_args.rank(0)
+        .world_size(1)
+        .dp_size(1)
+        .ep_size(1)
+        .cp_size(1)
+        .tp_size(1)
+        .sp_size(1);
+    draft_args.mapping_data(nlohmann::json{});
+    draft_args.process_group_ = parallel_args.single_rank_group_;
+    draft_args.dp_local_process_group_ = parallel_args.single_rank_group_;
+    draft_args.lm_head_group_ = parallel_args.tp_group_;
+    draft_args.tp_group_ = parallel_args.single_rank_group_;
+    draft_args.cp_group_ = parallel_args.single_rank_group_;
+    draft_args.moe_ep_group_ = parallel_args.single_rank_group_;
+    draft_args.moe_tp_group_ = parallel_args.single_rank_group_;
+  }
   return draft_args;
 }
 
