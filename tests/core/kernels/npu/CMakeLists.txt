@@ -51,4 +51,26 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
     "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
+cc_test(
+  NAME
+    hccl_scatter_operation_test
+  SRCS
+    hccl_scatter_operation_test.cpp
+  DEPS
+    xllm_atb_layers
+    atb
+    ascendcl
+    c_sec
+    hccl
+    GTest::gtest_main
+    spdlog::spdlog
+)
+target_link_options(hccl_scatter_operation_test PRIVATE
+  "-L$ENV{NPU_HOME_PATH}/lib64"
+)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(hccl_scatter_operation_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()
+
 add_subdirectory(tilelang)
