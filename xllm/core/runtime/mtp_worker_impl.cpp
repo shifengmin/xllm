@@ -18,8 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <vector>
 
 #include "common/metrics.h"
 #if defined(USE_MLU)
@@ -427,30 +429,62 @@ runtime::Options mtp_draft_options(const runtime::Options& options) {
   return draft_options;
 }
 
+#if defined(USE_NPU)
+// Decoder graphs key off mapping.Get(ATTN_LAYERWISE_SPLIT).IsEnabled(), not
+// ParallelArgs.layerwise_split_size. Collapse the copied group to a singleton
+// so a non-TP1 draft does not AllGather Q or Broadcast attention/topk.
+void disable_layerwise_split_mapping(ParallelArgs* parallel_args) {
+  CHECK(parallel_args != nullptr);
+  nlohmann::json& mapping_data = parallel_args->mapping_data();
+  if (mapping_data.contains("attnLayerwiseSplit")) {
+    nlohmann::json& split = mapping_data["attnLayerwiseSplit"];
+    split["group_size"] = 1;
+    split["rank"] = 0;
+    split["rankIds"] = std::vector<uint32_t>{
+        static_cast<uint32_t>(parallel_args->rank())};
+  }
+
+  atb_speed::base::Mapping& mapping = parallel_args->mapping();
+  if (!mapping.Has(atb_speed::base::ATTN_LAYERWISE_SPLIT)) {
+    return;
+  }
+  atb_speed::common::ParallelInfo split_info =
+      mapping.Get(atb_speed::base::ATTN_LAYERWISE_SPLIT);
+  if (!split_info.IsEnabled()) {
+    return;
+  }
+  split_info.rank = 0;
+  split_info.rankIds = {static_cast<uint32_t>(parallel_args->rank())};
+  mapping.Register(atb_speed::base::ATTN_LAYERWISE_SPLIT, split_info);
+}
+#endif
+
 ParallelArgs MTPDraftParallelArgs(const ParallelArgs& parallel_args,
                                   const runtime::Options& options) {
   ParallelArgs draft_args = parallel_args;
   draft_args.layerwise_split_size(1);
-  if (!options.enable_mtp_draft_body_tp1()) {
-    return draft_args;
+  if (options.enable_mtp_draft_body_tp1()) {
+    CHECK(parallel_args.single_rank_group_ != nullptr)
+        << "MTP draft body TP1 requires a single-rank process group";
+    draft_args.rank(0)
+        .world_size(1)
+        .dp_size(1)
+        .ep_size(1)
+        .cp_size(1)
+        .tp_size(1)
+        .sp_size(1);
+    draft_args.mapping_data(nlohmann::json{});
+    draft_args.process_group_ = parallel_args.single_rank_group_;
+    draft_args.dp_local_process_group_ = parallel_args.single_rank_group_;
+    draft_args.lm_head_group_ = parallel_args.tp_group_;
+    draft_args.tp_group_ = parallel_args.single_rank_group_;
+    draft_args.cp_group_ = parallel_args.single_rank_group_;
+    draft_args.moe_ep_group_ = parallel_args.single_rank_group_;
+    draft_args.moe_tp_group_ = parallel_args.single_rank_group_;
   }
-  CHECK(parallel_args.single_rank_group_ != nullptr)
-      << "MTP draft body TP1 requires a single-rank process group";
-  draft_args.rank(0)
-      .world_size(1)
-      .dp_size(1)
-      .ep_size(1)
-      .cp_size(1)
-      .tp_size(1)
-      .sp_size(1);
-  draft_args.mapping_data(nlohmann::json{});
-  draft_args.process_group_ = parallel_args.single_rank_group_;
-  draft_args.dp_local_process_group_ = parallel_args.single_rank_group_;
-  draft_args.lm_head_group_ = parallel_args.tp_group_;
-  draft_args.tp_group_ = parallel_args.single_rank_group_;
-  draft_args.cp_group_ = parallel_args.single_rank_group_;
-  draft_args.moe_ep_group_ = parallel_args.single_rank_group_;
-  draft_args.moe_tp_group_ = parallel_args.single_rank_group_;
+#if defined(USE_NPU)
+  disable_layerwise_split_mapping(&draft_args);
+#endif
   return draft_args;
 }
 
