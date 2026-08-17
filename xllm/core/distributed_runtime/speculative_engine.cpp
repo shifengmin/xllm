@@ -247,10 +247,17 @@ int64_t SpeculativeEngine::calculate_kv_cache(
           : block_size * draft_full_attention_layers *
                 draft_allocated_full_attention_slot_size;
   const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const int32_t world_size = static_cast<int32_t>(options_.devices().size()) *
+                             std::max(options_.nnodes(), 1);
+  const int32_t attn_tp_size =
+      std::max(world_size / std::max(options_.dp_size(), 1) /
+                   std::max(options_.cp_size(), 1),
+               1);
   const int32_t layerwise_split_size = effective_layerwise_split_size(
       parallel_config.layerwise_split_size(),
+      model_args_.model_type(),
       options_.is_draft_engine(),
-      model_args_.model_type());
+      attn_tp_size);
   if (layerwise_split_size > 1) {
     return estimate_layerwise_split_block_count(
         model_args_,

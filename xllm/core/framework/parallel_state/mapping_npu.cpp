@@ -274,9 +274,6 @@ void MappingNPU::validate() {
   const int32_t attn_tp_size = attn_tp_.group_size();
   CHECK(layerwise_split_size >= 1)
       << "layerwise_split_size must be >= 1, got " << layerwise_split_size;
-  CHECK(layerwise_split_size <= attn_tp_size)
-      << "layerwise_split_size (" << layerwise_split_size
-      << ") must not exceed attention tp size (" << attn_tp_size << ").";
   CHECK(attn_tp_size % layerwise_split_size == 0)
       << "attention tp size (" << attn_tp_size
       << ") must be divisible by layerwise_split_size (" << layerwise_split_size
@@ -417,7 +414,6 @@ void MappingNPU::get_kv_split_group(ParallelInfo& parallel_info) {
 
 void MappingNPU::get_layerwise_split_group(ParallelInfo& parallel_info) {
   const int32_t split_size = parallel_info.group_size();
-  CHECK_GT(split_size, 0);
   std::vector<std::vector<int32_t>> rank_per_group;
   for (const std::vector<int32_t>& tp_group : attn_tp_.rank_per_group()) {
     if (tp_group.empty() || tp_group.front() >= world_size_) {

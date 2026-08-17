@@ -200,14 +200,7 @@ void allocate_sleepable_kv_caches(std::vector<KVCache>& kv_caches,
             << ", total_bytes=" << total_bytes << ", base=" << base;
 }
 
-// Layerwise KV cache keeps one shared scratch cache at the same block capacity
-// as an owned layer. Non-owner layers view it instead of holding their own
-// blocks so PD cache ids stay aligned; attention itself always runs on the
-// layer owner.
-//
-// The per-layer indexer mask is dropped so the scratch exposes the superset of
-// the per-layer cache ABI: a layer that owns indexer tensors must find them on
-// the scratch too.
+// One scratch layer for non-owners. Empty indexer mask exposes the superset ABI.
 KVCache create_layerwise_scratch_cache(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options) {
@@ -352,8 +345,6 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
   }
 
   if (util::is_deepseek_v4_model_type(create_options.model_type())) {
-    CHECK(layer_cache_owned.empty())
-        << "DeepSeek V4 does not support layerwise split.";
     std::vector<int32_t> layer_compress_ratios;
     layer_compress_ratios.reserve(static_cast<size_t>(num_layers));
     std::map<int32_t, std::string> ratio_shape_summaries;

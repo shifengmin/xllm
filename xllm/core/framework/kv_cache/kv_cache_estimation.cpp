@@ -157,11 +157,7 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
     layer_bytes[static_cast<size_t>(layer_id)] = bytes;
   }
 
-  // Every rank also holds one shared scratch layer at the same block capacity
-  // as an owned layer so PD cache ids stay aligned. Attention always runs on
-  // the layer owner; the scratch is not an attention working set. It exposes
-  // the superset cache ABI, hence the indexer cost whenever any layer carries
-  // indexer tensors.
+  // Scratch matches an owned layer, including indexer when any layer has one.
   const int64_t scratch_bytes_per_block =
       kv_cache_cap.block_size() *
       (kv_cache_cap.slot_size() + kv_cache_cap.scale_slot_size() +

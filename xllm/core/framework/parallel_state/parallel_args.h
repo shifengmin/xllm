@@ -25,6 +25,7 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 namespace xllm {
 
@@ -152,7 +153,6 @@ struct ParallelArgs {
   // cp size
   PROPERTY(int32_t, cp_size) = 1;
 
-  // Layer-owner KV group size inside attention TP. 1 disables layerwise split.
   PROPERTY(int32_t, layerwise_split_size) = 1;
 
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
@@ -173,6 +173,28 @@ struct ParallelArgs {
       return 0;
     }
     return attn_tp_rank() % layerwise_split_size_;
+  }
+
+  void collapse_layerwise_split_mapping() {
+    if (mapping_data_.contains("attnLayerwiseSplit")) {
+      nlohmann::json& split = mapping_data_["attnLayerwiseSplit"];
+      split["group_size"] = 1;
+      split["rank"] = 0;
+      split["rankIds"] = std::vector<uint32_t>{static_cast<uint32_t>(rank_)};
+    }
+#if defined(USE_NPU)
+    if (!mapping_.Has(atb_speed::base::ATTN_LAYERWISE_SPLIT)) {
+      return;
+    }
+    atb_speed::common::ParallelInfo split_info =
+        mapping_.Get(atb_speed::base::ATTN_LAYERWISE_SPLIT);
+    if (!split_info.IsEnabled()) {
+      return;
+    }
+    split_info.rank = 0;
+    split_info.rankIds = {static_cast<uint32_t>(rank_)};
+    mapping_.Register(atb_speed::base::ATTN_LAYERWISE_SPLIT, split_info);
+#endif
   }
 
   // Derived: CP rank of the current process within its DP group.

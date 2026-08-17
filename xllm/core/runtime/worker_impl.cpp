@@ -376,6 +376,22 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
 }
 #endif
 
+void apply_layerwise_split_size(ParallelArgs* parallel_args,
+                                const std::string& model_type,
+                                bool is_draft_model) {
+  CHECK(parallel_args != nullptr) << "parallel_args must not be null.";
+  const int32_t size = effective_layerwise_split_size(
+      parallel_args->layerwise_split_size(),
+      model_type,
+      is_draft_model,
+      parallel_args->attn_tp_size());
+  parallel_args->layerwise_split_size(size);
+  if (size > 1) {
+    return;
+  }
+  parallel_args->collapse_layerwise_split_mapping();
+}
+
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
@@ -385,9 +401,6 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
   if (options_.enable_speculative_decode() &&
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
-  }
-  if (options_.is_draft_engine() || is_spec_draft_) {
-    parallel_args_.layerwise_split_size(1);
   }
 
   // first worker is the driver
@@ -468,16 +481,9 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
-  const int32_t layerwise_split_size = effective_layerwise_split_size(
-      parallel_args_.layerwise_split_size(),
-      /*is_draft_model=*/false,
-      args.model_type());
+  const int32_t layerwise_split_size = parallel_args_.layerwise_split_size();
   std::vector<bool> layer_cache_owned;
   if (layerwise_split_size > 1) {
-    CHECK_EQ(parallel_args_.attn_tp_size() % layerwise_split_size, 0)
-        << "attn tp size (" << parallel_args_.attn_tp_size()
-        << ") must be divisible by layerwise_split_size ("
-        << layerwise_split_size << ").";
     const LayerwiseSplitPlacement placement(
         /*enabled=*/true,
         layerwise_split_size,
@@ -2026,6 +2032,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 #endif
 
   setup_rl_sleep_weights();
+
+  apply_layerwise_split_size(&parallel_args_,
+                             args.model_type(),
+                             options_.is_draft_engine() || is_spec_draft_);
 
   // create model context
   dtype_ = dtype;

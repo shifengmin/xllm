@@ -29,10 +29,12 @@ namespace xllm {
 
 [[nodiscard]] inline int32_t effective_layerwise_split_size(
     int32_t configured,
+    const std::string& model_type,
     bool is_draft_model,
-    const std::string& model_type) noexcept {
+    int32_t attn_tp_size) noexcept {
   if (configured <= 1 || is_draft_model ||
-      !is_layerwise_split_supported_model(model_type)) {
+      !is_layerwise_split_supported_model(model_type) || attn_tp_size <= 1 ||
+      attn_tp_size % configured != 0) {
     return 1;
   }
   return configured;

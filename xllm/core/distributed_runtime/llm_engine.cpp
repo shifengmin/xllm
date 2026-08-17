@@ -496,10 +496,6 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   estimate_options.is_draft_engine = options_.is_draft_engine();
   estimate_options.enable_prefix_cache =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
-  estimate_options.layerwise_split_size = effective_layerwise_split_size(
-      ParallelConfig::get_instance().layerwise_split_size(),
-      options_.is_draft_engine(),
-      args_.model_type());
   if (options_.enable_mtp_draft_body_tp1() && options_.is_draft_engine()) {
     estimate_options.world_size = 1;
     estimate_options.n_local_kv_heads =
@@ -507,6 +503,11 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
     estimate_options.n_local_linear_k_heads = args_.linear_num_key_heads();
     estimate_options.n_local_linear_v_heads = args_.linear_num_value_heads();
   }
+  estimate_options.layerwise_split_size = effective_layerwise_split_size(
+      ParallelConfig::get_instance().layerwise_split_size(),
+      args_.model_type(),
+      options_.is_draft_engine(),
+      static_cast<int32_t>(estimate_options.world_size));
 
   KVCacheCapacity kv_cache_cap =
       ::xllm::estimate_kv_cache_capacity(args_, estimate_options);

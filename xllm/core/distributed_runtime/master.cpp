@@ -96,10 +96,6 @@ void validate_layerwise_split_size_startup_config(const Options& options) {
 
   CHECK_LE(options.host_blocks_factor(), 1.0)
       << "layerwise_split_size > 1 does not support hierarchy host cache.";
-  // Context parallelism shards a layer along tokens while layer ownership
-  // shards the model along layers. Expressing both at once needs a
-  // two-dimensional placement that capacity and block metadata do not carry
-  // yet.
   CHECK_EQ(parallel_config.cp_size(), 1)
       << "layerwise_split_size > 1 does not support context parallelism.";
   CHECK_EQ(parallel_config.kv_split_size_effective(), 1)

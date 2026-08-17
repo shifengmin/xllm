@@ -18,12 +18,16 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <vector>
+
 namespace xllm {
 namespace {
 
 TEST(LayerwiseSplitPlacementTest, SupportsOnlyDsaModelFamilies) {
   EXPECT_TRUE(is_layerwise_split_supported_model("deepseek_v32"));
   EXPECT_TRUE(is_layerwise_split_supported_model("glm_moe_dsa"));
+  EXPECT_FALSE(is_layerwise_split_supported_model("deepseek_v32_mtp"));
+  EXPECT_FALSE(is_layerwise_split_supported_model("glm_moe_dsa_mtp"));
   EXPECT_FALSE(is_layerwise_split_supported_model("deepseek_v3"));
   EXPECT_FALSE(is_layerwise_split_supported_model("qwen3"));
 }
@@ -31,23 +35,51 @@ TEST(LayerwiseSplitPlacementTest, SupportsOnlyDsaModelFamilies) {
 TEST(LayerwiseSplitPlacementTest, ResolvesEffectiveLayerwiseSplitSize) {
   EXPECT_EQ(effective_layerwise_split_size(
                 /*configured=*/2,
+                /*model_type=*/"deepseek_v32",
                 /*is_draft_model=*/false,
-                /*model_type=*/"deepseek_v32"),
+                /*attn_tp_size=*/8),
             2);
   EXPECT_EQ(effective_layerwise_split_size(
                 /*configured=*/2,
+                /*model_type=*/"glm_moe_dsa",
+                /*is_draft_model=*/false,
+                /*attn_tp_size=*/8),
+            2);
+  EXPECT_EQ(effective_layerwise_split_size(
+                /*configured=*/2,
+                /*model_type=*/"deepseek_v32",
                 /*is_draft_model=*/true,
-                /*model_type=*/"deepseek_v32"),
+                /*attn_tp_size=*/8),
             1);
   EXPECT_EQ(effective_layerwise_split_size(
                 /*configured=*/1,
+                /*model_type=*/"deepseek_v32",
                 /*is_draft_model=*/false,
-                /*model_type=*/"deepseek_v32"),
+                /*attn_tp_size=*/8),
             1);
   EXPECT_EQ(effective_layerwise_split_size(
                 /*configured=*/2,
+                /*model_type=*/"qwen3",
                 /*is_draft_model=*/false,
-                /*model_type=*/"qwen3"),
+                /*attn_tp_size=*/8),
+            1);
+  EXPECT_EQ(effective_layerwise_split_size(
+                /*configured=*/2,
+                /*model_type=*/"deepseek_v32_mtp",
+                /*is_draft_model=*/false,
+                /*attn_tp_size=*/8),
+            1);
+  EXPECT_EQ(effective_layerwise_split_size(
+                /*configured=*/2,
+                /*model_type=*/"deepseek_v32",
+                /*is_draft_model=*/false,
+                /*attn_tp_size=*/1),
+            1);
+  EXPECT_EQ(effective_layerwise_split_size(
+                /*configured=*/2,
+                /*model_type=*/"deepseek_v32",
+                /*is_draft_model=*/false,
+                /*attn_tp_size=*/3),
             1);
 }
 
@@ -107,6 +139,28 @@ TEST(LayerwiseSplitPlacementTest, DerivesLocalRankFromParallelArgs) {
   rank_seven.layerwise_split_size(2);
   EXPECT_EQ(rank_seven.attn_tp_rank(), 7);
   EXPECT_EQ(rank_seven.layerwise_split_rank(), 1);
+}
+
+TEST(LayerwiseSplitPlacementTest, CollapsesLayerwiseSplitMappingData) {
+  ParallelArgs args(/*rank=*/7,
+                    /*world_size=*/16,
+                    /*dp_size=*/2,
+                    /*cp_size=*/1,
+                    /*process_group=*/nullptr,
+                    /*ep_size=*/1);
+  nlohmann::json mapping_data;
+  mapping_data["attnLayerwiseSplit"]["group_size"] = 2;
+  mapping_data["attnLayerwiseSplit"]["rank"] = 1;
+  mapping_data["attnLayerwiseSplit"]["rankIds"] = std::vector<uint32_t>{6, 7};
+  args.mapping_data(mapping_data);
+
+  args.collapse_layerwise_split_mapping();
+
+  const nlohmann::json& split = args.mapping_data()["attnLayerwiseSplit"];
+  EXPECT_EQ(split["group_size"].get<int32_t>(), 1);
+  EXPECT_EQ(split["rank"].get<int32_t>(), 0);
+  EXPECT_EQ(split["rankIds"].get<std::vector<uint32_t>>(),
+            (std::vector<uint32_t>{7}));
 }
 
 }  // namespace
