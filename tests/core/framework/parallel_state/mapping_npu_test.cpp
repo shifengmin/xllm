@@ -96,7 +96,11 @@ TEST(TestMappingNPU, ToJsonUsesHcclBuffsizeEnv) {
   nlohmann::json data = mapping.to_json();
   nlohmann::json mlp_tp = data["mlpTp"];
   int32_t mlp_tp_buffer_size = mlp_tp["bufferSize"];
-  EXPECT_EQ(mlp_tp_buffer_size, 128);
+  nlohmann::json kv_split = data["kvSplit"];
+  int32_t kv_split_buffer_size = kv_split["bufferSize"];
+  // Both values include the process-wide MappingNPU instance offset. kvSplit
+  // retains its 128 MiB base, so equality verifies the environment override.
+  EXPECT_EQ(mlp_tp_buffer_size, kv_split_buffer_size);
 }
 
 TEST(TestMappingNPU, SplitsEachAttentionTpGroupContiguously) {
@@ -105,13 +109,15 @@ TEST(TestMappingNPU, SplitsEachAttentionTpGroupContiguously) {
   options.layerwise_split_size(2);
 
   MappingNPU rank_six_mapping(rank_table_file, 16, 6, options);
-  nlohmann::json rank_six_split = rank_six_mapping.to_json()["attnLayerwiseSplit"];
+  nlohmann::json rank_six_split =
+      rank_six_mapping.to_json()["attnLayerwiseSplit"];
   EXPECT_EQ(rank_six_split["groupId"].get<int32_t>(), 3);
   EXPECT_EQ(rank_six_split["rank"].get<int32_t>(), 0);
   EXPECT_EQ(rank_six_split["rankIds"], nlohmann::json::array({6, 7}));
 
   MappingNPU rank_seven_mapping(rank_table_file, 16, 7, options);
-  nlohmann::json rank_seven_split = rank_seven_mapping.to_json()["attnLayerwiseSplit"];
+  nlohmann::json rank_seven_split =
+      rank_seven_mapping.to_json()["attnLayerwiseSplit"];
   EXPECT_EQ(rank_seven_split["groupId"].get<int32_t>(), 3);
   EXPECT_EQ(rank_seven_split["rank"].get<int32_t>(), 1);
   EXPECT_EQ(rank_seven_split["rankIds"], nlohmann::json::array({6, 7}));
