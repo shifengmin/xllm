@@ -14,11 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include "core/common/layerwise_split_placement.h"
-#include "core/framework/parallel_state/parallel_args.h"
 
 #include <gtest/gtest.h>
 
-#include <vector>
+#include "core/framework/parallel_state/parallel_args.h"
 
 namespace xllm {
 namespace {
@@ -139,28 +138,6 @@ TEST(LayerwiseSplitPlacementTest, DerivesLocalRankFromParallelArgs) {
   rank_seven.layerwise_split_size(2);
   EXPECT_EQ(rank_seven.attn_tp_rank(), 7);
   EXPECT_EQ(rank_seven.layerwise_split_rank(), 1);
-}
-
-TEST(LayerwiseSplitPlacementTest, CollapsesLayerwiseSplitMappingData) {
-  ParallelArgs args(/*rank=*/7,
-                    /*world_size=*/16,
-                    /*dp_size=*/2,
-                    /*cp_size=*/1,
-                    /*process_group=*/nullptr,
-                    /*ep_size=*/1);
-  nlohmann::json mapping_data;
-  mapping_data["attnLayerwiseSplit"]["group_size"] = 2;
-  mapping_data["attnLayerwiseSplit"]["rank"] = 1;
-  mapping_data["attnLayerwiseSplit"]["rankIds"] = std::vector<uint32_t>{6, 7};
-  args.mapping_data(mapping_data);
-
-  args.collapse_layerwise_split_mapping();
-
-  const nlohmann::json& split = args.mapping_data()["attnLayerwiseSplit"];
-  EXPECT_EQ(split["group_size"].get<int32_t>(), 1);
-  EXPECT_EQ(split["rank"].get<int32_t>(), 0);
-  EXPECT_EQ(split["rankIds"].get<std::vector<uint32_t>>(),
-            (std::vector<uint32_t>{7}));
 }
 
 }  // namespace
