@@ -34,6 +34,7 @@ limitations under the License.
 #include "common/interruption_bus.h"
 #include "common/metrics.h"
 #include "common/options.h"
+#include "core/common/layerwise_split_placement.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
@@ -502,6 +503,11 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
     estimate_options.n_local_linear_k_heads = args_.linear_num_key_heads();
     estimate_options.n_local_linear_v_heads = args_.linear_num_value_heads();
   }
+  estimate_options.layerwise_split_size = effective_layerwise_split_size(
+      ParallelConfig::get_instance().layerwise_split_size(),
+      args_.model_type(),
+      options_.is_draft_engine(),
+      static_cast<int32_t>(estimate_options.world_size));
 
   KVCacheCapacity kv_cache_cap =
       ::xllm::estimate_kv_cache_capacity(args_, estimate_options);

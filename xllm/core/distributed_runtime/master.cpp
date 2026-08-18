@@ -34,6 +34,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/common/layerwise_split_placement.h"
 #include "core/common/xllm_build_info.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -83,6 +84,22 @@ void apply_runtime_kv_cache_options(const Options& source,
       .prefetch_timeout(source.prefetch_timeout())
       .layers_wise_copy_batchs(source.layers_wise_copy_batchs())
       .kv_cache_dtype(source.kv_cache_dtype());
+}
+
+void validate_layerwise_split_size_startup_config(const Options& options) {
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const int32_t layerwise_split_size = parallel_config.layerwise_split_size();
+  validate_layerwise_split_size_config(layerwise_split_size);
+  if (layerwise_split_size <= 1) {
+    return;
+  }
+
+  CHECK_LE(options.host_blocks_factor(), 1.0)
+      << "layerwise_split_size > 1 does not support hierarchy host cache.";
+  CHECK_EQ(parallel_config.cp_size(), 1)
+      << "layerwise_split_size > 1 does not support context parallelism.";
+  CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+      << "layerwise_split_size > 1 does not support KV split.";
 }
 
 std::optional<std::string> validate_model_cp(const Options& options,
@@ -430,6 +447,7 @@ Master::Master(const Options& options, EngineType type)
   }
   resolve_npu_kernel_backend_for_options(&options_);
 #endif
+  validate_layerwise_split_size_startup_config(options_);
   ParallelConfig::get_instance().enable_multi_stream_parallel(
       options.enable_multi_stream_parallel() && (options.nnodes() > 1));
   if (ParallelConfig::get_instance().enable_multi_stream_parallel()) {

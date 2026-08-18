@@ -35,6 +35,7 @@ limitations under the License.
 #endif
 
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +48,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/common/constants.h"
+#include "core/common/layerwise_split_placement.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -374,6 +376,22 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
 }
 #endif
 
+void apply_layerwise_split_size(ParallelArgs* parallel_args,
+                                const std::string& model_type,
+                                bool is_draft_model) {
+  CHECK(parallel_args != nullptr) << "parallel_args must not be null.";
+  const int32_t size = effective_layerwise_split_size(
+      parallel_args->layerwise_split_size(),
+      model_type,
+      is_draft_model,
+      parallel_args->attn_tp_size());
+  parallel_args->layerwise_split_size(size);
+  if (size > 1) {
+    return;
+  }
+  parallel_args->collapse_layerwise_split_mapping();
+}
+
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
@@ -463,6 +481,15 @@ bool WorkerImpl::allocate_kv_cache_storage(
       << "simultaneously.";
 
   const int64_t num_layers = get_num_layers();
+  const int32_t layerwise_split_size = parallel_args_.layerwise_split_size();
+  std::vector<bool> layer_cache_owned;
+  if (layerwise_split_size > 1) {
+    const LayerwiseSplitPlacement placement(
+        /*enabled=*/true,
+        layerwise_split_size,
+        parallel_args_.layerwise_split_rank());
+    layer_cache_owned = build_layer_cache_owned(args, placement, num_layers);
+  }
   std::vector<bool> indexer_cache_enabled_layers =
       resolve_indexer_cache_enabled_layers(args, num_layers);
 
@@ -513,6 +540,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .enable_sleep_mode(options_.enable_sleep_mode())
       .enable_linear_attention(enable_linear_attention)
       .enable_lighting_indexer(enable_lighting_indexer)
+      .layer_cache_owned(std::move(layer_cache_owned))
       .indexer_cache_enabled_layers(std::move(indexer_cache_enabled_layers))
       .enable_kv_cache_quant(enable_kv_cache_quant)
       .enable_indexer_cache_quant(enable_indexer_cache_quant)
@@ -2004,6 +2032,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 #endif
 
   setup_rl_sleep_weights();
+
+  apply_layerwise_split_size(&parallel_args_,
+                             args.model_type(),
+                             options_.is_draft_engine() || is_spec_draft_);
 
   // create model context
   dtype_ = dtype;

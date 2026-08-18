@@ -5,6 +5,7 @@ cc_library(
     common
   HDRS
     constants.h
+    layerwise_split_placement.h
     etcd_client.h
     global_flags.h
     instance_name.h
