@@ -123,4 +123,16 @@ TEST(TestMappingNPU, SplitsEachAttentionTpGroupContiguously) {
   EXPECT_EQ(rank_seven_split["rankIds"], nlohmann::json::array({6, 7}));
 }
 
+TEST(TestMappingNPU, FallsBackForIncompatibleAttentionTpSize) {
+  std::string rank_table_file;
+  MappingNPU::Options options = get_mapping_options();
+  options.layerwise_split_size(3);
+
+  MappingNPU mapping(rank_table_file, 16, 7, options);
+  nlohmann::json split = mapping.to_json()["attnLayerwiseSplit"];
+
+  EXPECT_EQ(split["rank"].get<int32_t>(), 0);
+  EXPECT_EQ(split["rankIds"], nlohmann::json::array({7}));
+}
+
 }  // namespace xllm

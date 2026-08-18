@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdlib>
 #include <limits>
 
+#include "core/common/layerwise_split_placement.h"
+
 #define MAX_LCCL_COMM_DOMAIN 63
 #define ENV_enable_extra_o_proj_tp false
 #define ENV_lm_head_local_tp false
@@ -211,7 +213,8 @@ void MappingNPU::parse_parallel_info() {
     attn_cp_.group_size(options_.cp_size());
   }
 
-  attn_layerwise_split_.group_size(options_.layerwise_split_size());
+  attn_layerwise_split_.group_size(topology_compatible_layerwise_split_size(
+      options_.layerwise_split_size(), attn_tp_.group_size()));
   attn_layerwise_split_.backend("hccl");
 
   const int32_t cp_group_size =

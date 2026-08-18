@@ -27,17 +27,24 @@ namespace xllm {
   return model_type == "deepseek_v32" || model_type == "glm_moe_dsa";
 }
 
+[[nodiscard]] inline int32_t topology_compatible_layerwise_split_size(
+    int32_t configured,
+    int32_t attn_tp_size) noexcept {
+  if (configured <= 1 || attn_tp_size <= 1 || attn_tp_size % configured != 0) {
+    return 1;
+  }
+  return configured;
+}
+
 [[nodiscard]] inline int32_t effective_layerwise_split_size(
     int32_t configured,
     const std::string& model_type,
     bool is_draft_model,
     int32_t attn_tp_size) noexcept {
-  if (configured <= 1 || is_draft_model ||
-      !is_layerwise_split_supported_model(model_type) || attn_tp_size <= 1 ||
-      attn_tp_size % configured != 0) {
+  if (is_draft_model || !is_layerwise_split_supported_model(model_type)) {
     return 1;
   }
-  return configured;
+  return topology_compatible_layerwise_split_size(configured, attn_tp_size);
 }
 
 inline void validate_layerwise_split_size_config(int32_t layerwise_split_size) {
@@ -50,7 +57,8 @@ class LayerwiseSplitPlacement final {
   LayerwiseSplitPlacement(bool enabled, int32_t group_size, int32_t local_rank)
       : enabled_(enabled), group_size_(group_size), local_rank_(local_rank) {
     CHECK_GT(group_size_, 0) << "Layerwise split group size must be positive.";
-    CHECK_GE(local_rank_, 0) << "Layerwise split local rank must be non-negative.";
+    CHECK_GE(local_rank_, 0)
+        << "Layerwise split local rank must be non-negative.";
     CHECK_LT(local_rank_, group_size_)
         << "Layerwise split local rank must be smaller than group size.";
   }
