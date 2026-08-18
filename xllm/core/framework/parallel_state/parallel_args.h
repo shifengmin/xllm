@@ -25,6 +25,7 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 namespace xllm {
 
@@ -152,13 +153,56 @@ struct ParallelArgs {
   // cp size
   PROPERTY(int32_t, cp_size) = 1;
 
-  // Derived: CP rank of the current process within its DP group.
+  PROPERTY(int32_t, layerwise_split_size) = 1;
+
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
+  [[nodiscard]] int32_t attn_tp_size() const noexcept {
+    return world_size_ / dp_size_ / cp_size_;
+  }
+
+  [[nodiscard]] int32_t attn_tp_rank() const noexcept {
+    const int32_t tp = attn_tp_size();
+    if (tp <= 1) {
+      return 0;
+    }
+    return rank_ % tp;
+  }
+
+  [[nodiscard]] int32_t layerwise_split_rank() const noexcept {
+    if (layerwise_split_size_ <= 1) {
+      return 0;
+    }
+    return attn_tp_rank() % layerwise_split_size_;
+  }
+
+  void collapse_layerwise_split_mapping() {
+    if (mapping_data_.contains("attnLayerwiseSplit")) {
+      nlohmann::json& split = mapping_data_["attnLayerwiseSplit"];
+      split["group_size"] = 1;
+      split["rank"] = 0;
+      split["rankIds"] = std::vector<uint32_t>{static_cast<uint32_t>(rank_)};
+    }
+#if defined(USE_NPU)
+    if (!mapping_.Has(atb_speed::base::ATTN_LAYERWISE_SPLIT)) {
+      return;
+    }
+    atb_speed::common::ParallelInfo split_info =
+        mapping_.Get(atb_speed::base::ATTN_LAYERWISE_SPLIT);
+    if (!split_info.IsEnabled()) {
+      return;
+    }
+    split_info.rank = 0;
+    split_info.rankIds = {static_cast<uint32_t>(rank_)};
+    mapping_.Register(atb_speed::base::ATTN_LAYERWISE_SPLIT, split_info);
+#endif
+  }
+
+  // Derived: CP rank of the current process within its DP group.
   [[nodiscard]] int32_t cp_rank() const noexcept {
     if (cp_size_ <= 1) {
       return 0;
     }
-    int32_t tp_sz = world_size_ / dp_size_ / cp_size_;
+    int32_t tp_sz = attn_tp_size();
     return (rank_ % (cp_size_ * tp_sz)) / tp_sz;
   }
 

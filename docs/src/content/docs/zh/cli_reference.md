@@ -127,6 +127,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `dp_size` | `int32` | `1` | MLA attention 的 data parallel 规模。 |
 | `ep_size` | `int32` | `1` | MoE 模型的 expert parallel 规模。 |
 | `cp_size` | `int32` | `1` | Context parallel 规模，需要后端和模型支持；设为 `1` 表示禁用 context parallel。MLU 的具体限制见[寒武纪 MLU](/zh/hardware/cambricon_mlu/)。 |
+| `layerwise_split_size` | `int32` | `1` | 每个 attention TP group 内的 layer-owner KV 规模。`1` 表示关闭；`> 1` 时按 layer owner 分片持久 KV、non-owner layer 共享一个 scratch cache，并启用 layerwise split 通信。该值必须整除 attention TP 规模。 |
 | `kv_split_size` | `int32` | `1` | KV Cache split 宽度；`0` 表示沿用 `cp_size`（旧行为），`1` 表示不切分 KV（每个 CP rank 存储完整 KV 并跳过 prefix AllGather），其他可整除 `cp_size` 的 K 表示 KV 在 K 个 rank 间分片，而 token-CP 仍使用 `cp_size`。 |
 | `tp_size` | `int64` | `1` | Tensor parallel 规模，仅 DiT 模型使用。 |
 | `sp_size` | `int64` | `1` | Sequence parallel 规模，仅 DiT 模型使用。 |

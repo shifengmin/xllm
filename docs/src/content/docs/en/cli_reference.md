@@ -127,6 +127,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `dp_size` | `int32` | `1` | Data parallel size for MLA attention. |
 | `ep_size` | `int32` | `1` | Expert parallel size for MoE models. |
 | `cp_size` | `int32` | `1` | Context parallel size. Backend and model support is required; `1` disables context parallelism. See [Cambricon MLU](/en/hardware/cambricon_mlu/) for MLU-specific constraints. |
+| `layerwise_split_size` | `int32` | `1` | Layer-owner KV group size within each attention TP group. `1` disables the feature; values `> 1` shard persistent KV by layer owner, share one scratch cache on non-owner layers, and enable layerwise-split communication. The value must divide the attention TP size. |
 | `kv_split_size` | `int32` | `1` | KV Cache split width. `0` falls back to `cp_size` (legacy). `1` disables KV split: each CP rank stores the full KV and skips the prefix AllGather. Other K values (K divides `cp_size`) shard KV across K ranks while token-CP still uses `cp_size`. |
 | `tp_size` | `int64` | `1` | Tensor parallelism size. Only used for DiT models. |
 | `sp_size` | `int64` | `1` | Sequence parallelism size. Only used for DiT models. |
