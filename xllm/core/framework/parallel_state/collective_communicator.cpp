@@ -229,6 +229,8 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
         global_rank, world_size, dp_size, cp_size, nullptr, ep_size);
     parallel_args_->kv_split_size(
         ::xllm::ParallelConfig::get_instance().kv_split_size());
+    parallel_args_->dcp_size(
+        ::xllm::ParallelConfig::get_instance().dcp_size());
     return;
   }
 
@@ -286,11 +288,13 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
                                                   dispatchAndCombineHcclComm);
   parallel_args_->kv_split_size(
       ::xllm::ParallelConfig::get_instance().kv_split_size());
+  parallel_args_->dcp_size(::xllm::ParallelConfig::get_instance().dcp_size());
 #else
   parallel_args_ = std::make_unique<ParallelArgs>(
       global_rank, world_size, dp_size, cp_size, nullptr, ep_size);
   parallel_args_->kv_split_size(
       ::xllm::ParallelConfig::get_instance().kv_split_size());
+  parallel_args_->dcp_size(::xllm::ParallelConfig::get_instance().dcp_size());
 #endif
 }
 
