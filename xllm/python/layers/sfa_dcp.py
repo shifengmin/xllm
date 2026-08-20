@@ -477,31 +477,27 @@ class AscendSFADCPImpl:
         return_lse: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         kv = kv_cache[0]
-        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+        attention_out, softmax_max, softmax_sum = torch.ops.xllm_ops.sparse_flash_attention_lse(
             query=ql_nope,
             key=kv,
             value=kv,
             sparse_indices=topk_indices,
-            scale_value=self.scale,
-            sparse_block_size=1,
             block_table=block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
             query_rope=q_pe,
             key_rope=kv_cache[1],
+            scale_value=self.scale,
+            sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=sparse_mode,
             attention_mode=2,
             return_softmax_lse=return_lse,
         )
-        if not isinstance(result, tuple):
-            if return_lse:
-                raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
-            return result
         if return_lse:
-            return result
-        return result[0]
+            return attention_out, softmax_max, softmax_sum
+        return attention_out
 
     def _execute_sparse_flash_attention_process(
         self,
