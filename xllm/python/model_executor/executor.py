@@ -53,7 +53,7 @@ def _create_attention_backend(
                 dcp_layer_options,
             )
 
-            index_topk, interleave_size, decode_threshold = dcp_layer_options(first_attention)
+            index_topk, decode_threshold = dcp_layer_options(first_attention)
             return SfaDcpAttentionBackend(
                 num_heads=first_attention.num_heads,
                 num_kv_heads=first_attention.num_kv_heads,
@@ -64,7 +64,6 @@ def _create_attention_backend(
                 dtype=dtype,
                 dcp_group=dcp_group,
                 index_topk=index_topk,
-                cp_kv_cache_interleave_size=interleave_size,
                 decode_threshold=decode_threshold,
                 max_num_reqs=max(max_num_reqs, 1),
             )

@@ -343,10 +343,10 @@ size_t SchedulerPolicy::compute_prefill_tokens(Sequence* seq,
   const size_t remaining_in_seq = seq->num_tokens() > kv_cache_tokens_num
                                       ? seq->num_tokens() - kv_cache_tokens_num
                                       : 0;
-  const int32_t kv_split_for_align =
-      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  const int32_t kv_shard_for_align =
+      ::xllm::ParallelConfig::get_instance().kv_shard_size();
   num_tokens = maybe_align_cp_chunk_tokens(num_tokens,
-                                           kv_split_for_align,
+                                           kv_shard_for_align,
                                            state.kv_cache_manager->block_size(),
                                            remaining_in_seq);
 

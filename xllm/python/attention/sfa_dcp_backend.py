@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch.distributed import ProcessGroup
 
-from xllm.python.attention.backend import AttentionMetadata
+from xllm.python.attention.backend import AttentionMetadata, LayerCache, MlaIndexContext
+from xllm.python.attention.kv_shard_layout import KVShardLayout
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 from xllm.python.layers.sfa_dcp import AscendSFADCPImpl, AscendSFADCPMetadataBuilder
 from xllm.python.model_executor.forward_context import get_forward_context
@@ -48,13 +49,12 @@ def _coordinator(group: ProcessGroup) -> _ProcessGroupCoordinator:
     )
 
 
-def dcp_layer_options(layer: Attention) -> tuple[int, int, int]:
+def dcp_layer_options(layer: Attention) -> tuple[int, int]:
     """Read SFA DCP knobs from a model attention layer, with safe defaults."""
     cfg = getattr(layer, "cfg", None)
     index_topk = int(getattr(cfg, "index_topk", 2048)) if cfg is not None else 2048
-    interleave_size = int(getattr(cfg, "cp_kv_cache_interleave_size", 1)) if cfg is not None else 1
     num_nextn = int(getattr(cfg, "num_nextn_predict_layers", 0)) if cfg is not None else 0
-    return index_topk, interleave_size, 1 + num_nextn
+    return index_topk, 1 + num_nextn
 
 
 def _query_start_loc_cpu(metadata: AttentionMetadata, num_reqs: int) -> torch.Tensor:
@@ -100,9 +100,8 @@ def _actual_seq_lengths(
 class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
     """Paged MLA backend whose ``execute_mla`` runs SFA DCP.
 
-    Indexer metadata, KV bind, and graph ``prepare`` stay on the NPU paged
-    backend so decode ACL-graph capture does not special-case DCP.
-    Frozen ``sfa_dcp`` still sees a vLLM-shaped coordinator and metadata.
+    Scheduler slots stay logical. This backend localizes owned KV writes and
+    expands the replicated indexer block table using ``KVShardLayout``.
     """
 
     def __init__(
@@ -117,7 +116,6 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         dcp_group: ProcessGroup,
         *,
         index_topk: int,
-        cp_kv_cache_interleave_size: int,
         decode_threshold: int,
         max_num_reqs: int,
     ) -> None:
@@ -130,34 +128,80 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             device=device,
             dtype=dtype,
         )
-        coordinator = _coordinator(dcp_group)
         self._dcp_group = dcp_group
-        self._interleave_size = cp_kv_cache_interleave_size
+        self._index_topk = index_topk
         self._decode_threshold = decode_threshold
+        self._max_num_reqs = max_num_reqs
+        self._kv_layout: KVShardLayout | None = None
+        self._impl: AscendSFADCPImpl | None = None
+        self._builder: AscendSFADCPMetadataBuilder | None = None
+        self._local_slot_mapping: torch.Tensor | None = None
+        self._expanded_indexer_block_table: torch.Tensor | None = None
+
+    def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
+        super().bind_kv_caches(kv_caches)
+        self._kv_layout = KVShardLayout.from_dcp(
+            self.page_size,
+            self._dcp_group.size(),
+            self._dcp_group.rank(),
+        )
+        coordinator = _coordinator(self._dcp_group)
         self._impl = AscendSFADCPImpl(
             coordinator,
-            scale=scale,
-            index_topk=index_topk,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            device=device,
+            scale=self.scale,
+            index_topk=self._index_topk,
+            layout=self._kv_layout,
+            device=self.device,
         )
         self._builder = AscendSFADCPMetadataBuilder(
             coordinator,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            device=device,
-            max_num_reqs=max_num_reqs,
-            decode_threshold=decode_threshold,
+            layout=self._kv_layout,
+            device=self.device,
+            max_num_reqs=max(self._max_num_reqs, 1),
+            decode_threshold=self._decode_threshold,
         )
 
     def _ensure_builder_capacity(self, num_reqs: int) -> None:
+        if self._builder is None or self._kv_layout is None:
+            raise RuntimeError("SFA DCP backend requires bind_kv_caches before execute")
         if num_reqs <= self._builder.dcp_local_seq_lens_buf.shape[0]:
             return
         self._builder = AscendSFADCPMetadataBuilder(
             _coordinator(self._dcp_group),
-            cp_kv_cache_interleave_size=self._interleave_size,
+            layout=self._kv_layout,
             device=self.device,
             max_num_reqs=num_reqs,
             decode_threshold=self._decode_threshold,
+        )
+
+    def prepare(
+        self,
+        metadata: AttentionMetadata,
+        *,
+        graph_mode: bool = False,
+    ) -> None:
+        super().prepare(metadata, graph_mode=graph_mode)
+        if self._kv_layout is None:
+            return
+        self._local_slot_mapping = self._kv_layout.localize_slots(metadata.slot_mapping)
+        if self._block_table_i32 is not None:
+            self._expanded_indexer_block_table = self._kv_layout.expand_indexer_block_table(
+                self._block_table_i32
+            )
+        else:
+            self._expanded_indexer_block_table = None
+
+    def mla_index_context(self, layer: Attention) -> MlaIndexContext:
+        context = super().mla_index_context(layer)
+        if self._expanded_indexer_block_table is None:
+            return context
+        return MlaIndexContext(
+            index_cache=context.index_cache,
+            slot_mapping=context.slot_mapping,
+            block_table=self._expanded_indexer_block_table,
+            actual_seq_q=context.actual_seq_q,
+            actual_seq_kv=context.actual_seq_kv,
+            update_index_cache=context.update_index_cache,
         )
 
     def execute_mla(
@@ -171,6 +215,8 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
     ) -> torch.Tensor:
         if topk is None:
             raise NotImplementedError("dense MLA (topk=None) is not supported on SfaDcpAttentionBackend")
+        if self._impl is None or self._builder is None or self._kv_layout is None:
+            raise RuntimeError("SFA DCP backend requires bind_kv_caches before execute_mla")
         ctx = get_forward_context()
         metadata = ctx.metadata
         layer_cache = ctx.layer_caches[layer.layer_id]
@@ -189,14 +235,16 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         is_prefilling = None
         if metadata.is_prefill or metadata.is_chunked_prefill:
             is_prefilling = torch.ones(num_reqs, dtype=torch.bool)
+        local_slots = self._local_slot_mapping
+        if local_slots is None:
+            local_slots = self._kv_layout.localize_slots(metadata.slot_mapping)
         attn_metadata = self._builder.build(
-            slot_mapping=metadata.slot_mapping,
+            slot_mapping=local_slots,
             block_table=metadata.block_table.to(torch.int32),
             seq_lens=seq_lens,
             query_start_loc_cpu=_query_start_loc_cpu(metadata, num_reqs),
             num_reqs=num_reqs,
             num_input_tokens=num_input_tokens,
-            dcp_local_seq_lens=seq_lens,
             is_prefilling=is_prefilling,
         )
 

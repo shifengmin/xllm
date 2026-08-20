@@ -26,7 +26,8 @@ namespace {
 
 TEST(DcpDecodeContextTest, LocalizesOnlyOwnedCacheWriteSlots) {
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/1),
+      KVShardLayout::from_dcp(
+          /*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/1),
       /*dcp_group=*/nullptr);
   torch::Tensor global_slots = torch::tensor({-1, 0, 3, 4, 7, 8, 12});
 
@@ -38,7 +39,8 @@ TEST(DcpDecodeContextTest, LocalizesOnlyOwnedCacheWriteSlots) {
 
 TEST(DcpDecodeContextTest, PacksOwnedTopkAndUpdatesEachContextLength) {
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
+      KVShardLayout::from_dcp(
+          /*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   DsaTopkState global_state(
       torch::tensor({{4, 0, 8, 1, 12}, {5, 6, 7, 2, 3}}, torch::kInt32),
@@ -55,7 +57,8 @@ TEST(DcpDecodeContextTest, PacksOwnedTopkAndUpdatesEachContextLength) {
 
 TEST(DcpDecodeContextTest, ExpandsLogicalBlocksForReplicatedIndexerCache) {
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
+      KVShardLayout::from_dcp(
+          /*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   torch::Tensor logical_blocks =
       torch::tensor({{3, 7, -1}, {0, 2, 4}}, torch::kInt32);
@@ -69,9 +72,20 @@ TEST(DcpDecodeContextTest, ExpandsLogicalBlocksForReplicatedIndexerCache) {
                                  torch::kInt32)));
 }
 
+TEST(DcpDecodeContextTest, LocalSeqLenFollowsPhysicalSlices) {
+  const KVShardLayout layout = KVShardLayout::from_dcp(
+      /*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/1);
+  EXPECT_EQ(layout.local_seq_len(0), 0);
+  EXPECT_EQ(layout.local_seq_len(4), 0);
+  EXPECT_EQ(layout.local_seq_len(6), 2);
+  EXPECT_EQ(layout.local_seq_len(8), 4);
+  EXPECT_EQ(layout.local_seq_len(12), 4);
+}
+
 TEST(DcpDecodeContextTest, DcpOnePreservesValidTopkEntries) {
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/4, /*dcp_size=*/1, /*dcp_rank=*/0),
+      KVShardLayout::from_dcp(
+          /*physical_block_size=*/4, /*dcp_size=*/1, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   DsaTopkState global_state(torch::tensor({{7, 3, 9, 11}}, torch::kInt32),
                             torch::tensor({2}, torch::kInt32));

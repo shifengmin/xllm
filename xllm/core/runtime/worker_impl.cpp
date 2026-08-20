@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/runtime/json_object_output_rows.h"
 #if defined(USE_NPU)
 #include "acl/acl.h"
+#include "framework/kv_cache/kv_shard_layout.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #elif defined(USE_MLU)
 #include <framework/core/caching_allocator.h>
@@ -445,9 +446,8 @@ bool WorkerImpl::allocate_kv_cache_storage(
   if (has_grouped_cache && options_.enable_disagg_pd()) {
     CHECK_EQ(::xllm::ParallelConfig::get_instance().cp_size(), 1)
         << "Grouped KV cache PD does not support context parallelism.";
-    CHECK_EQ(::xllm::ParallelConfig::get_instance().kv_split_size_effective(),
-             1)
-        << "Grouped KV cache PD does not support KV-split.";
+    CHECK_EQ(::xllm::ParallelConfig::get_instance().kv_shard_size(), 1)
+        << "Grouped KV cache PD does not support KV sharding.";
     CHECK(!options_.enable_pd_ooc())
         << "Grouped KV cache PD does not support PD-OOC yet.";
   }
@@ -970,20 +970,18 @@ torch::Tensor WorkerImpl::recompute_new_cache_slots(const ForwardInput& input) {
   auto old_cache_slots = input.input_params.attention.device.new_cache_slots;
   int64_t numel = old_cache_slots.numel();
   // The logical block stride that BlockManager hands out is
-  // `block_size * kv_split_size_effective` (see llm_engine init). When KV is
-  // not split (kv_split_size == 1) the stride collapses back to block_size.
-  const int32_t kv_split_size = parallel_args_.kv_split_size_effective();
-  const int32_t block_size_total = options_.block_size() * kv_split_size;
-  // KV-shard ownership predicate: block whose sub-index inside the logical
-  // block matches this rank's KV-split rank (degenerates to "this rank only"
-  // when kv_split_size == 1, since sub_block_idx is always 0 there).
-  const int32_t owner_kv_split_rank = parallel_args_.kv_split_rank();
+  // `physical_block_size * kv_shard_size` (see llm_engine init).
+  const KVShardLayout layout = KVShardLayout::from_parallel_args(
+      options_.block_size(), parallel_args_);
+  const int32_t block_size_total =
+      static_cast<int32_t>(layout.logical_block_size());
+  const int32_t owner_shard_rank = layout.shard_rank();
 
   torch::Tensor indices = torch::arange(numel, torch::kCPU);
   torch::Tensor block_offset = indices % block_size_total;
   torch::Tensor sub_block_idx =
       torch::floor_divide(block_offset, options_.block_size());
-  torch::Tensor mask = (sub_block_idx == owner_kv_split_rank);
+  torch::Tensor mask = (sub_block_idx == owner_shard_rank);
   torch::Tensor valid_indices = torch::nonzero(mask).squeeze();
 
   torch::Tensor new_cache_slots = torch::full_like(old_cache_slots, -1);

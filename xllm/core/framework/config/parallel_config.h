@@ -94,6 +94,12 @@ class ParallelConfig final {
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
   }
+
+  // Logical KV shard width for block-manager packing. DCP and KV-split are
+  // mutually exclusive; this is the only place that picks between them.
+  [[nodiscard]] int32_t kv_shard_size() const noexcept {
+    return dcp_size_ > 1 ? dcp_size_ : kv_split_size_effective();
+  }
 };
 
 }  // namespace xllm

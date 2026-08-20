@@ -306,7 +306,7 @@ torch::Tensor DeepseekV2AttentionImpl::forward_dcp(
         merged.output.view({q_input.size(0), heads.attn * kv_lora_rank_});
   } else {
     std::vector<int64_t> cache_sizes = k_cache.sizes().vec();
-    cache_sizes[0] *= kv_split_size_;
+    cache_sizes[0] *= shard_size_;
     torch::Tensor replicated_k_cache =
         torch::empty(cache_sizes, k_cache.options());
     xllm::kernel::ReshapePagedCacheParams write_params;

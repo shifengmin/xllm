@@ -595,13 +595,12 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   kv_cache_shape.print_shapes();
 
   // initialize block manager
-  // Logical block_size *= kv_split_size.
-  const int32_t kv_split_size_eff =
-      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  // Logical block_size *= kv_shard_size (DCP or KV-split, resolved once).
+  const int32_t kv_shard_size =
+      ::xllm::ParallelConfig::get_instance().kv_shard_size();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
-      .block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff
-                                        : block_size)
+      .block_size(block_size * kv_shard_size)
       .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
       .enable_linear_state(enable_gdn_attention)
       .enable_prefix_cache(kv_cache_config.enable_xtensor()

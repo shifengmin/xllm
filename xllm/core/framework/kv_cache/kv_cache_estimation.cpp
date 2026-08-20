@@ -80,9 +80,10 @@ int64_t index_slot_size(const ModelArgs& model_args,
 
   const int64_t index_n_head = 1;
   int64_t split_factor = 1;
-  if (Platform::supports_dsa_indexer_cache_sharding() &&
-      util::kv_split_size_effective() > 1) {
-    split_factor = util::kv_split_size_effective();
+  const int32_t shard_size = util::kv_shard_size();
+  if (shard_size > 1 && (Platform::supports_dsa_indexer_cache_sharding() ||
+                         util::dcp_size() > 1)) {
+    split_factor = shard_size;
   }
   if (enable_indexer_cache_quantization) {
     // int8 index cache: one byte per element, plus an independent per-token

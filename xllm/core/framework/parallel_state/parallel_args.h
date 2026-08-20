@@ -195,6 +195,15 @@ struct ParallelArgs {
     return rank_ / (world_size_ / kv);
   }
 
+  // Same packing width/rank that KVShardLayout stores after construction.
+  [[nodiscard]] int32_t kv_shard_size() const noexcept {
+    return dcp_size_ > 1 ? dcp_size_ : kv_split_size_effective();
+  }
+
+  [[nodiscard]] int32_t kv_shard_rank() const noexcept {
+    return dcp_size_ > 1 ? dcp_rank() : kv_split_rank();
+  }
+
   // tp size
   PROPERTY(int32_t, tp_size) = 1;
 

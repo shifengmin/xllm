@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DCP sparse-flash-attention path. Imports are torch and the stdlib."""
+"""DCP sparse-flash-attention path built on KVShardLayout packing."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from typing import Any, NamedTuple, Protocol
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from xllm.python.attention.kv_shard_layout import KVShardLayout
 
 
 class GroupCoordinator(Protocol):
@@ -46,23 +48,10 @@ def all_gather_async(
 
 def get_dcp_local_seq_lens(
     seq_lens: torch.Tensor,
-    dcp_size: int,
-    interleave_size: int,
+    layout: KVShardLayout,
 ) -> torch.Tensor:
-    """Return the interleave-aware KV length of every DCP rank."""
-    tiled = seq_lens.unsqueeze(-1)
-    rank_offsets = torch.arange(
-        dcp_size,
-        dtype=seq_lens.dtype,
-        device=seq_lens.device,
-    )
-    base = tiled // interleave_size // dcp_size * interleave_size
-    remainder = tiled - base * dcp_size
-    return base + torch.clamp(
-        remainder - rank_offsets * interleave_size,
-        0,
-        interleave_size,
-    )
+    """Return this rank's KV length under the shared KVShardLayout packing."""
+    return layout.local_seq_lens(seq_lens)
 
 
 def _count_prefills(
@@ -125,20 +114,24 @@ class AscendSFADCPMetadataBuilder:
         self,
         dcp_group: GroupCoordinator,
         *,
-        cp_kv_cache_interleave_size: int,
+        layout: KVShardLayout,
         device: torch.device,
         max_num_reqs: int,
         decode_threshold: int = 1,
     ) -> None:
         if dcp_group.world_size <= 1:
             raise RuntimeError("AscendSFADCPMetadataBuilder requires DCP world size > 1.")
-        if cp_kv_cache_interleave_size <= 0:
-            raise RuntimeError(f"Invalid cp_kv_cache_interleave_size: {cp_kv_cache_interleave_size}")
+        if layout.shard_size != dcp_group.world_size:
+            raise RuntimeError(
+                "KVShardLayout.shard_size must match the DCP group size, "
+                f"got layout.shard_size={layout.shard_size}, "
+                f"dcp_group.world_size={dcp_group.world_size}."
+            )
         if max_num_reqs <= 0:
             raise RuntimeError(f"Invalid max_num_reqs: {max_num_reqs}")
-        self.dcp_size = dcp_group.world_size
-        self.dcp_rank = dcp_group.rank_in_group
-        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        self.layout = layout
+        self.dcp_size = layout.shard_size
+        self.dcp_rank = layout.shard_rank
         self.device = device
         self.decode_threshold = decode_threshold
         self.dcp_local_seq_lens_buf = torch.empty(
@@ -153,11 +146,7 @@ class AscendSFADCPMetadataBuilder:
         )
 
     def _local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        return get_dcp_local_seq_lens(
-            seq_lens,
-            self.dcp_size,
-            self.cp_kv_cache_interleave_size,
-        )[:, self.dcp_rank]
+        return get_dcp_local_seq_lens(seq_lens, self.layout)
 
     def _build_compact_kv_gather_metadata(
         self,
@@ -231,21 +220,18 @@ class AscendSFADCPImpl:
         *,
         scale: float,
         index_topk: int,
-        cp_kv_cache_interleave_size: int,
+        layout: KVShardLayout,
         device: torch.device,
     ) -> None:
-        if cp_kv_cache_interleave_size <= 0:
-            raise RuntimeError(f"Invalid cp_kv_cache_interleave_size: {cp_kv_cache_interleave_size}")
         if index_topk <= 0:
             raise RuntimeError("index_topk must be a positive integer for DCP SFA.")
         self.dcp_group = dcp_group
-        self.dcp_size = dcp_group.world_size
-        self.dcp_rank = dcp_group.rank_in_group
+        self.layout = layout
+        self.dcp_size = layout.shard_size
+        self.dcp_rank = layout.shard_rank
         self.scale = float(scale)
-        self._dcp_interleave_size = cp_kv_cache_interleave_size
         self._dcp_index_topk = index_topk
         self._remap_order = torch.arange(index_topk, dtype=torch.float32, device=device)
-        self._remap_invalid_index = torch.tensor(-1.0, dtype=torch.float32, device=device)
 
     @staticmethod
     def _has_prefill(attn_metadata: AscendSFADCPMetadata) -> bool:
@@ -320,7 +306,7 @@ class AscendSFADCPImpl:
         return gathered, handle, restore_perm
 
     def _remap_sparse_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
-        if self.dcp_size <= 1:
+        if self.layout.shard_size <= 1:
             return topk_indices
 
         topk_count = topk_indices.shape[-1]
@@ -329,31 +315,12 @@ class AscendSFADCPImpl:
                 f"topk_indices last dimension ({topk_count}) exceeds configured index_topk ({self._dcp_index_topk})."
             )
 
-        # Remap the topk indices from the replicated view to the DCP-local KV cache view.
-        # We use float32 for better performance on Ascend.
-        topk_indices_fp32 = topk_indices.to(torch.float32)
-        interleave_size = self._dcp_interleave_size
-        local_block_indices = torch.floor(topk_indices_fp32 / interleave_size)
-        local_owner_base = torch.floor(local_block_indices / self.dcp_size) * self.dcp_size
-        local_owner = local_block_indices - local_owner_base
-        local_owner_mask = (topk_indices_fp32 >= 0) & (local_owner == self.dcp_rank)
-        if interleave_size == 1:
-            remapped_indices_fp32 = torch.floor(topk_indices_fp32 / self.dcp_size)
-        else:
-            local_offsets = topk_indices_fp32 - local_block_indices * interleave_size
-            remapped_indices_fp32 = torch.floor(topk_indices_fp32 / (self.dcp_size * interleave_size))
-            remapped_indices_fp32 = remapped_indices_fp32 * interleave_size + local_offsets
-        remapped_indices = torch.where(
-            local_owner_mask,
-            remapped_indices_fp32,
-            self._remap_invalid_index,
-        ).to(topk_indices.dtype)
-
-        # Compact local indices to the front without changing their top-k order.
+        local_table = self.layout.localize_slots(topk_indices)
+        owned_entries = local_table >= 0
         original_order = self._remap_order[:topk_count].expand_as(topk_indices)
-        pack_keys = original_order + (~local_owner_mask).to(torch.float32) * topk_count
+        pack_keys = original_order + (~owned_entries).to(torch.float32) * topk_count
         _, pack_order = torch.sort(pack_keys, dim=-1)
-        return torch.gather(remapped_indices, dim=-1, index=pack_order.to(torch.int32))
+        return torch.gather(local_table, dim=-1, index=pack_order.to(torch.int32))
 
     def _all_to_all_dcp_tensor(
         self,
