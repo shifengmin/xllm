@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -137,7 +137,11 @@ DECLARE_int32(redundant_experts_num);
 
 DECLARE_int64(eplb_update_interval);
 
-DECLARE_double(eplb_update_threshold);
+DECLARE_double(eplb_min_peak_load_improvement);
+
+DECLARE_string(eplb_policy_kind);
+
+DECLARE_bool(eplb_use_decode_only_load);
 
 DECLARE_int32(expert_parallel_degree);
 
@@ -146,6 +150,8 @@ DECLARE_string(rank_tablefile);
 constexpr int32_t kGraphExecutorLogVerboseLevel = 50;
 
 DECLARE_bool(enable_graph);
+
+DECLARE_bool(disable_graph_warmup);
 
 DECLARE_bool(enable_graph_double_buffer);
 
@@ -175,8 +181,6 @@ DECLARE_bool(enable_pd_ooc);
 DECLARE_int32(disagg_pd_port);
 
 DECLARE_string(instance_role);
-
-DECLARE_string(kv_cache_transfer_type);
 
 DECLARE_string(kv_cache_transfer_mode);
 

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -47,7 +47,7 @@ struct Options {
   // the number of slots per block, default 128, value must be multiple of 16
   PROPERTY(int32_t, block_size) = 128;
 
-  // 0 means that cache size is caculated by available memory
+  // 0 means that cache size is calculated by available memory
   PROPERTY(int64_t, max_cache_size) = 0;
 
   // maximum memory utilization allowed, default 0.9

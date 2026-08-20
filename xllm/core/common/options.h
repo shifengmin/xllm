@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -51,7 +51,7 @@ class Options {
   PROPERTY(int32_t, block_size) = 128;
 
   // the maximum cache size in bytes, default is 0 which means cache size is
-  // caculated by available memory * max_memory_utilization
+  // calculated by available memory * max_memory_utilization
   PROPERTY(int64_t, max_cache_size) = 0;
 
   // maximum memory utilization allowed, default 0.9
@@ -108,7 +108,7 @@ class Options {
 
   PROPERTY(std::optional<int64_t>, eplb_update_interval);
 
-  PROPERTY(std::optional<double>, eplb_update_threshold);
+  PROPERTY(std::optional<double>, eplb_min_peak_load_improvement);
 
   PROPERTY(std::optional<std::string>, communication_backend);
 

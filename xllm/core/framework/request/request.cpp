@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -61,6 +61,7 @@ void Request::create_sequences_group() {
   sequence_params.best_of = state_.best_of;
   sequence_params.streaming = state_.stream;
   sequence_params.enable_schedule_overlap = state_.enable_schedule_overlap;
+  sequence_params.is_graph_warmup = state_.is_graph_warmup;
   sequence_params.rec_type = state_.rec_type;
   sequence_params.bos_token_id = state_.bos_token_id;
   sequence_params.request_id = request_id_;

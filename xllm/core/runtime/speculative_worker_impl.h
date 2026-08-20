@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -124,14 +124,6 @@ class SpeculativeWorkerImpl : public WorkerImpl {
     return impl_->pull_kv_blocks_async(src_cluster_id, src_addr, mappings);
   };
 
-  folly::SemiFuture<bool> pull_hetero_kv_blocks_async(
-      const std::vector<uint64_t>& src_cluster_ids,
-      const std::vector<std::string>& src_addrs,
-      const std::vector<KVTransferMapping>& mappings) override {
-    return impl_->pull_hetero_kv_blocks_async(
-        src_cluster_ids, src_addrs, mappings);
-  };
-
  protected:
   // Algorithm-specific virtual methods for subclasses to implement
   virtual std::optional<ForwardOutput> step_prefill(
@@ -159,6 +151,25 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   void prepare_validate_inputs(const ForwardInput& inputs,
                                ForwardInput& validate_inputs,
                                const std::vector<int32_t>& per_seq_val_tokens);
+
+  // Overwrite dp_global_token_nums / raw_dp_global_token_nums with the true
+  // post-pruning validate token count of every DP peer, gathered over the DP
+  // group. Adaptive pruning makes each rank's validate token count
+  // data-dependent, so the engine-supplied global vector (which assumes a
+  // uniform per-seq width) no longer matches; DpEpPadding needs the real
+  // per-rank counts to compute matching MoE all-to-all pads. No-op when the DP
+  // group spans a single rank. MUST be called on every DP rank each validate
+  // step (both the pruned and the unpruned branch) so the collective stays in
+  // lockstep and does not deadlock.
+  void sync_dp_global_token_nums_after_prune(ModelInputParams& input_params,
+                                             int32_t local_total_val_tokens);
+
+  // Idle-rank counterpart: a DP rank whose shard is empty still runs the target
+  // validate forward (fake input) while busy peers run the pruned forward.
+  // Both must join the same DP allgather. This variant contributes the idle
+  // rank's own current dp_global_token_nums entry (already scaled to the
+  // uniform validate width) so it stays symmetric with the busy peers.
+  void sync_dp_global_token_nums_for_idle_rank(ModelInputParams& input_params);
 
   // Target-side cache budget after reserving storage for a colocated draft.
   // DeepSeek-V4's fixed SWA pools require both geometries to participate.

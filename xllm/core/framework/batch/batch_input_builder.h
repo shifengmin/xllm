@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -129,6 +129,7 @@ class BatchInputBuilder {
     std::vector<std::string> request_ids;
     std::vector<int32_t> extra_token_ids;
     std::vector<int32_t> mtp_shifted_token_ids;
+    std::vector<int32_t> eplb_decode_token_mask;
     std::vector<int32_t> mtp_bootstrap_row_idxes;
     std::vector<torch::Tensor> mtp_bootstrap_embeddings;
     std::vector<TransferKVInfo> transfer_kv_infos;
@@ -194,6 +195,8 @@ class BatchInputBuilder {
   bool use_mrope_ = false;
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
+  bool build_eplb_decode_token_mask_ = false;
+  bool is_graph_warmup_ = false;
   int32_t cp_size_ = 1;
 
   // copy in and out cache contents

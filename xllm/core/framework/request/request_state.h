@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -152,11 +152,6 @@ struct RequestState final {
   // decode address.
   std::string decode_address;
 
-  // Set after the Prefill/Decode topology guard accepts the opt-in non-MLA
-  // heterogeneous TP path. It scopes first-generation transfer metadata to
-  // requests that actually consume it.
-  bool heterogeneous_pd = false;
-
   torch::Tensor input_embedding;
 
   // multimodal
@@ -166,6 +161,8 @@ struct RequestState final {
   bool logprobs;
 
   bool enable_schedule_overlap = false;
+
+  bool is_graph_warmup = false;
 
   RecType rec_type = RecType::kNone;
 

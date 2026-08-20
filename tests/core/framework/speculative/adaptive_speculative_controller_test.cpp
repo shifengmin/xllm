@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,21 +43,6 @@ void setup_registry() {
   predictor.query_prefix_ms = 0.001;
   SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
       predictor);
-}
-
-TEST(AdaptiveSpeculativeControllerTest, EnablesOnlyForMtpWithoutGraph) {
-  runtime::Options options = make_options();
-  AdaptiveSpeculativeController controller(options);
-  EXPECT_TRUE(controller.enabled());
-
-  options.speculative_algorithm("Eagle3");
-  AdaptiveSpeculativeController eagle_controller(options);
-  EXPECT_FALSE(eagle_controller.enabled());
-
-  options = make_options();
-  options.enable_graph(true);
-  AdaptiveSpeculativeController graph_controller(options);
-  EXPECT_FALSE(graph_controller.enabled());
 }
 
 TEST(AdaptiveSpeculativeControllerTest, SelectsPrunedPrefixesByPathProb) {

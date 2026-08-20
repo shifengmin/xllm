@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -37,6 +37,8 @@ class KVTransferCompletion final {
   KVTransferCompletion& operator=(KVTransferCompletion&&) = delete;
 
   void add(folly::SemiFuture<bool> future);
+
+  bool empty() const { return futures_.empty(); }
 
   // Waits until all owned transfers finish. Returns false when any transfer
   // reports failure or completes with an exception.

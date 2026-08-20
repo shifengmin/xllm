@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -78,12 +78,9 @@ class Platform final {
     return is_npu() || is_mlu();
   }
 
-  // MTP decode expands one sequence into num_decoding_tokens token rows. The
-  // MLU graph executor reuses graphs by padded token-row buckets, so graph
-  // warmup must visit every batch size that starts a new MTP token bucket.
-  // Other backends retain the compatibility warmup buckets until their graph
-  // keying and MTP replay contracts are verified against the same strategy.
-  static constexpr bool supports_mtp_decode_graph_warmup() { return is_mlu(); }
+  static constexpr bool supports_mtp_decode_graph_warmup() {
+    return is_mlu() || is_npu();
+  }
 
   static constexpr bool is_ilu() {
 #if defined(USE_ILU)

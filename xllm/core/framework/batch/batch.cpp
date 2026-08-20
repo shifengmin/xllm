@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -244,6 +244,10 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
 }
 
 std::vector<Sequence*> Batch::get_sequences() {
+  return static_cast<const Batch&>(*this).get_sequences();
+}
+
+std::vector<Sequence*> Batch::get_sequences() const {
   if (!sequences_.empty()) {
     return sequences_;
   }
@@ -776,7 +780,7 @@ void Batch::append_token_for_sequence(Sequence* seq,
       }
     }
   } else if (!seq->cancelled()) {
-    // truely update the real token if replace_fake_token
+    // truly update the real token if replace_fake_token
     seq->update_last_step_token(token, token_idx);
     if (seq->error_status().has_value()) {
       return;

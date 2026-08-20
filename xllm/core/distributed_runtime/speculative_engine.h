@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -70,14 +70,6 @@ class SpeculativeEngine : public Engine {
                       const std::vector<std::string>& src_addrs,
                       const int32_t dst_dp_rank,
                       const std::vector<KVTransferMapping>& mappings) override;
-
-  bool pull_hetero_kv_blocks(
-      const int32_t src_dp_size,
-      const int32_t src_dp_rank,
-      const std::vector<uint64_t>& src_cluster_ids,
-      const std::vector<std::string>& src_addrs,
-      const int32_t dst_dp_rank,
-      const std::vector<KVTransferMapping>& mappings) override;
 
   void get_cache_info(std::vector<uint64_t>& cluster_ids,
                       std::vector<std::string>& addrs,

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,7 +25,6 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
-#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -33,16 +32,16 @@ limitations under the License.
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/process_group.h"
-#include "framework/sampling/rejection_sampler.h"
+#include "framework/sampling/sampling_params.h"
 #if defined(USE_NPU) || defined(USE_MLU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 #if defined(USE_NPU)
 #include "core/layers/npu_torch/deepseek_sparse_attention.h"
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
-#include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
 #endif
 #include "core/framework/speculative/spec_input_builder.h"
+#include "core/framework/speculative/spec_verify.h"
 #include "util/json_reader.h"
 #include "util/timer.h"
 
@@ -313,19 +312,14 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       parallel_args, device, draft_options(options));
 
-  // Adaptive per-seq validate pruning. Same DP/EP-parallel guard as MTP.
+  // Adaptive per-seq validate pruning. DP is supported: the worker gathers
+  // each rank's true validate token count over the DP group before the target
+  // forward (see sync_dp_global_token_nums_after_prune).
   const bool enable_adaptive = options.enable_adaptive_speculative_decode() &&
                                options.num_speculative_tokens() > 1;
-  const bool enable_parallel_adaptive_sl =
-      parallel_args.dp_size() <= 1 && parallel_args.ep_size() <= 1;
-  if (enable_adaptive && enable_parallel_adaptive_sl) {
+  if (enable_adaptive) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
-  } else if (enable_adaptive) {
-    LOG(WARNING) << "DFlash/DSpark adaptive speculative decode disabled under "
-                 << "DP/EP parallelism (v1). dp_size="
-                 << parallel_args.dp_size()
-                 << ", ep_size=" << parallel_args.ep_size();
   }
 }
 
@@ -479,33 +473,11 @@ bool DFlashWorkerImpl::allocate_kv_cache_with_transfer(
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
 
   if (kv_cache_transfer_ == nullptr) {
-#if defined(USE_NPU)
-    const std::string& transfer_type =
-        ::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type();
-    if (transfer_type == "LlmDataDist") {
-      kv_cache_transfer_ = std::make_shared<SpecKVCacheTransfer>(
-          options_.transfer_listen_port(),
-          options_.instance_role(),
-          context_.get_model_args().index_n_heads() > 0,
-          context_.get_model_args().enable_mla());
-    } else {
-      CHECK_EQ(transfer_type, "Mooncake");
-      kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
-          device_.index(),
-          options_.transfer_listen_port(),
-          device_,
-          context_.get_model_args().model_type());
-    }
-#elif defined(USE_MLU)
-    CHECK_EQ(::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type(),
-             "Mooncake")
-        << "MLU DFlash only supports Mooncake KV transfer.";
     kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
         device_.index(),
         options_.transfer_listen_port(),
         device_,
         context_.get_model_args().model_type());
-#endif
 
     const int32_t device_id = device_.index();
     kv_cache_transfer_->initialize(device_id);
@@ -582,6 +554,12 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(
       validate_input.input_params, options_.num_speculative_tokens() + 1);
+  // Deadlock-safety under DP: when all ranks decode but this rank's shard is
+  // empty (fake input), busy peers reach run_validate and allgather their
+  // pruned validate counts before the target forward. This idle rank runs the
+  // same target forward and must join that allgather in lockstep, contributing
+  // its own uniform (unpruned) count. No-op unless adaptive + dp_size>1.
+  sync_dp_global_token_nums_for_idle_rank(validate_input.input_params);
   ForwardOutput output =
       run_llm_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
@@ -965,6 +943,20 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     fill_validate_input_from_draft_outputs(
         draft_block, validate_input, *compute_stream_, max_val_tokens);
   }
+  // Under DP, publish this rank's true validate token count to all DP peers so
+  // DpEpPadding computes matching MoE all-to-all pads. Runs on both branches
+  // (pruned and dense) and on every DP rank so the collective stays in
+  // lockstep. No-op when the DP group spans a single rank.
+  int32_t local_total_val_tokens = 0;
+  if (did_prune) {
+    for (int32_t v : per_seq_val_tokens) {
+      local_total_val_tokens += v;
+    }
+  } else {
+    local_total_val_tokens = batch_size * max_val_tokens;
+  }
+  sync_dp_global_token_nums_after_prune(validate_input.input_params,
+                                        local_total_val_tokens);
   ForwardOutput target_output =
       run_llm_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
@@ -1110,8 +1102,6 @@ SampleOutput DFlashWorkerImpl::validate(
       << "DFlash validate target logits rows must be divisible by validation "
          "width";
   const int32_t batch_size = num_logits_rows / num_val_tokens;
-  const int32_t vocab_size =
-      static_cast<int32_t>(target_output.logits.size(/*dim=*/-1));
 
   using torch::indexing::None;
   using ISlice = torch::indexing::Slice;
@@ -1145,47 +1135,23 @@ SampleOutput DFlashWorkerImpl::validate(
         target_next_tokens_2d.gather(/*dim=*/1, bonus_idx).view({-1, 1});
   }
 
-  torch::Tensor target_logits =
-      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
-
-  auto rejection_sampler =
-      std::make_unique<RejectionSampler>(sampling_params.do_sample,
-                                         sampling_params.all_random_sample,
-                                         sampling_params.all_greedy_sample,
-                                         target_output.logprobs,
-                                         target_output.max_top_logprobs,
-                                         enable_fused_kernel_);
-
-  SampleOutput sample_output =
-      rejection_sampler->forward(draft_token_ids.to(bonus_token_ids),
-                                 draft_probs.to(target_logits.device()),
-                                 target_logits,
-                                 bonus_token_ids,
-                                 /*mask_out_rejected_tokens=*/true);
-
-  const torch::Tensor& embeddings = target_output.sample_output.embeddings;
-  sample_output.embeddings =
-      embeddings.view({batch_size, num_val_tokens, embeddings.size(-1)});
-  return sample_output;
+  torch::Tensor target_logits = target_output.logits.view(
+      {batch_size, num_val_tokens, target_output.logits.size(/*dim=*/-1)});
+  return spec_verify::run_rejection_sampling(
+      {.do_sample = sampling_params.do_sample,
+       .all_random_sample = sampling_params.all_random_sample,
+       .all_greedy_sample = sampling_params.all_greedy_sample},
+      draft_token_ids,
+      draft_probs,
+      target_logits,
+      target_output,
+      bonus_token_ids,
+      enable_fused_kernel_);
 }
 
 void DFlashWorkerImpl::process_draft_sample_output(
     SampleOutput& sample_output) {
-  if (sample_output.probs.defined()) {
-    CHECK(sample_output.next_tokens.defined())
-        << "DFlash draft sample_output.next_tokens must be defined when probs "
-           "exist";
-    CHECK_EQ(sample_output.next_tokens.dim(), 1)
-        << "DFlash draft cache expects next_tokens [batch], got "
-        << sample_output.next_tokens.sizes();
-    CHECK(sample_output.probs.dim() == 1 || sample_output.probs.dim() == 2)
-        << "DFlash draft cache expects probs [batch] or [batch,vocab], got "
-        << sample_output.probs.sizes();
-    CHECK_EQ(sample_output.probs.size(0), sample_output.next_tokens.size(0))
-        << "DFlash draft cache probs/token batch mismatch";
-    sample_output.probs = specBuilder::draftProbs::compress_for_cache(
-        sample_output.probs, sample_output.next_tokens);
-  }
+  specBuilder::draftProbs::compress_sample_output_for_cache(sample_output);
 }
 
 void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {

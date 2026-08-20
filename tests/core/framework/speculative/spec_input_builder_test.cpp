@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -409,29 +409,6 @@ TEST(SpecDecodeInputBuilderTest, AppendDecodeRowFromLastStep) {
   EXPECT_EQ(buf.out_positions, std::vector<int32_t>({5, 9}));
   EXPECT_EQ(buf.out_new_cache_slots, std::vector<int32_t>({5, 21}));
   EXPECT_EQ(buf.out_kv_seq_lens, to_layout_seq_lens({6, 10}));
-}
-
-TEST(SpecDecodeInputBuilderTest, QCuSeqLensConsistency) {
-  ModelInputParams params;
-  params.meta.num_sequences = 3;
-  params.attention.host.q_seq_lens = to_layout_seq_lens({1, 2, 3});
-  params.attention.host.q_cu_seq_lens = {1, 3, 6};
-
-  torch::Tensor q_cu_seq_lens = build_q_cu_seq_lens_tensor(params);
-  EXPECT_EQ(tensor_to_vec_int32(q_cu_seq_lens),
-            std::vector<int32_t>({1, 3, 6}));
-}
-
-TEST(SpecDecodeInputBuilderTest, QCuSeqLensWithLeadingZero) {
-  ModelInputParams params;
-  params.meta.num_sequences = 3;
-  params.attention.host.q_seq_lens = to_layout_seq_lens({1, 2, 3});
-  params.attention.host.q_cu_seq_lens = {1, 3, 6};
-
-  torch::Tensor q_cu_seq_lens =
-      build_q_cu_seq_lens_tensor(params, torch::kCPU, true);
-  EXPECT_EQ(tensor_to_vec_int32(q_cu_seq_lens),
-            std::vector<int32_t>({0, 1, 3, 6}));
 }
 
 TEST(SpecDecodeInputBuilderTest, CalcSlotIdOutOfRangeDeath) {

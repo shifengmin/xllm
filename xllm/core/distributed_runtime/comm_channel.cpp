@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -282,28 +282,6 @@ bool CommChannel::pull_kv_blocks(
   brpc::Controller cntl;
   stub_->PullKVCache(&cntl, &request, &s, nullptr);
 
-  return !cntl.Failed() && s.ok();
-}
-
-bool CommChannel::pull_hetero_kv_blocks(
-    const std::vector<uint64_t>& src_cluster_ids,
-    const std::vector<std::string>& src_addrs,
-    const std::vector<KVTransferMapping>& mappings) {
-  proto::PullKVCacheRequest request;
-  request.set_hetero_merge(true);
-  ADD_VECTOR_TO_PROTO(request.mutable_src_cluster_ids(), src_cluster_ids);
-  ADD_VECTOR_TO_PROTO(request.mutable_src_addrs(), src_addrs);
-  for (const KVTransferMapping& mapping : mappings) {
-    proto::KVTransferMapping* proto_mapping = request.add_mappings();
-    proto_mapping->set_group_id(mapping.group_id);
-    ADD_VECTOR_TO_PROTO(proto_mapping->mutable_local_ids(), mapping.local_ids);
-    ADD_VECTOR_TO_PROTO(proto_mapping->mutable_remote_ids(),
-                        mapping.remote_ids);
-  }
-
-  proto::Status s;
-  brpc::Controller cntl;
-  stub_->PullKVCache(&cntl, &request, &s, nullptr);
   return !cntl.Failed() && s.ok();
 }
 

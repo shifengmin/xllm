@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,7 +50,6 @@ limitations under the License.
 #include "core/common/constants.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
-#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -77,6 +76,7 @@ limitations under the License.
 #endif
 #include "core/distributed_runtime/master.h"
 #include "core/runtime/worker_rendezvous.h"
+#include "framework/eplb/eplb_utils.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/kv_cache/linear_state_restore.h"
@@ -472,11 +472,6 @@ bool WorkerImpl::allocate_kv_cache_storage(
 
   const bool has_grouped_cache = kv_cache_shape.has_grouped_cache_layout();
   if (has_grouped_cache && options_.enable_disagg_pd()) {
-    CHECK_EQ(::xllm::ParallelConfig::get_instance().cp_size(), 1)
-        << "Grouped KV cache PD does not support context parallelism.";
-    CHECK_EQ(::xllm::ParallelConfig::get_instance().kv_split_size_effective(),
-             1)
-        << "Grouped KV cache PD does not support KV-split.";
     CHECK(!options_.enable_pd_ooc())
         << "Grouped KV cache PD does not support PD-OOC yet.";
   }
@@ -593,15 +588,9 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
   CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
 
   const ModelArgs& model_args = context_.get_model_args();
-  const bool enable_lighting_indexer = model_args.index_n_heads() > 0;
-  const std::string& transfer_type =
-      ::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type();
   kv_cache_transfer_ =
-      KVCacheTransferFactory::create(transfer_type,
-                                     options_.transfer_listen_port(),
-                                     options_.instance_role(),
+      KVCacheTransferFactory::create(options_.transfer_listen_port(),
                                      device_,
-                                     enable_lighting_indexer,
                                      model_args.model_type(),
                                      options_.model_id());
   CHECK(kv_cache_transfer_ != nullptr)
@@ -611,15 +600,17 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
   bool use_huge_page_allocator = true;
   std::shared_ptr<KVCacheTensorAllocator> tensor_allocator;
 #if defined(USE_MLU)
-  if (transfer_type == "Mooncake") {
-    use_huge_page_allocator = false;
-  }
+  use_huge_page_allocator = false;
 #endif
   if (!allocate_kv_cache_storage(kv_cache_shape,
                                  use_huge_page_allocator,
                                  std::move(tensor_allocator))) {
     return false;
   }
+  kv_cache_transfer_->configure_cache_layout(parallel_args_,
+                                             context_.get_model_args(),
+                                             options_.block_size(),
+                                             /*is_spec_draft=*/false);
   kv_cache_transfer_->register_kv_cache(kv_caches_, kv_cache_shape, dtype_);
 
   status_ = Status::READY;
@@ -642,9 +633,17 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
   }
 
   if (is_spec_draft_) {
+    kv_cache_transfer_->configure_cache_layout(parallel_args_,
+                                               context_.get_model_args(),
+                                               options_.block_size(),
+                                               /*is_spec_draft=*/true);
     kv_cache_transfer_->register_kv_cache_spec(
         kv_caches_, kv_cache_shape, dtype_);
   } else {
+    kv_cache_transfer_->configure_cache_layout(parallel_args_,
+                                               context_.get_model_args(),
+                                               options_.block_size(),
+                                               /*is_spec_draft=*/false);
     kv_cache_transfer_->register_kv_cache(kv_caches_, kv_cache_shape, dtype_);
   }
 
@@ -1194,12 +1193,16 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     const ForwardInput& input,
     ForwardInput& processed_input,
     Stream& prepare_stream,
-    bool record_ready_event) {
+    bool record_ready_event,
+    bool restore_linear_state) {
   if (!input.json_object_state_snapshots.empty()) {
     ForwardInput restored_input = input;
     restore_json_object_states(restored_input);
-    prepare_work_before_execute_on_stream(
-        restored_input, processed_input, prepare_stream, record_ready_event);
+    prepare_work_before_execute_on_stream(restored_input,
+                                          processed_input,
+                                          prepare_stream,
+                                          record_ready_event,
+                                          restore_linear_state);
     return;
   }
 #if defined(USE_NPU)
@@ -1299,7 +1302,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
       // Defer the slot-restore copy to step_for_schedule_overlap (worker
       // thread, on compute_stream_) so stream ordering between chunk N-1
       // writes and chunk N restore is automatic.
-      if (!enable_schedule_overlap()) {
+      if (restore_linear_state && !enable_schedule_overlap()) {
         restore_linear_state_slots(kv_caches_,
                                    input_params.linear_state_cache_ops,
                                    input_params.linear_state_validity_mask);
@@ -1910,8 +1913,6 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 
   auto model_loader = ModelLoader::create(model_weights_path);
   model_weights_path_ = std::move(model_weights_path);
-  auto tokenizer = model_loader->tokenizer();
-  CHECK(tokenizer != nullptr);
 
   auto args = model_loader->model_args();
   auto quant_args = model_loader->quant_args();
@@ -1919,10 +1920,16 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   args.embedding_mode(embedding_mode);
   torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
 
-  // Only the target engine reconciles tokenizer and model vocab sizes. Draft
-  // engines do not detokenize output, but worker-local JSON grammar state
-  // restoration still requires retaining the tokenizer below.
+  // A draft engine is fed token ids and detokenized by the target, so it owns
+  // no tokenizer (its weights dir may not even ship tokenizer files, e.g. the
+  // DFlash / DSpark draft checkpoints). Only the target worker builds one and
+  // reconciles vocab sizes; its JSON grammar restoration below is target-only
+  // and never runs on a draft.
+  std::unique_ptr<Tokenizer> tokenizer;
   if (!options_.is_draft_engine()) {
+    tokenizer = model_loader->tokenizer();
+    CHECK(tokenizer != nullptr);
+
     const int64_t tokenizer_vocab_size = tokenizer->vocab_size();
     int64_t model_vocab_size = args.vocab_size();
     // use tokenizer vocab size if model vocab size is not set
@@ -2070,12 +2077,16 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 
   // Warm JSON grammars off the forward path so the first constrained request
   // does not pay tokenizer.decode over the full vocab under the step lock.
-  if (ensure_json_object_grammar(/*reasoning_enabled=*/false) == nullptr) {
-    LOG(WARNING) << "JSON object grammar warmup failed; will retry lazily";
-  }
-  if (ensure_json_object_grammar(/*reasoning_enabled=*/true) == nullptr) {
-    LOG(WARNING)
-        << "JSON reasoning grammar warmup failed; will retry lazily on demand";
+  // Draft-engine workers own no tokenizer and never serve constrained requests
+  // (the target does), so skip the warmup for them.
+  if (!options_.is_draft_engine()) {
+    if (ensure_json_object_grammar(/*reasoning_enabled=*/false) == nullptr) {
+      LOG(WARNING) << "JSON object grammar warmup failed; will retry lazily";
+    }
+    if (ensure_json_object_grammar(/*reasoning_enabled=*/true) == nullptr) {
+      LOG(WARNING) << "JSON reasoning grammar warmup failed; will retry lazily "
+                      "on demand";
+    }
   }
 
   int32_t tp_world_size = parallel_args_.world_size();
@@ -2110,9 +2121,13 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     // todo: support xtensor
     int32_t num_layers = args.n_layers() - args.first_k_dense_replace();
-    int32_t num_device_experts =
-        args.n_routed_experts() / context_.get_parallel_args().world_size() +
-        ::xllm::EPLBConfig::get_instance().redundant_experts_num();
+    const int32_t eplb_device_num =
+        eplb::effective_device_num(context_.get_parallel_args().world_size(),
+                                   context_.get_parallel_args().ep_size());
+    int32_t num_device_experts = eplb::local_physical_experts_num(
+        args.n_routed_experts(),
+        eplb_device_num,
+        ::xllm::EPLBConfig::get_instance().redundant_experts_num());
     expert_load_data_ = torch::zeros({num_layers, num_device_experts})
                             .to(torch::kInt64)
                             .to(device_)
@@ -2211,41 +2226,6 @@ folly::SemiFuture<bool> WorkerImpl::pull_kv_blocks_async(
   promise.setValue(false);
   return future;
 #endif
-}
-
-folly::SemiFuture<bool> WorkerImpl::pull_hetero_kv_blocks_async(
-    const std::vector<uint64_t>& src_cluster_ids,
-    const std::vector<std::string>& src_addrs,
-    const std::vector<KVTransferMapping>& mappings) {
-  folly::Promise<bool> promise;
-  auto future = promise.getSemiFuture();
-#if defined(USE_NPU)
-  threadpool_.schedule([this,
-                        src_cluster_ids,
-                        src_addrs,
-                        mappings,
-                        promise = std::move(promise)]() mutable {
-    const bool success = kv_cache_transfer_->pull_hetero_kv_blocks(
-        src_cluster_ids, src_addrs, mappings);
-    if (success) {
-      const int ret = device_.synchronize_default_stream();
-      if (ret != 0) {
-        LOG(ERROR) << "synchronize_default_stream after heterogeneous KV "
-                      "merge failed, ret="
-                   << ret;
-        promise.setValue(false);
-        return;
-      }
-    }
-    promise.setValue(success);
-  });
-#else
-  (void)src_cluster_ids;
-  (void)src_addrs;
-  (void)mappings;
-  promise.setValue(false);
-#endif
-  return future;
 }
 
 uint32_t WorkerImpl::transfer_kv_blocks(

@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -92,12 +92,23 @@ class DeepseekV32MtpModel(nn.Module):
             input_embedding = token_hidden
 
         rotated_embedding = self.rot(input_embedding) if self.enable_rot else input_embedding
-        h = self.eh_proj(torch.cat((self.enorm(token_hidden), self.hnorm(rotated_embedding)), dim=-1))
+        enorm_out = self.enorm(token_hidden)
+        hnorm_out = self.hnorm(rotated_embedding)
+
+        h = self.eh_proj(torch.cat((enorm_out, hnorm_out), dim=-1))
+
         positions = positions.to(torch.int64).contiguous()
-        cos_sin_cache = self.rotary.cos_sin_cache
+        half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(positions)
         residual: torch.Tensor | None = None
         for layer in self.layers:
-            h, residual = layer(h, residual, positions, cos_sin_cache)
+            h, residual = layer(
+                h,
+                residual,
+                half_rope_cos,
+                half_rope_sin,
+                rope_cos,
+                rope_sin,
+            )
         h, _ = self.norm(h, residual)
         return h
 

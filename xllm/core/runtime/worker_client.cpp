@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -83,15 +83,6 @@ bool WorkerClient::pull_kv_blocks(
     const std::vector<KVTransferMapping>& mappings) {
   auto future =
       worker_->pull_kv_blocks_async(src_cluster_id, src_addr, mappings);
-  return std::move(future).get();
-}
-
-bool WorkerClient::pull_hetero_kv_blocks(
-    const std::vector<uint64_t>& src_cluster_ids,
-    const std::vector<std::string>& src_addrs,
-    const std::vector<KVTransferMapping>& mappings) {
-  auto future = worker_->pull_hetero_kv_blocks_async(
-      src_cluster_ids, src_addrs, mappings);
   return std::move(future).get();
 }
 

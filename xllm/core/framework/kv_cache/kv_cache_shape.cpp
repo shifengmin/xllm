@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -158,6 +158,20 @@ bool KVCacheShape::has_conv_cache_shape() const {
 
 bool KVCacheShape::has_ssm_cache_shape() const {
   return ssm_cache_shape_.has_value();
+}
+
+int64_t KVCacheShape::linear_ssm_checkpoint_stride() const {
+  if (!has_conv_cache_shape() || !has_ssm_cache_shape()) {
+    return 1;
+  }
+  CHECK(!conv_cache_shape().empty() && !ssm_cache_shape().empty());
+  CHECK_GT(conv_cache_shape()[0], 0);
+  CHECK_EQ(ssm_cache_shape()[0] % conv_cache_shape()[0], 0)
+      << "SSM physical rows must be divisible by logical sequence slots.";
+  const int64_t checkpoint_stride =
+      ssm_cache_shape()[0] / conv_cache_shape()[0];
+  CHECK_GT(checkpoint_stride, 0);
+  return checkpoint_stride;
 }
 
 void KVCacheShape::print_shapes() const {

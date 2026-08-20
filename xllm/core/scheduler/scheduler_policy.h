@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,7 +41,7 @@ struct SchedulerState {
   // Queues (unified -- no separate online/offline distinction).
   // prefill_queue: holds new prefill requests (kv_cache_tokens_num == 0)
   // chunk_queue: holds chunked prefill continuations (has partial KV,
-  // preemptable) decode_queue: holds decode requests unified_queue: used by
+  // preemptible) decode_queue: holds decode requests unified_queue: used by
   // UnifiedPolicy (all requests in one list)
   RequestPriorityQueue& prefill_queue;
   RequestPriorityQueue& chunk_queue;

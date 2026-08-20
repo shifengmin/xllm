@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,6 +28,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/kernels/xllm_torch_ops.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/runtime/forward_params.h"
@@ -199,12 +200,15 @@ TEST(MtpAsyncInputBuilderTest, RejectsPageCountBeyondBlockTableWidth) {
 }
 
 TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
+  ensure_xllm_torch_ops_registered();
   if (!Py_IsInitialized()) {
     setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", 1);
     Py_InitializeEx(0);
   }
   py::gil_scoped_acquire gil;
   prepend_python_model_path();
+  py::module_::import("xllm.python._npu_bootstrap");
+  py::module_::import("xllm.python").attr("initialize_runtime")();
   py::module_ main_module = py::module_::import("__main__");
   register_attention_metadata_views(main_module);
 
@@ -233,7 +237,8 @@ TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
   runner.attr("attention_backend") = types.attr("SimpleNamespace")(
       py::arg("page_size") = kBlockSize, py::arg("is_mla") = false);
 
-  py::object py_metadata = py::cast(PyAttentionMetadataView(metadata));
+  ModelInputParams params;
+  py::object py_metadata = py::cast(PyAttentionMetadataView(metadata, params));
   py::tuple selected = runner.attr("_decode_metadata")(py_metadata);
 
   EXPECT_TRUE(torch::equal(selected[0].cast<torch::Tensor>(),

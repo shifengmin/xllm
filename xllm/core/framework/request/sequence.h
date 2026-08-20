@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -97,6 +97,8 @@ struct SequenceParams {
 
   // enable_schedule_overlap or not. default = false.
   bool enable_schedule_overlap = false;
+
+  bool is_graph_warmup = false;
 
   RecType rec_type = RecType::kNone;
 
@@ -261,6 +263,8 @@ class Sequence final {
   std::string sample_sequence_id() const {
     return request_id_ + "#" + std::to_string(index_);
   }
+
+  bool is_graph_warmup() const { return sequence_params_.is_graph_warmup; }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 

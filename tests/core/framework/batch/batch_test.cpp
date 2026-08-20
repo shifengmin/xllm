@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -513,6 +513,25 @@ TEST(BatchInputBuilderTest, DSV4FirstChunkSlicesFullRemoteAllocation) {
           full_info, &sequence, /*seq_len=*/32);
 
   expect_mapping(info, BlockType::C4, block_ids(blocks), {100, 101});
+  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
+            2u);
+}
+
+TEST(BatchInputBuilderTest, DSV4KvSplitMapsOneSourceBlockToTwoDecodeBlocks) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(2);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::C4, blocks);
+  const TransferKVInfo full_info =
+      make_info({100, 101, 102, 103}, BlockType::C4);
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/64, /*kv_split_size=*/2);
+
+  expect_mapping(info, BlockType::C4, block_ids(blocks), {100, 101, 102, 103});
   EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
             2u);
 }
@@ -1710,6 +1729,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   seq_params.echo = false;
   seq_params.logprobs = true;
   seq_params.enable_schedule_overlap = false;
+  seq_params.is_graph_warmup = true;
   seq_params.request_id = "req-packed";
 
   torch::Tensor input_embedding;
@@ -1771,6 +1791,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
 
   EXPECT_EQ(round_trip.input_params.meta.batch_id, batch_id);
+  EXPECT_TRUE(round_trip.input_params.meta.is_graph_warmup);
   EXPECT_TRUE(equal(round_trip.token_ids, std::vector<int32_t>({1, 2, 3, 4})));
   ASSERT_EQ(round_trip.transfer_kv_infos.size(), 1u);
   const KVTransferMapping& mapping =

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -30,6 +30,7 @@ namespace xllm {
 struct ModelInputParams;
 struct ForwardInput;
 struct SamplingParameters;
+struct SampleOutput;
 
 namespace specBuilder {
 
@@ -152,13 +153,6 @@ void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,
                                 int32_t kv_len,
                                 int32_t& kv_max_seq_len);
 
-// Builds q_cu_seq_lens tensor from upstream-provided host values.
-// When include_leading_zero is true, returns query_start_loc-style
-// [0, cumsum...].
-torch::Tensor build_q_cu_seq_lens_tensor(const ModelInputParams& params,
-                                         torch::Device device = torch::kCPU,
-                                         bool include_leading_zero = false);
-
 // Updates common decode-side ModelInputParams fields from built buffers.
 void update_input_params(ModelInputParams& input_params,
                          DecodeBuildBuffers& buf,
@@ -193,6 +187,10 @@ namespace draftProbs {
 // [batch_size] / [batch_size, 1].
 torch::Tensor compress_for_cache(const torch::Tensor& draft_probs,
                                  const torch::Tensor& draft_token_ids);
+
+// Compresses a draft SampleOutput's probs to selected-only cache form in place;
+// no-op when probs are undefined.
+void compress_sample_output_for_cache(SampleOutput& sample_output);
 
 // Build validate inputs from per-step draft token ids/probs.
 // Returns:

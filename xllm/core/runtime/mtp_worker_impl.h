@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,21 +22,16 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/mtp_json_object_state.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
-#if defined(USE_NPU)
-#include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
-#endif
-#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
 
 #if defined(USE_NPU)
-using namespace llm_datadist;
-
 namespace detail {
 class NpuJsonDraftTokenHandoff;
 }  // namespace detail

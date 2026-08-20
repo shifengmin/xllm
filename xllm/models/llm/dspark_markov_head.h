@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -71,6 +71,15 @@ class DSparkMarkovHead final {
     torch::Tensor markov_embedding =
         F::embedding(previous_token_ids, markov_w1_);
     return F::linear(markov_embedding, markov_w2_);
+  }
+
+  // Expose the shared markov_w1 embedding so a ConfidenceHead can reuse the
+  // same low-rank features without a redundant lookup-table copy.
+  torch::Tensor markov_embed(const torch::Tensor& previous_token_ids) const {
+    CHECK(markov_w1_.defined())
+        << "DSpark Markov head weights are not initialized.";
+    namespace F = torch::nn::functional;
+    return F::embedding(previous_token_ids, markov_w1_);
   }
 
  private:

@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -223,7 +223,7 @@ TEST(JsonObjectGrammarTest, RejectsNonEmptyStopTokensBeforeRootCompletion) {
                              " ",
                              "e",
                              "}",
-                             "tru",
+                             "tru",  // codespell:ignore tru
                              "<think>",
                              "</think>"},
                             /*stop_token_ids=*/{5, 6, 7},
@@ -246,7 +246,8 @@ TEST(JsonObjectGrammarTest, RejectsNonEmptyStopTokensBeforeRootCompletion) {
   EXPECT_FALSE(number_state.can_accept_token(/*stop_space=*/6));
 
   JsonObjectGrammarState literal_state = grammar.initial_state();
-  ASSERT_TRUE(literal_state.accept_piece("{\"a\":tru"));
+  ASSERT_TRUE(
+      literal_state.accept_piece("{\"a\":tru"));  // codespell:ignore tru
   EXPECT_FALSE(literal_state.can_accept_token(/*stop_e=*/7));
 }
 

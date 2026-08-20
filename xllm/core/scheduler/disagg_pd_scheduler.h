@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -82,7 +82,6 @@ class DisaggPDScheduler : public ContinuousScheduler {
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      bool heterogeneous_pd = false,
       torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
       int32_t num_cached_tokens = 0);
 

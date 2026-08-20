@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -445,27 +445,6 @@ void append_decode_row_from_last_step(const DecodeRowContext& ctx,
   append_decode_row(ctx, row, block_size, buf);
 }
 
-torch::Tensor build_q_cu_seq_lens_tensor(const ModelInputParams& params,
-                                         torch::Device device,
-                                         bool include_leading_zero) {
-  CHECK_EQ(params.attention.host.q_seq_lens.empty(),
-           params.attention.host.q_cu_seq_lens.empty())
-      << "q_seq_lens and q_cu_seq_lens must be provided together";
-  if (!include_leading_zero) {
-    return torch::tensor(params.attention.host.q_cu_seq_lens,
-                         torch::dtype(torch::kInt).device(device));
-  }
-  std::vector<int32_t> q_cu_seq_lens_vec;
-  q_cu_seq_lens_vec.reserve(params.meta.num_sequences + 1);
-  q_cu_seq_lens_vec.emplace_back(0);
-  for (int32_t i = 0; i < params.meta.num_sequences; ++i) {
-    q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() +
-                                   params.get_q_seq_len(i));
-  }
-  return torch::tensor(q_cu_seq_lens_vec,
-                       torch::dtype(torch::kInt).device(device));
-}
-
 void update_input_params(ModelInputParams& input_params,
                          DecodeBuildBuffers& buf,
                          int32_t q_max_seq_len,
@@ -576,6 +555,25 @@ torch::Tensor scatter_selected_to_dense(const torch::Tensor& ids,
 torch::Tensor compress_for_cache(const torch::Tensor& draft_probs,
                                  const torch::Tensor& draft_token_ids) {
   return extract_selected_probs(draft_probs, draft_token_ids);
+}
+
+void compress_sample_output_for_cache(SampleOutput& sample_output) {
+  if (!sample_output.probs.defined()) {
+    return;
+  }
+  CHECK(sample_output.next_tokens.defined())
+      << "draft sample_output.next_tokens must be defined when probs exist";
+  CHECK_EQ(sample_output.next_tokens.dim(), 1)
+      << "draft cache expects next_tokens [batch], got "
+      << sample_output.next_tokens.sizes();
+  CHECK(sample_output.probs.dim() == 1 || sample_output.probs.dim() == 2)
+      << "draft cache expects probs [batch] or [batch,vocab], got "
+      << sample_output.probs.sizes();
+  CHECK_EQ(sample_output.probs.size(0), sample_output.next_tokens.size(0))
+      << "draft cache probs/token batch mismatch";
+  // Cache always stores selected-only draft probs [batch_size] to reduce HBM.
+  sample_output.probs =
+      compress_for_cache(sample_output.probs, sample_output.next_tokens);
 }
 
 std::pair<torch::Tensor, torch::Tensor> build_validate_tensors(

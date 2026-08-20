@@ -4,7 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,11 +35,12 @@ limitations under the License.
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 #include "core/framework/block/block_utils.h"
-#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/multimodal/mm_data.h"
 #if defined(USE_NPU)
@@ -50,6 +51,7 @@ limitations under the License.
 #include "core/framework/speculative/mtp_async_input_builder.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/spec_input_builder.h"
+#include "core/framework/speculative/spec_verify.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "util/pretty_print.h"
@@ -796,17 +798,9 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
       MTPDraftParallelArgs(parallel_args, options),
       device,
       mtp_draft_options(draft_options));
-  const bool enable_parallel_adaptive_sl =
-      parallel_args.dp_size() <= 1 && parallel_args.ep_size() <= 1;
-  if (enable_adaptive_speculative_decode && enable_parallel_adaptive_sl) {
+  if (enable_adaptive_speculative_decode) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
-  } else if (enable_adaptive_speculative_decode &&
-             options.enable_adaptive_speculative_decode()) {
-    LOG(WARNING)
-        << "Adaptive speculative decode is disabled for DP/EP parallelism "
-        << "in v1. dp_size=" << parallel_args.dp_size()
-        << ", ep_size=" << parallel_args.ep_size();
   }
 }
 
@@ -1052,34 +1046,11 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   CHECK(draft_impl_ != nullptr);
 
   if (kv_cache_transfer_ == nullptr) {
-#if defined(USE_NPU)
-    const std::string& transfer_type =
-        ::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type();
-    if (transfer_type == "LlmDataDist") {
-      kv_cache_transfer_ = std::make_shared<SpecKVCacheTransfer>(
-          options_.transfer_listen_port(),
-          options_.instance_role(),
-          context_.get_model_args().index_n_heads() > 0,
-          context_.get_model_args().enable_mla(),
-          options_.enable_mtp_draft_body_tp1());
-    } else {
-      CHECK_EQ(transfer_type, "Mooncake");
-      kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
-          device_.index(),
-          options_.transfer_listen_port(),
-          device_,
-          context_.get_model_args().model_type());
-    }
-#elif defined(USE_MLU)
-    CHECK_EQ(::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type(),
-             "Mooncake")
-        << "MLU MTP only supports Mooncake KV transfer.";
     kv_cache_transfer_ = std::make_shared<MooncakeKVCacheTransferDefault>(
         device_.index(),
         options_.transfer_listen_port(),
         device_,
         context_.get_model_args().model_type());
-#endif
 
     int32_t device_id = device_.index();
     kv_cache_transfer_->initialize(device_id);
@@ -1198,6 +1169,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.raw_dp_global_token_nums) {
       token_num *= 2;
     }
+    new_input.input_params.expert.eplb_decode_token_mask =
+        eplb::expand_decode_token_mask(
+            new_input.input_params.expert.eplb_decode_token_mask,
+            /*tokens_per_row=*/2);
     if (use_prelaunched_first_draft) {
       draft_outputs.emplace_back(
           std::move(pending_draft_context_.output.value()));
@@ -1230,6 +1205,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
          new_input.input_params.parallel.raw_dp_global_token_nums) {
       token_num *= options_.num_speculative_tokens() + 1;
     }
+    new_input.input_params.expert.eplb_decode_token_mask =
+        eplb::expand_decode_token_mask(
+            new_input.input_params.expert.eplb_decode_token_mask,
+            options_.num_speculative_tokens() + 1);
+    // Deadlock-safety under DP: this rank's shard is empty but all peers
+    // decode, so busy peers allgather their pruned validate counts before the
+    // target forward. Join that allgather in lockstep with this rank's uniform
+    // count.
+    sync_dp_global_token_nums_for_idle_rank(new_input.input_params);
     ForwardOutput output = run_llm_no_sync_impl(*impl_,
                                                 new_input,
                                                 *prepare_stream_,
@@ -2170,6 +2154,17 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                          per_seq_val_tokens,
                                          json_scratch,
                                          *compute_stream_);
+  // Under DP, publish this rank's true validate token count to all DP peers so
+  // DpEpPadding computes matching MoE all-to-all pads. per_seq_val_tokens is
+  // uniform (N+1) on the static path and varlen on the adaptive path; both
+  // funnel through here, so every DP rank runs the collective in lockstep.
+  // No-op when the DP group spans a single rank.
+  int32_t local_total_val_tokens = 0;
+  for (int32_t v : per_seq_val_tokens) {
+    local_total_val_tokens += v;
+  }
+  sync_dp_global_token_nums_after_prune(validate_input.input_params,
+                                        local_total_val_tokens);
   ForwardOutput target_output = run_llm_no_sync_impl(*impl_,
                                                      validate_input,
                                                      *compute_stream_,
@@ -2856,21 +2851,7 @@ bool MTPWorkerImpl::adaptive_enabled() const {
 }
 
 void MTPWorkerImpl::process_draft_sample_output(SampleOutput& sample_output) {
-  if (sample_output.probs.defined()) {
-    CHECK(sample_output.next_tokens.defined())
-        << "draft sample_output.next_tokens must be defined when probs exist";
-    CHECK_EQ(sample_output.next_tokens.dim(), 1)
-        << "MTP draft cache expects next_tokens [batch], got "
-        << sample_output.next_tokens.sizes();
-    CHECK(sample_output.probs.dim() == 1 || sample_output.probs.dim() == 2)
-        << "MTP draft cache expects probs [batch] or [batch,vocab], got "
-        << sample_output.probs.sizes();
-    CHECK_EQ(sample_output.probs.size(0), sample_output.next_tokens.size(0))
-        << "MTP draft cache probs/token batch mismatch";
-    // Cache always stores selected-only draft probs [batch_size] to reduce HBM.
-    sample_output.probs = specBuilder::draftProbs::compress_for_cache(
-        sample_output.probs, sample_output.next_tokens);
-  }
+  specBuilder::draftProbs::compress_sample_output_for_cache(sample_output);
 }
 
 void MTPWorkerImpl::update_decode_step_input(
@@ -3165,6 +3146,8 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   for (int32_t& token_num : input_params.parallel.raw_dp_global_token_nums) {
     token_num *= num_val_tokens;
   }
+  input_params.expert.eplb_decode_token_mask = eplb::expand_decode_token_mask(
+      input_params.expert.eplb_decode_token_mask, num_val_tokens);
 
   std::vector<int32_t> accepted_prefix_lengths;
   if (use_chunked_prefill_spec_verify_path()) {
@@ -3767,6 +3750,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
           static_cast<int32_t>(buf.out_positions.size());
     }
   }
+  input_params.expert.eplb_decode_token_mask = eplb::expand_decode_token_mask(
+      input_params.expert.eplb_decode_token_mask,
+      static_cast<int32_t>(buf.out_positions.size() / num_sequences));
 
 #if defined(USE_NPU)
   // The extend layout is the 2B cache variant during steady overlap decode.
@@ -4009,23 +3995,17 @@ SampleOutput MTPWorkerImpl::validate(
                        draft_token_ids);
     }
 
-    // prepare input for rejection sampling
-    std::unique_ptr<RejectionSampler> rejection_sampler =
-        std::make_unique<RejectionSampler>(sampling_params.do_sample,
-                                           sampling_params.all_random_sample,
-                                           sampling_params.all_greedy_sample,
-                                           target_output.logprobs,
-                                           target_output.max_top_logprobs,
-                                           enable_fused_kernel_);
-
     // get the accepted tokens
-    sample_output = rejection_sampler->forward(
-        validation_draft_token_ids.to(bonus_token_ids),
-        draft_probs.defined() ? draft_probs.to(target_logits.device())
-                              : torch::Tensor(),
+    sample_output = spec_verify::run_rejection_sampling(
+        {.do_sample = sampling_params.do_sample,
+         .all_random_sample = sampling_params.all_random_sample,
+         .all_greedy_sample = sampling_params.all_greedy_sample},
+        validation_draft_token_ids,
+        draft_probs,
         target_logits,
+        target_output,
         bonus_token_ids,
-        /*mask_out_rejected_tokens=*/true);
+        enable_fused_kernel_);
 
     if (!invalid_draft.empty()) {
       torch::Tensor target_sampled_tokens =
@@ -4057,11 +4037,6 @@ SampleOutput MTPWorkerImpl::validate(
         }
       }
     }
-
-    // process embedding
-    torch::Tensor embeddings = target_output.sample_output.embeddings;
-    sample_output.embeddings =
-        embeddings.view({batch_size, num_val_tokens, embeddings.size(-1)});
   }
 
   if (pruned_prefix_lengths != nullptr) {
