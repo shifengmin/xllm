@@ -104,6 +104,8 @@ struct AttentionMetadata {
   std::vector<int32_t> kv_seq_lens_vec;
   std::vector<int32_t> q_seq_lens_vec;
   torch::Tensor block_table;
+  // Worker logical coordinates: `block_id * logical_block_size + offset`.
+  // Cache-shard ranks must not rewrite this; they localize a derived copy.
   torch::Tensor slot_mapping;
   // Cache-shard derivations are immutable batch data shared by all layers.
   std::shared_ptr<const KVShardBatchMetadata> kv_shard_batch_metadata;

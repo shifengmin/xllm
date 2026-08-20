@@ -1073,6 +1073,9 @@ void BatchInputBuilder::setup_kv_cache_info(
     }
   }
 
+  // Logical/global slots: `block_id * Block.size() + offset`. Block.size() is
+  // already `physical_block_size * kv_shard_size()`, so DCP/KV-split packing is
+  // encoded here. Worker metadata keeps these coordinates; attention localizes.
   const auto slot_ids = sequence->kv_state().cache_slots(
       BlockType::KV, n_kv_cache_tokens, seq_len);
   state.new_token_slot_ids.insert(

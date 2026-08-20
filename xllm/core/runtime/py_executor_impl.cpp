@@ -140,6 +140,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         << "KV cache layer count changed after initial bind";
   }
 
+  // Pass Worker logical slot_mapping / block_table / kv_seq_lens unchanged.
+  // Python SFA DCP localizes owned KV writes in SfaDcpAttentionBackend.prepare.
   py::object py_metadata =
       py::cast(PyAttentionMetadataView(attn_metadata, params));
   py::object input_embedding = params.embedding.input_embedding.defined()

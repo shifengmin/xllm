@@ -68,6 +68,13 @@ def normalize_layer_caches(caches: Sequence[LayerCacheInput]) -> list[LayerCache
 
 
 class AttentionMetadata(Protocol):
+    """Worker attention metadata in global logical coordinates.
+
+    ``slot_mapping``, ``block_table`` and ``kv_seq_lens`` describe the full
+    sequence. Cache-shard backends localize a derived copy; they must not
+    rewrite these fields in place.
+    """
+
     slot_mapping: torch.Tensor
     paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor

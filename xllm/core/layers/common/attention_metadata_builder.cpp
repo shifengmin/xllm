@@ -320,6 +320,8 @@ AttentionMetadata build_attention_metadata(
   }
   attn_metadata.kv_seq_lens_vec = params.attention.host.kv_seq_lens;
   attn_metadata.q_seq_lens_vec = params.attention.host.q_seq_lens;
+  // Keep Worker slots in global logical coordinates. DCP/KV-split localization
+  // is derived later into kv_shard_batch_metadata / the Python backend.
   attn_metadata.slot_mapping = params.attention.device.new_cache_slots;
   attn_metadata.compute_dtype = compute_dtype;
 #if defined(USE_DCU)

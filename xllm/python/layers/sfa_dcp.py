@@ -36,7 +36,7 @@ def all_gather_async(
     group: GroupCoordinator,
     output: torch.Tensor | None = None,
     async_op: bool = True,
-):
+) -> tuple[torch.Tensor, torch.distributed.Work | None]:
     if group.world_size == 1:
         return input, None
     if output is None:
@@ -173,6 +173,7 @@ class AscendSFADCPMetadataBuilder:
         dcp_local_seq_lens: torch.Tensor | None = None,
         is_prefilling: torch.Tensor | None = None,
         query_lens_cpu: torch.Tensor | None = None,
+        num_prefills: int | None = None,
     ) -> AscendSFADCPMetadata:
         dcp_block_table = block_table[:num_reqs]
         if dcp_local_seq_lens is None:
@@ -190,13 +191,16 @@ class AscendSFADCPMetadataBuilder:
         self.dcp_local_seq_lens_buf[:num_reqs].copy_(local_seq_lens_src, non_blocking=True)
         local_seq_lens = self.dcp_local_seq_lens_buf[:num_reqs]
 
-        num_prefills = _count_prefills(
-            query_start_loc_cpu,
-            num_reqs,
-            self.decode_threshold,
-            is_prefilling,
-            query_lens_cpu,
-        )
+        if num_prefills is None:
+            num_prefills = _count_prefills(
+                query_start_loc_cpu,
+                num_reqs,
+                self.decode_threshold,
+                is_prefilling,
+                query_lens_cpu,
+            )
+        elif num_prefills < 0 or num_prefills > num_reqs:
+            raise RuntimeError(f"num_prefills must be in [0, {num_reqs}], got {num_prefills}")
         kv_gather_block_ids = None
         kv_gather_block_table = None
         if num_prefills > 0:
@@ -406,12 +410,6 @@ class AscendSFADCPImpl:
             return
         attn_metadata.dcp_context.gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
 
-    def _get_sfa_kv_slot_mapping(
-        self,
-        attn_metadata: AscendSFADCPMetadata,
-    ) -> torch.Tensor:
-        return attn_metadata.dcp_context.slot_mapping
-
     def _store_parallel_kv(
         self,
         k_pe: torch.Tensor | None,
@@ -468,14 +466,14 @@ class AscendSFADCPImpl:
 
     def _execute_sparse_flash_attention_process(
         self,
-        ql_nope,
-        q_pe,
-        kv_cache,
-        topk_indices,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        topk_indices: torch.Tensor,
         attn_metadata: AscendSFADCPMetadata,
-        actual_seq_lengths_query,
-        actual_seq_lengths_key,
-    ):
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+    ) -> torch.Tensor:
         assert self.dcp_group is not None, "DCP SFA requires dcp_group when dcp_size > 1."
         dcp_context = attn_metadata.dcp_context
         if self._has_prefill(attn_metadata):

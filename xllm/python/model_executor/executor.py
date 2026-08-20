@@ -43,11 +43,18 @@ def _create_attention_backend(
     first_attention: Attention,
     device: torch.device,
     dtype: torch.dtype,
-    max_num_reqs: int,
+    max_num_reqs: int = 1,
+    *,
+    cp_size: int = 1,
 ) -> AttentionBackend:
     if current_platform.is_npu():
         dcp_group = distributed.dcp_group(device)
         if dcp_group is not None and dcp_group.size() > 1:
+            if cp_size > 1:
+                raise NotImplementedError(
+                    "DCP keeps Worker KV metadata in global coordinates; "
+                    "CP sequence sharding (cp_size > 1) is not supported with dcp_size > 1."
+                )
             from xllm.python.attention.sfa_dcp_backend import (
                 SfaDcpAttentionBackend,
                 dcp_layer_options,
@@ -123,6 +130,7 @@ class ModelExecutor:
             device,
             first_parameter.dtype,
             max_seqs_per_batch,
+            cp_size=int(config.get("cp_size", 1)),
         )
 
         execution_model = model.model
