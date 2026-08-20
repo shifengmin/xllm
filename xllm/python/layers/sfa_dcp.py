@@ -1,0 +1,571 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""DCP sparse-flash-attention path. Imports are torch and the stdlib."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, NamedTuple, Protocol
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+class GroupCoordinator(Protocol):
+    world_size: int
+    rank_in_group: int
+    device_group: Any
+
+
+def all_gather_async(
+    input: torch.Tensor,
+    group: GroupCoordinator,
+    output: torch.Tensor | None = None,
+    async_op: bool = True,
+):
+    if group.world_size == 1:
+        return input, None
+    if output is None:
+        input_size = input.size()
+        output_size = (input_size[0] * group.world_size,) + input_size[1:]
+        output = torch.empty(output_size, dtype=input.dtype, device=input.device)
+    return output, dist.all_gather_into_tensor(output, input, group=group.device_group, async_op=async_op)
+
+
+def get_dcp_local_seq_lens(
+    seq_lens: torch.Tensor,
+    dcp_size: int,
+    interleave_size: int,
+) -> torch.Tensor:
+    """Return the interleave-aware KV length of every DCP rank."""
+    tiled = seq_lens.unsqueeze(-1)
+    rank_offsets = torch.arange(
+        dcp_size,
+        dtype=seq_lens.dtype,
+        device=seq_lens.device,
+    )
+    base = tiled // interleave_size // dcp_size * interleave_size
+    remainder = tiled - base * dcp_size
+    return base + torch.clamp(
+        remainder - rank_offsets * interleave_size,
+        0,
+        interleave_size,
+    )
+
+
+def _count_prefills(
+    query_start_loc_cpu: torch.Tensor,
+    num_reqs: int,
+    decode_threshold: int,
+    is_prefilling: torch.Tensor | None,
+    query_lens_cpu: torch.Tensor | None,
+) -> int:
+    """Count prefill requests. Short extends that are still prefilling count as prefills."""
+    if num_reqs == 0:
+        return 0
+    query_lens_sharded = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    query_lens = query_lens_sharded if query_lens_cpu is None else query_lens_cpu
+    if query_lens[0].item() > decode_threshold:
+        return num_reqs
+    is_prefill = query_lens > decode_threshold
+    if is_prefilling is not None:
+        is_prefilling_row = is_prefilling[: query_lens.shape[0]]
+        if is_prefilling_row.shape[0] < query_lens.shape[0]:
+            is_prefilling_row = F.pad(
+                is_prefilling_row,
+                (0, query_lens.shape[0] - is_prefilling_row.shape[0]),
+                value=False,
+            )
+        is_prefill = is_prefill | is_prefilling_row
+    if not torch.any(is_prefill):
+        return 0
+    first_prefill = int(is_prefill.int().argmax(dim=-1).item())
+    return num_reqs - first_prefill
+
+
+class DCPGatherContext(NamedTuple):
+    """State needed to finish an async fused DCP all-gather."""
+
+    gathered: torch.Tensor
+    handle: torch.distributed.Work | None
+    restore_perm: tuple[int, ...] | None
+    split_sizes: tuple[int, ...]
+
+
+@dataclass
+class DCPContext:
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    seq_lens: torch.Tensor
+    kv_gather_block_ids: torch.Tensor | None = None
+    kv_gather_block_table: torch.Tensor | None = None
+    gather_context: DCPGatherContext | None = None
+
+
+@dataclass
+class AscendSFADCPMetadata:
+    num_prefills: int
+    dcp_context: DCPContext
+
+
+class AscendSFADCPMetadataBuilder:
+    def __init__(
+        self,
+        dcp_group: GroupCoordinator,
+        *,
+        cp_kv_cache_interleave_size: int,
+        device: torch.device,
+        max_num_reqs: int,
+        decode_threshold: int = 1,
+    ) -> None:
+        if dcp_group.world_size <= 1:
+            raise RuntimeError("AscendSFADCPMetadataBuilder requires DCP world size > 1.")
+        if cp_kv_cache_interleave_size <= 0:
+            raise RuntimeError(f"Invalid cp_kv_cache_interleave_size: {cp_kv_cache_interleave_size}")
+        if max_num_reqs <= 0:
+            raise RuntimeError(f"Invalid max_num_reqs: {max_num_reqs}")
+        self.dcp_size = dcp_group.world_size
+        self.dcp_rank = dcp_group.rank_in_group
+        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        self.device = device
+        self.decode_threshold = decode_threshold
+        self.dcp_local_seq_lens_buf = torch.empty(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.dcp_rank_arange = torch.arange(
+            self.dcp_size,
+            dtype=torch.int32,
+            device=device,
+        )
+
+    def _local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        return get_dcp_local_seq_lens(
+            seq_lens,
+            self.dcp_size,
+            self.cp_kv_cache_interleave_size,
+        )[:, self.dcp_rank]
+
+    def _build_compact_kv_gather_metadata(
+        self,
+        dcp_block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid_block_ids, compact_block_table = dcp_block_table.flatten().unique(return_inverse=True)
+        compact_block_table = compact_block_table.view_as(dcp_block_table)
+        num_blocks = valid_block_ids.shape[0]
+        remapped_block_table = (
+            compact_block_table.unsqueeze(-1)
+            + (self.dcp_rank_arange * num_blocks).view(1, 1, -1).to(dcp_block_table)
+        ).reshape(dcp_block_table.shape[0], -1)
+        return valid_block_ids, remapped_block_table.to(torch.int32)
+
+    def build(
+        self,
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_reqs: int,
+        num_input_tokens: int,
+        *,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
+        query_lens_cpu: torch.Tensor | None = None,
+    ) -> AscendSFADCPMetadata:
+        dcp_block_table = block_table[:num_reqs]
+        if dcp_local_seq_lens is None:
+            dcp_local_seq_lens = self._local_seq_lens(seq_lens[:num_reqs])
+        local_seq_lens_src = dcp_local_seq_lens[:num_reqs].to(
+            device=self.device,
+            dtype=torch.int32,
+            non_blocking=True,
+        )
+        if num_reqs > self.dcp_local_seq_lens_buf.shape[0]:
+            raise RuntimeError(
+                f"dcp_local_seq_lens_buf is too small: "
+                f"shape={tuple(self.dcp_local_seq_lens_buf.shape)}, num_reqs={num_reqs}"
+            )
+        self.dcp_local_seq_lens_buf[:num_reqs].copy_(local_seq_lens_src, non_blocking=True)
+        local_seq_lens = self.dcp_local_seq_lens_buf[:num_reqs]
+
+        num_prefills = _count_prefills(
+            query_start_loc_cpu,
+            num_reqs,
+            self.decode_threshold,
+            is_prefilling,
+            query_lens_cpu,
+        )
+        kv_gather_block_ids = None
+        kv_gather_block_table = None
+        if num_prefills > 0:
+            kv_gather_block_ids, kv_gather_block_table = self._build_compact_kv_gather_metadata(dcp_block_table)
+        return AscendSFADCPMetadata(
+            num_prefills=num_prefills,
+            dcp_context=DCPContext(
+                slot_mapping=slot_mapping[:num_input_tokens],
+                block_table=dcp_block_table,
+                seq_lens=local_seq_lens,
+                kv_gather_block_ids=kv_gather_block_ids,
+                kv_gather_block_table=kv_gather_block_table,
+            ),
+        )
+
+
+class AscendSFADCPImpl:
+    def __init__(
+        self,
+        dcp_group: GroupCoordinator,
+        *,
+        scale: float,
+        index_topk: int,
+        cp_kv_cache_interleave_size: int,
+        device: torch.device,
+    ) -> None:
+        if cp_kv_cache_interleave_size <= 0:
+            raise RuntimeError(f"Invalid cp_kv_cache_interleave_size: {cp_kv_cache_interleave_size}")
+        if index_topk <= 0:
+            raise RuntimeError("index_topk must be a positive integer for DCP SFA.")
+        self.dcp_group = dcp_group
+        self.dcp_size = dcp_group.world_size
+        self.dcp_rank = dcp_group.rank_in_group
+        self.scale = float(scale)
+        self._dcp_interleave_size = cp_kv_cache_interleave_size
+        self._dcp_index_topk = index_topk
+        self._remap_order = torch.arange(index_topk, dtype=torch.float32, device=device)
+        self._remap_invalid_index = torch.tensor(-1.0, dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _has_prefill(attn_metadata: AscendSFADCPMetadata) -> bool:
+        return attn_metadata.num_prefills > 0
+
+    def _record_dcp_kv_gather_context(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendSFADCPMetadata,
+    ) -> None:
+        """Start the compact KV all-gather used by prefill/mixed DCP batches."""
+        if not self._has_prefill(attn_metadata):
+            return
+        assert self.dcp_group is not None, "DCP SFA requires dcp_group when dcp_size > 1."
+
+        valid_block_ids = attn_metadata.dcp_context.kv_gather_block_ids
+        block_table = attn_metadata.dcp_context.kv_gather_block_table
+        assert valid_block_ids is not None and block_table is not None
+        kv = torch.index_select(kv_cache[0], 0, valid_block_ids)
+        if len(kv_cache) < 2:
+            raise RuntimeError("DCP SFA KV all-gather requires nope and rope KV caches.")
+        key_rope = torch.index_select(kv_cache[1], 0, valid_block_ids)
+        if kv.shape[:-1] != key_rope.shape[:-1] or kv.dtype != key_rope.dtype:
+            raise RuntimeError(
+                "Cannot fuse DCP KV gather for KV/nope and KV/rope caches with "
+                f"shapes {tuple(kv.shape)} / {tuple(key_rope.shape)} and dtypes {kv.dtype} / {key_rope.dtype}."
+            )
+        attn_metadata.dcp_context.gather_context = self._start_dcp_gather(
+            torch.cat([kv, key_rope], dim=-1).contiguous(),
+            dim=0,
+            split_sizes=(kv.shape[-1], key_rope.shape[-1]),
+        )
+
+    def _start_dcp_gather(
+        self,
+        x: torch.Tensor,
+        dim: int,
+        split_sizes: tuple[int, ...],
+    ) -> DCPGatherContext:
+        gathered, handle, restore_perm = self._all_gather_dim_async(x, dim)
+        return DCPGatherContext(
+            gathered=gathered,
+            handle=handle,
+            restore_perm=restore_perm,
+            split_sizes=split_sizes,
+        )
+
+    @staticmethod
+    def _finish_dcp_gather(
+        context: DCPGatherContext,
+    ) -> tuple[torch.Tensor, ...]:
+        if context.handle is not None:
+            context.handle.wait()
+        gathered = context.gathered
+        if context.restore_perm is not None:
+            gathered = gathered.permute(context.restore_perm).contiguous()
+        return torch.split(gathered, context.split_sizes, dim=-1)
+
+    def _all_gather_dim_async(
+        self,
+        x: torch.Tensor,
+        dim: int,
+    ) -> tuple[torch.Tensor, torch.distributed.Work | None, tuple[int, ...] | None]:
+        assert self.dcp_group is not None
+        if dim == 0:
+            gathered, handle = all_gather_async(x.contiguous(), self.dcp_group)
+            return gathered, handle, None
+
+        perm = (dim, *[i for i in range(x.dim()) if i != dim])
+        restore_perm = tuple(perm.index(i) for i in range(x.dim()))
+        gathered, handle = all_gather_async(x.permute(perm).contiguous(), self.dcp_group)
+        return gathered, handle, restore_perm
+
+    def _remap_sparse_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        if self.dcp_size <= 1:
+            return topk_indices
+
+        topk_count = topk_indices.shape[-1]
+        if topk_count > self._dcp_index_topk:
+            raise RuntimeError(
+                f"topk_indices last dimension ({topk_count}) exceeds configured index_topk ({self._dcp_index_topk})."
+            )
+
+        # Remap the topk indices from the replicated view to the DCP-local KV cache view.
+        # We use float32 for better performance on Ascend.
+        topk_indices_fp32 = topk_indices.to(torch.float32)
+        interleave_size = self._dcp_interleave_size
+        local_block_indices = torch.floor(topk_indices_fp32 / interleave_size)
+        local_owner_base = torch.floor(local_block_indices / self.dcp_size) * self.dcp_size
+        local_owner = local_block_indices - local_owner_base
+        local_owner_mask = (topk_indices_fp32 >= 0) & (local_owner == self.dcp_rank)
+        if interleave_size == 1:
+            remapped_indices_fp32 = torch.floor(topk_indices_fp32 / self.dcp_size)
+        else:
+            local_offsets = topk_indices_fp32 - local_block_indices * interleave_size
+            remapped_indices_fp32 = torch.floor(topk_indices_fp32 / (self.dcp_size * interleave_size))
+            remapped_indices_fp32 = remapped_indices_fp32 * interleave_size + local_offsets
+        remapped_indices = torch.where(
+            local_owner_mask,
+            remapped_indices_fp32,
+            self._remap_invalid_index,
+        ).to(topk_indices.dtype)
+
+        # Compact local indices to the front without changing their top-k order.
+        original_order = self._remap_order[:topk_count].expand_as(topk_indices)
+        pack_keys = original_order + (~local_owner_mask).to(torch.float32) * topk_count
+        _, pack_order = torch.sort(pack_keys, dim=-1)
+        return torch.gather(remapped_indices, dim=-1, index=pack_order.to(torch.int32))
+
+    def _all_to_all_dcp_tensor(
+        self,
+        tensor: torch.Tensor,
+        scatter_dim: int,
+    ) -> torch.Tensor:
+        assert self.dcp_group is not None, "DCP output All2All requires dcp_group when dcp_size > 1."
+        scatter_size = tensor.shape[scatter_dim]
+        if scatter_size % self.dcp_size != 0:
+            raise RuntimeError(
+                "DCP output All2All requires the scatter dimension to be divisible "
+                f"by dcp_size, got shape={tuple(tensor.shape)}, scatter_dim={scatter_dim}, "
+                f"and dcp_size={self.dcp_size}."
+            )
+
+        local_scatter_size = scatter_size // self.dcp_size
+        send = tensor.movedim(scatter_dim, 0).contiguous()
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=self.dcp_group.device_group)
+        recv = recv.view(self.dcp_size, local_scatter_size, *send.shape[1:])
+        return recv
+
+    @staticmethod
+    def _merge_dcp_outputs_with_torch(
+        output_recv: torch.Tensor,
+        lse_recv: torch.Tensor,
+    ) -> torch.Tensor:
+        if output_recv.ndim != 4 or lse_recv.ndim != 3 or output_recv.shape[:3] != lse_recv.shape:
+            raise RuntimeError(
+                "DCP output merge expects matching rank/token/head dimensions, "
+                f"got {tuple(output_recv.shape)} and {tuple(lse_recv.shape)}."
+            )
+        lse_recv = lse_recv.masked_fill(~torch.isfinite(lse_recv), float("-inf"))
+        weights = torch.softmax(lse_recv, dim=0)
+        weights = torch.nan_to_num(weights, nan=0.0)
+
+        output = (output_recv.to(lse_recv.dtype) * weights.unsqueeze(-1)).sum(dim=0)
+        return output.movedim(1, 0).contiguous()
+
+    def _merge_dcp_outputs(
+        self,
+        sfa_output: torch.Tensor,
+        softmax_lse: torch.Tensor,
+    ) -> torch.Tensor:
+        output_recv = self._all_to_all_dcp_tensor(sfa_output, 1)
+        lse_recv = self._all_to_all_dcp_tensor(softmax_lse, 1).squeeze(-1)
+        return self._merge_dcp_outputs_with_torch(output_recv, lse_recv)
+
+    def _start_dcp_query_gather(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> DCPGatherContext:
+        assert self.dcp_group is not None, "DCP query gather requires dcp_group when dcp_size > 1."
+        if ql_nope.shape[:-1] != q_pe.shape[:-1] or ql_nope.dtype != q_pe.dtype:
+            raise RuntimeError(
+                "Cannot fuse DCP query gather for ql_nope/q_pe with "
+                f"shapes {tuple(ql_nope.shape)} / {tuple(q_pe.shape)} "
+                f"and dtypes {ql_nope.dtype} / {q_pe.dtype}."
+            )
+
+        # Avoid back-to-back DCP all_gather calls for the two SFA query
+        # fragments. On Ascend the separate gathers can leave SFA with an
+        # incomplete stream dependency on the first prefill. Native DCP
+        # restores query shards on dim 1.
+        fused_q = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        return self._start_dcp_gather(
+            fused_q,
+            dim=1,
+            split_sizes=(ql_nope.shape[-1], q_pe.shape[-1]),
+        )
+
+    def _record_query_gather_context(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        attn_metadata: AscendSFADCPMetadata,
+    ) -> None:
+        # Prefill/mixed batches gather compact KV after its cache write instead.
+        # Keeping Q local avoids a full query all-gather and the subsequent LSE
+        # output merge in the all-KV attention path.
+        if self._has_prefill(attn_metadata):
+            return
+        attn_metadata.dcp_context.gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
+
+    def _get_sfa_kv_slot_mapping(
+        self,
+        attn_metadata: AscendSFADCPMetadata,
+    ) -> torch.Tensor:
+        return attn_metadata.dcp_context.slot_mapping
+
+    def _store_parallel_kv(
+        self,
+        k_pe: torch.Tensor | None,
+        k_nope: torch.Tensor | None,
+        k_li: torch.Tensor | None,
+        kv_cache: tuple[torch.Tensor, ...] | None,
+        attn_metadata: AscendSFADCPMetadata,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        # Prefill DCP gathers referenced blocks after the current layer writes
+        # its SFA KV cache and before indexer/top-k work begins.
+        if kv_cache is not None:
+            self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+        return k_pe, k_nope, k_li
+
+    def _npu_sparse_flash_attention(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        topk_indices: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        *,
+        sparse_mode: int,
+        return_lse: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv = kv_cache[0]
+        result = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=ql_nope,
+            key=kv,
+            value=kv,
+            sparse_indices=topk_indices,
+            scale_value=self.scale,
+            sparse_block_size=1,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_key,
+            query_rope=q_pe,
+            key_rope=kv_cache[1],
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=sparse_mode,
+            attention_mode=2,
+            return_softmax_lse=return_lse,
+        )
+        if not isinstance(result, tuple):
+            if return_lse:
+                raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
+            return result
+        if return_lse:
+            return result
+        return result[0]
+
+    def _execute_sparse_flash_attention_process(
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata: AscendSFADCPMetadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+    ):
+        assert self.dcp_group is not None, "DCP SFA requires dcp_group when dcp_size > 1."
+        dcp_context = attn_metadata.dcp_context
+        if self._has_prefill(attn_metadata):
+            gather_context = dcp_context.gather_context
+            dcp_context.gather_context = None
+            if gather_context is None:
+                # The normal forward path starts this after KV writes so it can
+                # overlap indexer selection. Keep a synchronous fallback for
+                # callers that invoke this method outside that path.
+                self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+                gather_context = dcp_context.gather_context
+                dcp_context.gather_context = None
+            assert gather_context is not None
+            gathered_kv_cache = self._finish_dcp_gather(gather_context)
+            block_table = dcp_context.kv_gather_block_table
+            assert block_table is not None
+            # The gathered KV cache is complete, so each rank can attend with
+            # its local Q heads/tokens directly.
+            return self._npu_sparse_flash_attention(
+                ql_nope,
+                q_pe,
+                gathered_kv_cache,
+                topk_indices,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                block_table,
+                sparse_mode=3,
+                return_lse=False,
+            )
+
+        gather_context = dcp_context.gather_context
+        dcp_context.gather_context = None
+        if gather_context is None:
+            gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
+        topk_indices = self._remap_sparse_indices(topk_indices)
+        ql_nope, q_pe = self._finish_dcp_gather(gather_context)
+        # The replicated-view indexer already applies the causal visibility rule.
+        # After DCP remaps topk indices to local KV positions, local KV
+        # length no longer shares the same coordinate system as global
+        # query length, so SFA must not apply its right-down causal crop.
+        sfa_output, softmax_max, softmax_sum = self._npu_sparse_flash_attention(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            actual_seq_lengths_query,
+            dcp_context.seq_lens,
+            dcp_context.block_table,
+            sparse_mode=0,
+            return_lse=True,
+        )
+        softmax_lse = softmax_max + torch.log(softmax_sum)
+        softmax_lse = softmax_lse.permute(1, 0, 2).reshape(softmax_lse.shape[1], -1, 1)
+        output_dtype = sfa_output.dtype
+        output = self._merge_dcp_outputs(sfa_output, softmax_lse)
+        return output.to(output_dtype)

@@ -172,6 +172,30 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
                        global_world_size,
                        cp_group_index);
   }
+  const int32_t dcp_size = parallel_args.dcp_size();
+  if (dcp_size > 1) {
+    // DCP shards decode KV inside the attention TP group. It is a separate
+    // communicator from CP, mutually exclusive with kv_split, and uses the
+    // contiguous membership of Python ``dcp`` groups: group index =
+    // global_rank / dcp_size, rank in group = global_rank % dcp_size.
+    CHECK_EQ(parallel_args.kv_split_size_effective(), 1)
+        << "dcp_size (" << dcp_size
+        << ") and kv_split_size are mutually exclusive.";
+    CHECK_EQ(tp_size_ % dcp_size, 0)
+        << "DCP groups are contiguous partitions of TP; tp_size (" << tp_size_
+        << ") must be divisible by dcp_size (" << dcp_size << ").";
+    const int32_t dcp_rank = global_rank % dcp_size;
+    const int32_t dcp_group_index = global_rank / dcp_size;
+    init_process_group("dcp",
+                       parallel_args.python_rendezvous_host_,
+                       parallel_args.python_rendezvous_port_,
+                       dcp_rank,
+                       dcp_size,
+                       c10::str(device_),
+                       global_rank,
+                       global_world_size,
+                       dcp_group_index);
+  }
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
                                       : context.get_model_args().model_type();
