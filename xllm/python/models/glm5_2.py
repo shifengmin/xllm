@@ -111,6 +111,13 @@ class Glm52Config:
     moe_intermediate_size: int = 2048
     tp_size: int = 1
     tp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+    dp_size: int = 1
+    dp_rank: int = 0
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    world_size: int = 1
     indexer_types: list | None = None
     mlp_layer_types: list | None = None
     index_skip_topk_offset: int = 2
@@ -199,6 +206,13 @@ class Glm52Config:
             moe_intermediate_size=int(pick("moe_intermediate_size", default=2048)),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
+            ep_size=int(pick("ep_size", default=1)),
+            ep_rank=int(pick("ep_rank", default=0)),
+            dp_size=int(pick("dp_size", default=1)),
+            dp_rank=int(pick("dp_rank", default=0)),
+            moe_tp_size=int(pick("moe_tp_size", default=1)),
+            moe_tp_rank=int(pick("moe_tp_rank", default=0)),
+            world_size=int(pick("world_size", default=1)),
             indexer_types=pick("indexer_types", default=None) or None,
             mlp_layer_types=pick("mlp_layer_types", default=None) or None,
             index_skip_topk_offset=int(pick("index_skip_topk_offset", default=2)),
@@ -530,6 +544,13 @@ class Glm52ForCausalLM(PyModelBase):
         self.cfg = Glm52Config.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
         self.cfg.tp_rank = int(config.get("tp_rank", _tp_rank_from_device(config.get("device", "npu:0"))))
+        self.cfg.ep_size = int(config.get("ep_size", 1))
+        self.cfg.ep_rank = int(config.get("ep_rank", 0))
+        self.cfg.dp_size = int(config.get("dp_size", 1))
+        self.cfg.dp_rank = int(config.get("dp_rank", 0))
+        self.cfg.moe_tp_size = int(config.get("moe_tp_size", 1))
+        self.cfg.moe_tp_rank = int(config.get("moe_tp_rank", 0))
+        self.cfg.world_size = int(config.get("world_size", self.cfg.tp_size))
         dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         device = torch.device(config.get("device", "cuda"))
         self.dtype = dtype
@@ -595,7 +616,13 @@ class Glm52ForCausalLM(PyModelBase):
                 w13_offset = self.get_buffer(p + "mlp.experts_w13_offset")
                 w2_scale = self.get_buffer(p + "mlp.experts_w2_scale")
                 w2_offset = self.get_buffer(p + "mlp.experts_w2_offset")
-                for j in range(cfg.n_routed_experts):
+                moe_layer = self.model.layers[i].mlp
+                expert_start = moe_layer.local_expert_start
+                expert_end = moe_layer.local_expert_end
+                shard_world = cfg.moe_tp_size if cfg.ep_size > 1 else cfg.tp_size
+                shard_rank = cfg.moe_tp_rank if cfg.ep_size > 1 else cfg.tp_rank
+                for j in range(expert_start, expert_end):
+                    local_idx = j - expert_start
                     gw = loader.load_tensor(se + f"{j}.gate_proj.weight")
                     gs = loader.load_tensor(se + f"{j}.gate_proj.weight_scale")
                     go = loader.load_tensor(se + f"{j}.gate_proj.weight_offset")
@@ -605,17 +632,45 @@ class Glm52ForCausalLM(PyModelBase):
                     dw = loader.load_tensor(se + f"{j}.down_proj.weight")
                     ds = loader.load_tensor(se + f"{j}.down_proj.weight_scale")
                     do = loader.load_tensor(se + f"{j}.down_proj.weight_offset")
-                    w13_param.data[j].copy_(torch.cat([loader.shard(gw, 0), loader.shard(uw, 0)], dim=0).contiguous())
-                    w13_scale.data[j].copy_(torch.cat([loader.shard(gs, 0), loader.shard(us, 0)], dim=0).contiguous())
-                    w13_offset.data[j].copy_(torch.cat([loader.shard(go, 0), loader.shard(uo, 0)], dim=0).contiguous())
-                    w2_param.data[j].copy_(loader.shard(dw, 1).contiguous())
-                    w2_scale.data[j].copy_(ds.contiguous())
-                    w2_offset.data[j].copy_(do.contiguous())
+                    w13_param.data[local_idx].copy_(
+                        torch.cat(
+                            [
+                                loader.shard(gw, 0, shard_world, shard_rank),
+                                loader.shard(uw, 0, shard_world, shard_rank),
+                            ],
+                            dim=0,
+                        ).contiguous()
+                    )
+                    w13_scale.data[local_idx].copy_(
+                        torch.cat(
+                            [
+                                loader.shard(gs, 0, shard_world, shard_rank),
+                                loader.shard(us, 0, shard_world, shard_rank),
+                            ],
+                            dim=0,
+                        ).contiguous()
+                    )
+                    w13_offset.data[local_idx].copy_(
+                        torch.cat(
+                            [
+                                loader.shard(go, 0, shard_world, shard_rank),
+                                loader.shard(uo, 0, shard_world, shard_rank),
+                            ],
+                            dim=0,
+                        ).contiguous()
+                    )
+                    w2_param.data[local_idx].copy_(loader.shard(dw, 1, shard_world, shard_rank).contiguous())
+                    w2_scale.data[local_idx].copy_(ds.contiguous())
+                    w2_offset.data[local_idx].copy_(do.contiguous())
                 loader.copy_in(p + "mlp.gate.weight", loader.load_tensor(p + "mlp.gate.weight"))
                 loader.copy_in(
                     p + "mlp.e_score_correction_bias", loader.load_tensor(p + "mlp.gate.e_score_correction_bias")
                 )
+                saved_tp = (loader.tp_size, loader.tp_rank)
+                loader.tp_size = shard_world
+                loader.tp_rank = shard_rank
                 loader.load_w8a8_b(p + "mlp.shared_experts.")
+                loader.tp_size, loader.tp_rank = saved_tp
                 self.model.layers[i].mlp.process_weights_after_loading()
 
         loader.copy_in("model.norm.weight", loader.load_tensor("model.norm.weight"))
