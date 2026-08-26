@@ -15,6 +15,9 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
+#include <unordered_map>
+
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/mooncake_transfer_engine.h"
 
@@ -117,10 +120,10 @@ class MooncakeKVCacheTransferDefault final
     bool registered = false;
   };
 
-  void add_buf(const torch::Tensor& tensor,
-               std::vector<void*>& addrs,
-               std::vector<size_t>& lens,
-               std::vector<uint64_t>& buf_bytes) const;
+  int64_t add_buf(const torch::Tensor& tensor,
+                  std::vector<void*>& addrs,
+                  std::vector<size_t>& lens,
+                  std::vector<uint64_t>& buf_bytes);
   bool append_buffer_mappings(
       const BufLayout& layout,
       const std::vector<int64_t>& layer_ids,
@@ -128,12 +131,14 @@ class MooncakeKVCacheTransferDefault final
       std::vector<MooncakeTransferEngine::BufferTransferMapping>*
           buffer_mappings) const;
 
-  // Register per-layer K/V tensor memory.
-  void register_kv_cache_impl(const std::vector<xllm::KVCache>& kv_caches);
-
   bool has_v_cache_ = true;
   BufLayout main_layout_;
   BufLayout spec_layout_;
+  // Mooncake rejects overlapped registerLocalMemory. Layerwise-split ranks
+  // share one scratch KV among unowned layers, so the same data_ptr must
+  // reuse the existing buf_id instead of being registered again.
+  std::unordered_map<uintptr_t, int64_t> addr_to_buf_id_;
+  int64_t next_buf_id_ = 0;
 };
 
 class MooncakeKVCacheTransferXTensor final

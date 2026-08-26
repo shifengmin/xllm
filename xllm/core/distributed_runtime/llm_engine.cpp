@@ -915,8 +915,11 @@ bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
                              const int32_t src_kv_split_size) {
   const int32_t src_world_size = static_cast<int32_t>(cluster_ids.size());
 
-  // Each D worker connects to every P worker that routes KV blocks to its TP
-  // rank. When P TP is larger, multiple P ranks share one D-side owner.
+  // Match merge_kv_blocks: P rank r pushes to D workers
+  // r % src_tp_size, r % src_tp_size + src_tp_size, ...
+  // D worker w therefore links to P index (w % src_tp_size) for every
+  // kv_split shard. src_tp_size is the kv_split-axis width
+  // (world/dp/kv_split), not physical TP; do not use get_src_tp_ranks.
   // P layout: rank = dp_i * src_cp_tp_size + split_j * src_tp_size + tp_rank
   int32_t src_cp_tp_size = src_world_size / src_dp_size;
   int32_t src_tp_size = src_cp_tp_size / src_kv_split_size;
@@ -927,26 +930,21 @@ bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
     std::vector<uint64_t> target_cluster_ids;
     std::vector<std::string> target_addrs;
     std::vector<uint16_t> target_ports;
-    const int32_t dst_tp_rank =
-        static_cast<int32_t>(worker_rank % dp_local_tp_size_);
-    const std::vector<int32_t> src_tp_ranks =
-        get_src_tp_ranks(dst_tp_rank, src_tp_size, dp_local_tp_size_);
+    const int32_t src_tp_rank =
+        static_cast<int32_t>(worker_rank % static_cast<size_t>(src_tp_size));
     const size_t endpoint_count = static_cast<size_t>(src_dp_size) *
-                                  static_cast<size_t>(src_kv_split_size) *
-                                  src_tp_ranks.size();
+                                  static_cast<size_t>(src_kv_split_size);
     target_cluster_ids.reserve(endpoint_count);
     target_addrs.reserve(endpoint_count);
     target_ports.reserve(endpoint_count);
 
     for (int32_t dp_i = 0; dp_i < src_dp_size; ++dp_i) {
       for (int32_t split_j = 0; split_j < src_kv_split_size; ++split_j) {
-        for (int32_t src_tp_rank : src_tp_ranks) {
-          const int32_t p_idx =
-              dp_i * src_cp_tp_size + split_j * src_tp_size + src_tp_rank;
-          target_cluster_ids.emplace_back(cluster_ids[p_idx]);
-          target_addrs.emplace_back(addrs[p_idx]);
-          target_ports.emplace_back(ports[p_idx]);
-        }
+        const int32_t p_idx =
+            dp_i * src_cp_tp_size + split_j * src_tp_size + src_tp_rank;
+        target_cluster_ids.emplace_back(cluster_ids[p_idx]);
+        target_addrs.emplace_back(addrs[p_idx]);
+        target_ports.emplace_back(ports[p_idx]);
       }
     }
 
@@ -992,26 +990,21 @@ bool LLMEngine::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
     std::vector<uint64_t> target_cluster_ids;
     std::vector<std::string> target_addrs;
     std::vector<uint16_t> target_ports;
-    const int32_t dst_tp_rank =
-        static_cast<int32_t>(worker_rank % dp_local_tp_size_);
-    const std::vector<int32_t> src_tp_ranks =
-        get_src_tp_ranks(dst_tp_rank, src_tp_size, dp_local_tp_size_);
+    const int32_t src_tp_rank =
+        static_cast<int32_t>(worker_rank % static_cast<size_t>(src_tp_size));
     const size_t endpoint_count = static_cast<size_t>(src_dp_size) *
-                                  static_cast<size_t>(src_kv_split_size) *
-                                  src_tp_ranks.size();
+                                  static_cast<size_t>(src_kv_split_size);
     target_cluster_ids.reserve(endpoint_count);
     target_addrs.reserve(endpoint_count);
     target_ports.reserve(endpoint_count);
 
     for (int32_t dp_i = 0; dp_i < src_dp_size; ++dp_i) {
       for (int32_t split_j = 0; split_j < src_kv_split_size; ++split_j) {
-        for (int32_t src_tp_rank : src_tp_ranks) {
-          const int32_t p_idx =
-              dp_i * src_cp_tp_size + split_j * src_tp_size + src_tp_rank;
-          target_cluster_ids.emplace_back(cluster_ids[p_idx]);
-          target_addrs.emplace_back(addrs[p_idx]);
-          target_ports.emplace_back(ports[p_idx]);
-        }
+        const int32_t p_idx =
+            dp_i * src_cp_tp_size + split_j * src_tp_size + src_tp_rank;
+        target_cluster_ids.emplace_back(cluster_ids[p_idx]);
+        target_addrs.emplace_back(addrs[p_idx]);
+        target_ports.emplace_back(ports[p_idx]);
       }
     }
 

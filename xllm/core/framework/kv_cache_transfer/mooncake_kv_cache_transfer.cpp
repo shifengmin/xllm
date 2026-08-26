@@ -223,6 +223,9 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
   if (is_spec_draft) {
     layout.offset = main_layout_.offset + main_layout_.total_buf_cnt;
   }
+  std::vector<void*> addrs;
+  std::vector<size_t> lens;
+  std::vector<uint64_t> buf_bytes;
   for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
     const std::vector<KVCacheTensor> transfer_tensors =
         get_mooncake_tensors(kv_caches[static_cast<size_t>(layer_id)]);
@@ -240,8 +243,9 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
       const uint64_t logical_bytes = static_cast<uint64_t>(tensor.nbytes());
       CHECK_EQ(logical_bytes % static_cast<uint64_t>(block_count), 0);
 
+      const int64_t buf_id = add_buf(tensor, addrs, lens, buf_bytes);
       RegisteredBufferDesc desc{
-          layout.offset + layout.total_buf_cnt,
+          buf_id,
           cache_tensor.role,
           cache_tensor.group_id,
           logical_bytes / static_cast<uint64_t>(block_count)};
@@ -261,7 +265,13 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
     spec_layout_ = layout;
   }
 
-  register_kv_cache_impl(kv_caches);
+  if (!addrs.empty() &&
+      !mooncake_te_->register_memory(addrs, lens, buf_bytes)) {
+    LOG(FATAL) << "register_kv_cache_impl failed";
+  }
+  LOG(INFO) << "register_kv_cache_impl success, registered_layers="
+            << kv_caches.size() << ", new_buffers=" << addrs.size()
+            << ", total_unique_buffers=" << next_buf_id_;
 }
 
 void MooncakeKVCacheTransferDefault::register_kv_cache_spec(
@@ -273,14 +283,13 @@ void MooncakeKVCacheTransferDefault::register_kv_cache_spec(
   register_kv_cache(kv_caches, kv_cache_shape, dtype);
 }
 
-void MooncakeKVCacheTransferDefault::add_buf(
+int64_t MooncakeKVCacheTransferDefault::add_buf(
     const torch::Tensor& tensor,
     std::vector<void*>& addrs,
     std::vector<size_t>& lens,
-    std::vector<uint64_t>& buf_bytes) const {
-  if (!tensor.defined() || tensor.numel() == 0) {
-    return;
-  }
+    std::vector<uint64_t>& buf_bytes) {
+  CHECK(tensor.defined() && tensor.numel() > 0)
+      << "Mooncake add_buf requires a non-empty tensor";
 
   CHECK_GT(tensor.dim(), 0) << "cache tensor dim must be positive";
   CHECK(tensor.is_contiguous())
@@ -317,9 +326,18 @@ void MooncakeKVCacheTransferDefault::add_buf(
       << ", available_bytes=" << available_bytes
       << ", block_bytes=" << block_bytes;
 
+  const auto key = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+  const auto it = addr_to_buf_id_.find(key);
+  if (it != addr_to_buf_id_.end()) {
+    return it->second;
+  }
+
+  const int64_t buf_id = next_buf_id_++;
+  addr_to_buf_id_[key] = buf_id;
   addrs.emplace_back(tensor.data_ptr());
   lens.emplace_back(logical_bytes);
   buf_bytes.emplace_back(static_cast<uint64_t>(block_bytes));
+  return buf_id;
 }
 
 bool MooncakeKVCacheTransferDefault::append_buffer_mappings(
@@ -385,31 +403,6 @@ bool MooncakeKVCacheTransferDefault::append_buffer_mappings(
     }
   }
   return true;
-}
-
-void MooncakeKVCacheTransferDefault::register_kv_cache_impl(
-    const std::vector<xllm::KVCache>& kv_caches) {
-  std::vector<void*> addrs;
-  std::vector<size_t> lens;
-  std::vector<uint64_t> buf_bytes;
-  addrs.reserve(kv_caches.size() * 4);
-  lens.reserve(kv_caches.size() * 4);
-  buf_bytes.reserve(kv_caches.size() * 4);
-
-  for (const KVCache& cache : kv_caches) {
-    const std::vector<KVCacheTensor> transfer_tensors =
-        get_mooncake_tensors(cache);
-    for (const KVCacheTensor& cache_tensor : transfer_tensors) {
-      add_buf(cache_tensor.tensor, addrs, lens, buf_bytes);
-    }
-  }
-
-  if (!mooncake_te_->register_memory(addrs, lens, buf_bytes)) {
-    LOG(FATAL) << "register_kv_cache_impl failed";
-  }
-
-  LOG(INFO) << "register_kv_cache_impl success, registered_layers="
-            << kv_caches.size() << ", buffers=" << buf_bytes.size();
 }
 
 bool MooncakeKVCacheTransferDefault::pull_kv_blocks(
@@ -680,8 +673,9 @@ bool MooncakeKVCacheTransferXTensor::pull_kv_blocks_impl(
       dst_offsets.push_back(dst_v_off);
     }
 
-    auto* te = static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
-    auto ret = te->move_memory_by_global_offsets(
+    auto* transfer_engine =
+        static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
+    auto ret = transfer_engine->move_memory_by_global_offsets(
         src_addr,
         src_offsets,
         dst_offsets,
