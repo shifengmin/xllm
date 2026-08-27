@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import torch
 
 from xllm.python.attention.kv_shard_layout import KVShardLayout
-from xllm.python.layers.sfa_dcp import AscendSFADCPMetadataBuilder
+from xllm.python.layers.sfa_dcp import AscendSFADCPMetadataBuilder, sfa_dcp_fusion_mode
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
     ForwardContext,
@@ -95,3 +95,23 @@ def test_copy_into_execution_buffer_eager_returns_source() -> None:
     with forward_context(_cpu_context(None)):
         out = copy_into_execution_buffer(("DCP_LOCAL_SLOTS", (2,)), source)
         assert out.data_ptr() == source.data_ptr()
+
+
+def test_sfa_dcp_fusion_mode_defaults_fused(monkeypatch) -> None:
+    monkeypatch.delenv("XLLM_SFA_DCP_FUSION", raising=False)
+    assert sfa_dcp_fusion_mode() == "fused"
+
+
+def test_sfa_dcp_fusion_mode_accepts_naive(monkeypatch) -> None:
+    monkeypatch.setenv("XLLM_SFA_DCP_FUSION", "naive")
+    assert sfa_dcp_fusion_mode() == "naive"
+
+
+def test_sfa_dcp_fusion_mode_rejects_unknown(monkeypatch) -> None:
+    monkeypatch.setenv("XLLM_SFA_DCP_FUSION", "jit")
+    try:
+        sfa_dcp_fusion_mode()
+    except RuntimeError as exc:
+        assert "XLLM_SFA_DCP_FUSION" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")

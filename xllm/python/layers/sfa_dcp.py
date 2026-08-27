@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
@@ -23,6 +24,22 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from xllm.python.attention.kv_shard_layout import KVShardLayout
+from xllm.python.layers.sfa_dcp_ref import merge_dcp_outputs, remap_sparse_indices
+from xllm.python.model_executor.forward_context import get_execution_buffer
+
+_REMAP_VEC_LEN = 64
+_SFA_DCP_FUSION_ENV = "XLLM_SFA_DCP_FUSION"
+_SFA_DCP_FUSION_FUSED = "fused"
+_SFA_DCP_FUSION_NAIVE = "naive"
+
+
+def sfa_dcp_fusion_mode() -> str:
+    raw = os.getenv(_SFA_DCP_FUSION_ENV, _SFA_DCP_FUSION_FUSED).strip().lower()
+    if raw not in {_SFA_DCP_FUSION_FUSED, _SFA_DCP_FUSION_NAIVE}:
+        raise RuntimeError(
+            f"{_SFA_DCP_FUSION_ENV} must be '{_SFA_DCP_FUSION_FUSED}' or '{_SFA_DCP_FUSION_NAIVE}', got {raw!r}."
+        )
+    return raw
 
 
 class GroupCoordinator(Protocol):
@@ -156,8 +173,7 @@ class AscendSFADCPMetadataBuilder:
         compact_block_table = compact_block_table.view_as(dcp_block_table)
         num_blocks = valid_block_ids.shape[0]
         remapped_block_table = (
-            compact_block_table.unsqueeze(-1)
-            + (self.dcp_rank_arange * num_blocks).view(1, 1, -1).to(dcp_block_table)
+            compact_block_table.unsqueeze(-1) + (self.dcp_rank_arange * num_blocks).view(1, 1, -1).to(dcp_block_table)
         ).reshape(dcp_block_table.shape[0], -1)
         return valid_block_ids, remapped_block_table.to(torch.int32)
 
@@ -235,7 +251,16 @@ class AscendSFADCPImpl:
         self.dcp_rank = layout.shard_rank
         self.scale = float(scale)
         self._dcp_index_topk = index_topk
-        self._remap_order = torch.arange(index_topk, dtype=torch.float32, device=device)
+        self._sfa_dcp_fusion_mode = sfa_dcp_fusion_mode()
+        print(
+            f"[sfa_dcp] {_SFA_DCP_FUSION_ENV}={self._sfa_dcp_fusion_mode}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _remap_scratch_numel(num_tokens: int, index_topk: int) -> int:
+        width = _REMAP_VEC_LEN if index_topk <= _REMAP_VEC_LEN else index_topk
+        return num_tokens * width
 
     @staticmethod
     def _has_prefill(attn_metadata: AscendSFADCPMetadata) -> bool:
@@ -309,9 +334,14 @@ class AscendSFADCPImpl:
         gathered, handle = all_gather_async(x.permute(perm).contiguous(), self.dcp_group)
         return gathered, handle, restore_perm
 
+    def _use_fused_sfa_dcp(self) -> bool:
+        return self._sfa_dcp_fusion_mode == _SFA_DCP_FUSION_FUSED
+
     def _remap_sparse_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if self.layout.shard_size <= 1:
             return topk_indices
+        if not self._use_fused_sfa_dcp():
+            return remap_sparse_indices(topk_indices, self.layout, self._dcp_index_topk)
 
         topk_count = topk_indices.shape[-1]
         if topk_count > self._dcp_index_topk:
@@ -319,12 +349,24 @@ class AscendSFADCPImpl:
                 f"topk_indices last dimension ({topk_count}) exceeds configured index_topk ({self._dcp_index_topk})."
             )
 
-        local_table = self.layout.localize_slots(topk_indices)
-        owned_entries = local_table >= 0
-        original_order = self._remap_order[:topk_count].expand_as(topk_indices)
-        pack_keys = original_order + (~owned_entries).to(torch.float32) * topk_count
-        _, pack_order = torch.sort(pack_keys, dim=-1)
-        return torch.gather(local_table, dim=-1, index=pack_order.to(torch.int32))
+        out = get_execution_buffer(
+            ("SFA_DCP_REMAP_OUT", tuple(topk_indices.shape)),
+            lambda: torch.empty_like(topk_indices),
+        )
+        num_tokens = int(topk_indices.numel() // topk_count)
+        scratch_n = self._remap_scratch_numel(num_tokens, int(topk_count))
+        idx_scratch = get_execution_buffer(
+            ("SFA_DCP_REMAP_SCRATCH", scratch_n),
+            lambda: torch.empty(scratch_n, dtype=torch.int32, device=topk_indices.device),
+        )
+        return torch.ops.xllm_ops.sfa_dcp_remap_out(
+            topk_indices,
+            int(self.layout.physical_block_size),
+            int(self.layout.shard_size),
+            int(self.layout.shard_rank),
+            out,
+            idx_scratch,
+        )
 
     def _all_to_all_dcp_tensor(
         self,
@@ -347,22 +389,30 @@ class AscendSFADCPImpl:
         recv = recv.view(self.dcp_size, local_scatter_size, *send.shape[1:])
         return recv
 
-    @staticmethod
     def _merge_dcp_outputs_with_torch(
+        self,
         output_recv: torch.Tensor,
         lse_recv: torch.Tensor,
     ) -> torch.Tensor:
+        if not self._use_fused_sfa_dcp():
+            return merge_dcp_outputs(output_recv, lse_recv)
         if output_recv.ndim != 4 or lse_recv.ndim != 3 or output_recv.shape[:3] != lse_recv.shape:
             raise RuntimeError(
                 "DCP output merge expects matching rank/token/head dimensions, "
                 f"got {tuple(output_recv.shape)} and {tuple(lse_recv.shape)}."
             )
-        lse_recv = lse_recv.masked_fill(~torch.isfinite(lse_recv), float("-inf"))
-        weights = torch.softmax(lse_recv, dim=0)
-        weights = torch.nan_to_num(weights, nan=0.0)
-
-        output = (output_recv.to(lse_recv.dtype) * weights.unsqueeze(-1)).sum(dim=0)
-        return output.movedim(1, 0).contiguous()
+        num_heads = int(output_recv.shape[1])
+        num_tokens = int(output_recv.shape[2])
+        head_dim = int(output_recv.shape[3])
+        merged = get_execution_buffer(
+            ("SFA_DCP_MERGE_OUT", num_tokens, num_heads, head_dim, str(output_recv.dtype)),
+            lambda: torch.empty(
+                (num_tokens, num_heads, head_dim),
+                dtype=output_recv.dtype,
+                device=output_recv.device,
+            ),
+        )
+        return torch.ops.xllm_ops.sfa_dcp_merge_out(output_recv, lse_recv, merged)
 
     def _merge_dcp_outputs(
         self,
