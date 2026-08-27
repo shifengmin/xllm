@@ -25,6 +25,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "npu_ops_api.h"
 
@@ -268,6 +269,28 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
 
 }  // namespace
 
+torch::Tensor sfa_dcp_remap_out_npu(const torch::Tensor& topk_indices,
+                                    int64_t physical_block_size,
+                                    int64_t shard_size,
+                                    int64_t shard_rank,
+                                    torch::Tensor& out,
+                                    torch::Tensor& idx_scratch) {
+  xllm::kernel::npu::tilelang::sfa_dcp_remap_out(topk_indices,
+                                                 physical_block_size,
+                                                 shard_size,
+                                                 shard_rank,
+                                                 out,
+                                                 idx_scratch);
+  return out;
+}
+
+torch::Tensor sfa_dcp_merge_out_npu(const torch::Tensor& output_recv,
+                                    const torch::Tensor& lse_recv,
+                                    torch::Tensor& out) {
+  xllm::kernel::npu::tilelang::sfa_dcp_merge_out(output_recv, lse_recv, out);
+  return out;
+}
+
 void ensure_xllm_ops_registered() {
   // Intentionally empty — referencing this symbol prevents the linker from
   // stripping the TORCH_LIBRARY static initializers below.
@@ -349,6 +372,13 @@ TORCH_LIBRARY(xllm_ops, m) {
       "shard_valid_mask, Tensor restore_index, Tensor query_index, Tensor "
       "kv_gather_index, int[] q_cu_seqlens, int[] kv_cu_seqlens, int "
       "total_local)");
+  m.def(
+      "sfa_dcp_remap_out(Tensor topk_indices, int physical_block_size, int "
+      "shard_size, int shard_rank, Tensor(a!) out, Tensor(b!) idx_scratch) -> "
+      "Tensor(a!)");
+  m.def(
+      "sfa_dcp_merge_out(Tensor output_recv, Tensor lse_recv, Tensor(a!) out) "
+      "-> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -371,6 +401,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention));
   m.impl("sparse_flash_attention_out",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_out));
+  m.impl("sfa_dcp_remap_out", TORCH_FN(xllm::sfa_dcp_remap_out_npu));
+  m.impl("sfa_dcp_merge_out", TORCH_FN(xllm::sfa_dcp_merge_out_npu));
 }
 
 // build_cp_context is pure host index math with no Tensor input, so the

@@ -326,6 +326,27 @@ def _sparse_flash_attention_out_fake(
     return output
 
 
+def _sfa_dcp_remap_out_fake(
+    topk_indices: torch.Tensor,
+    physical_block_size: int,
+    shard_size: int,
+    shard_rank: int,
+    out: torch.Tensor,
+    idx_scratch: torch.Tensor,
+) -> torch.Tensor:
+    del physical_block_size, shard_size, shard_rank, topk_indices, idx_scratch
+    return out
+
+
+def _sfa_dcp_merge_out_fake(
+    output_recv: torch.Tensor,
+    lse_recv: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    del output_recv, lse_recv
+    return out
+
+
 register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::fused_add_rms_norm", _fused_add_rms_norm_fake)
 register_fake("xllm_ops::silu_and_mul", _silu_and_mul_fake)
@@ -339,3 +360,5 @@ register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
 register_fake("xllm_ops::sparse_flash_attention", _sparse_flash_attention_fake)
 register_fake("xllm_ops::sparse_flash_attention_out", _sparse_flash_attention_out_fake)
+register_fake("xllm_ops::sfa_dcp_remap_out", _sfa_dcp_remap_out_fake)
+register_fake("xllm_ops::sfa_dcp_merge_out", _sfa_dcp_merge_out_fake)
