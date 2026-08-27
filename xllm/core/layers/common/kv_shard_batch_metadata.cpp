@@ -33,7 +33,7 @@ torch::Tensor localize_kv_shard_slots(const torch::Tensor& logical_slots,
   torch::Tensor owner_ranks =
       torch::floor_divide(logical_offsets, layout.physical_block_size());
   torch::Tensor owned_slots =
-      torch::logical_and(valid_slots, owner_ranks == layout.dcp_rank());
+      torch::logical_and(valid_slots, owner_ranks == layout.shard_rank());
   torch::Tensor logical_block_ids =
       torch::floor_divide(safe_slots, layout.logical_block_size());
   torch::Tensor local_offsets =
@@ -52,9 +52,9 @@ torch::Tensor expand_kv_shard_indexer_block_table(
   CHECK_EQ(logical_block_table.dim(), 2)
       << "cache-shard indexer block table must be two-dimensional";
   torch::Tensor shard_offsets =
-      torch::arange(layout.dcp_size(), logical_block_table.options());
+      torch::arange(layout.shard_size(), logical_block_table.options());
   torch::Tensor expanded =
-      logical_block_table.unsqueeze(-1) * layout.dcp_size() + shard_offsets;
+      logical_block_table.unsqueeze(-1) * layout.shard_size() + shard_offsets;
   expanded = torch::where(logical_block_table.unsqueeze(-1) >= 0,
                           expanded,
                           torch::full_like(expanded, -1));

@@ -44,6 +44,7 @@ class ParallelConfig final {
         {"dp_size",
          "ep_size",
          "cp_size",
+         "dcp_size",
          "tp_size",
          "sp_size",
          "cfg_size",
@@ -62,6 +63,10 @@ class ParallelConfig final {
   PROPERTY(int32_t, ep_size) = 1;
 
   PROPERTY(int32_t, cp_size) = 1;
+
+  // Decode-context parallel size. Contiguous partition of attention TP;
+  // mutually exclusive with kv_split_size_effective() > 1.
+  PROPERTY(int32_t, dcp_size) = 1;
 
   // 0 means follow cp_size (legacy KV-split width).
   PROPERTY(int32_t, kv_split_size) = 1;
@@ -88,6 +93,12 @@ class ParallelConfig final {
 
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
+  }
+
+  // Logical KV shard width for block-manager packing. DCP and KV-split are
+  // mutually exclusive; this is the only place that picks between them.
+  [[nodiscard]] int32_t kv_shard_size() const noexcept {
+    return dcp_size_ > 1 ? dcp_size_ : kv_split_size_effective();
   }
 };
 

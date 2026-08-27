@@ -18,6 +18,7 @@ limitations under the License.
 #include <tuple>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "framework/kv_cache/kv_shard_layout.h"
 #include "kernels/ops_api.h"
 #include "platform/platform.h"
 
@@ -40,17 +41,16 @@ DeepseekV2AttentionImpl::DeepseekV2AttentionImpl(
       eps_(args.rms_norm_eps()),
       interleaved_(true) {
   has_indexer_ = enable_lighting_indexer_ && enable_indexer;
-  kv_split_size_ = parallel_args.kv_split_size_effective();
-  kv_split_rank_ = parallel_args.kv_split_rank();
+  shard_size_ = parallel_args.kv_shard_size();
   tp_group_ = parallel_args.tp_group_;
   tp_rank_ = tp_group_->rank();
   block_size_ = ::xllm::KVCacheConfig::get_instance().block_size();
-  enable_mla_cache_sharding_ = kv_split_size_ > 1;
+  enable_mla_cache_sharding_ = shard_size_ > 1;
   if (enable_mla_cache_sharding_) {
     CHECK(parallel_args.dcp_group_ != nullptr)
         << "MLA cache sharding requires a DCP process group";
     dcp_decode_context_ = std::make_unique<DcpDecodeContext>(
-        KVShardLayout(block_size_, kv_split_size_, kv_split_rank_),
+        KVShardLayout::from_parallel_args(block_size_, parallel_args),
         parallel_args.dcp_group_);
     dcp_spans_tp_ =
         parallel_args.dcp_group_->world_size() > parallel_args.cp_size();

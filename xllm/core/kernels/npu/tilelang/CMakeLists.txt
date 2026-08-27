@@ -172,6 +172,16 @@ tilelang_register_runtime_kernel(
   WRAPPER_SRCS fused_sigmoid_gating_delta_rule_wrapper.cpp
 )
 
+tilelang_register_runtime_kernel(
+  NAME sfa_dcp_remap
+  WRAPPER_SRCS sfa_dcp_remap_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME sfa_dcp_merge
+  WRAPPER_SRCS sfa_dcp_merge_wrapper.cpp
+)
+
 cc_library(
   NAME
     tilelang_kernels

@@ -123,6 +123,12 @@ class ArgumentParser:
         self.parser.add_argument(
             "--cp_size", type=int, default=1, help="Context parallel size. Backend and model support is required."
         )
+        self.parser.add_argument(
+            "--dcp_size",
+            type=int,
+            default=1,
+            help="Decode-context parallel size. Contiguous partition of TP; mutually exclusive with kv_split.",
+        )
         self.parser.add_argument("--ep_size", type=int, default=1, help="Expert parallel size for MoE model.")
         self.parser.add_argument("--instance_name", type=str, default="", help="instance name")
         self.parser.add_argument(

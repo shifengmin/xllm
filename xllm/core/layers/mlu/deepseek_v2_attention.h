@@ -223,8 +223,7 @@ class DeepseekV2AttentionImpl : public torch::nn::Module {
   int64_t qk_nope_head_dim_;
   int64_t qk_rope_head_dim_;
   int64_t index_topk_;
-  int32_t kv_split_size_ = 1;
-  int32_t kv_split_rank_ = 0;
+  int32_t shard_size_ = 1;
   int32_t tp_rank_ = 0;
   int32_t block_size_ = 1;
   bool enable_mla_cache_sharding_ = false;

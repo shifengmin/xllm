@@ -43,11 +43,9 @@ class Glm52ModelImpl : public Glm5ModelImpl {
   explicit Glm52ModelImpl(const ModelContext& context)
       : Glm5ModelImpl(context, create_decoder_layer_factory(context)) {
     const ParallelArgs& parallel_args = context.get_parallel_args();
-    const int32_t kv_split_size = parallel_args.kv_split_size_effective();
-    if (kv_split_size > 1) {
-      kv_shard_layout_.emplace(KVCacheConfig::get_instance().block_size(),
-                               kv_split_size,
-                               parallel_args.kv_split_rank());
+    if (parallel_args.kv_shard_size() > 1) {
+      kv_shard_layout_ = KVShardLayout::from_parallel_args(
+          KVCacheConfig::get_instance().block_size(), parallel_args);
     }
   }
 

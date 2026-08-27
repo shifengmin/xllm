@@ -284,6 +284,14 @@ inline int32_t kv_split_size_effective(void) {
   return ParallelConfig::get_instance().kv_split_size_effective();
 }
 
+inline int32_t kv_shard_size(void) {
+  return ParallelConfig::get_instance().kv_shard_size();
+}
+
+inline int32_t dcp_size(void) {
+  return ParallelConfig::get_instance().dcp_size();
+}
+
 inline bool enable_kvcache_split(void) { return kv_split_size_effective() > 1; }
 
 }  // namespace util

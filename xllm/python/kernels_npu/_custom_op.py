@@ -326,6 +326,86 @@ def _sparse_flash_attention_out_fake(
     return output
 
 
+def _sparse_flash_attention_lse_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    block_table: torch.Tensor | None,
+    actual_seq_lengths_query: torch.Tensor | None,
+    actual_seq_lengths_kv: torch.Tensor | None,
+    query_rope: torch.Tensor | None,
+    key_rope: torch.Tensor | None,
+    scale_value: float,
+    sparse_block_size: int,
+    layout_query: str,
+    layout_kv: str,
+    sparse_mode: int,
+    pre_tokens: int = 9223372036854775807,
+    next_tokens: int = 9223372036854775807,
+    attention_mode: int = 2,
+    return_softmax_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        value,
+        sparse_indices,
+        block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        key_rope,
+        scale_value,
+        sparse_block_size,
+        layout_query,
+        sparse_mode,
+        pre_tokens,
+        next_tokens,
+        attention_mode,
+    )
+    if return_softmax_lse:
+        if query.dim() == 3:
+            kv_head_num = key.size(2) if layout_kv == "PA_BSND" else key.size(1)
+            softmax_size = (
+                kv_head_num,
+                query.size(0),
+                query.size(1) // kv_head_num,
+            )
+        else:
+            softmax_size = (
+                query.size(0),
+                key.size(2),
+                query.size(1),
+                query.size(2) // key.size(2),
+            )
+    else:
+        softmax_size = (0,)
+        del key, layout_kv
+    softmax_max = query.new_empty(softmax_size, dtype=torch.float32)
+    softmax_sum = query.new_empty(softmax_size, dtype=torch.float32)
+    return query.new_empty(query.shape, dtype=query.dtype), softmax_max, softmax_sum
+
+
+def _sfa_dcp_remap_out_fake(
+    topk_indices: torch.Tensor,
+    physical_block_size: int,
+    shard_size: int,
+    shard_rank: int,
+    out: torch.Tensor,
+    idx_scratch: torch.Tensor,
+) -> torch.Tensor:
+    del physical_block_size, shard_size, shard_rank, topk_indices, idx_scratch
+    return out
+
+
+def _sfa_dcp_merge_out_fake(
+    output_recv: torch.Tensor,
+    lse_recv: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    del output_recv, lse_recv
+    return out
+
+
 register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::fused_add_rms_norm", _fused_add_rms_norm_fake)
 register_fake("xllm_ops::silu_and_mul", _silu_and_mul_fake)
@@ -339,3 +419,6 @@ register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
 register_fake("xllm_ops::sparse_flash_attention", _sparse_flash_attention_fake)
 register_fake("xllm_ops::sparse_flash_attention_out", _sparse_flash_attention_out_fake)
+register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_lse_fake)
+register_fake("xllm_ops::sfa_dcp_remap_out", _sfa_dcp_remap_out_fake)
+register_fake("xllm_ops::sfa_dcp_merge_out", _sfa_dcp_merge_out_fake)

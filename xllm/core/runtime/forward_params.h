@@ -406,7 +406,8 @@ class WorkerType {
   Value value_;
 };
 
-// Worker-local KV slot layout for NPU CP (not transported).
+// Worker-local KV slot layout (not transported). DCP leaves slots at
+// LOGICAL_REAL; NPU CP may expand them to recovered-physical.
 enum class KvSlotLayout : int8_t {
   LOGICAL_REAL = 0,  // Builder slots; input to prepare_cache_slots.
   NPU_CP_RECOVERED_PHYSICAL = 1,  // Already CP-expanded; skip re-prepare.

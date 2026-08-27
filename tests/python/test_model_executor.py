@@ -191,6 +191,31 @@ class TestCreateAttentionBackend:
             backend = _create_attention_backend(attn, torch.device("cuda"), torch.float16)
         assert isinstance(backend, StubAttentionBackend)
 
+    @patch(
+        "xllm.python.model_executor.executor.current_platform.is_npu",
+        return_value=True,
+    )
+    def test_rejects_cp_when_dcp_group_is_active(self, _mock_is_npu):
+        class _FakeDcpGroup:
+            def size(self) -> int:
+                return 2
+
+            def rank(self) -> int:
+                return 0
+
+        attn = _make_attention_layer()
+        with patch(
+            "xllm.python.model_executor.executor.distributed.dcp_group",
+            return_value=_FakeDcpGroup(),
+        ):
+            with pytest.raises(NotImplementedError, match="global coordinates"):
+                _create_attention_backend(
+                    attn,
+                    torch.device("npu"),
+                    torch.float16,
+                    cp_size=2,
+                )
+
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor construction

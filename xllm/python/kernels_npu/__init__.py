@@ -68,6 +68,7 @@ _EXPORTS = {
         "scatter_nd_update",
         "sparse_flash_attention",
         "sparse_flash_attention_out",
+        "sparse_flash_attention_lse",
     ),
 }
 
@@ -99,6 +100,7 @@ __all__ = [
     "scatter_nd_update",
     "sparse_flash_attention",
     "sparse_flash_attention_out",
+    "sparse_flash_attention_lse",
     "causal_conv1d_prefill",
     "causal_conv1d_decode",
     "resolve_gdn_prefill_backend",
