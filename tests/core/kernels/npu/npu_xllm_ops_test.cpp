@@ -1341,5 +1341,229 @@ assert output.data_ptr() == output_address
 )PY");
 }
 
+TEST_F(NpuXllmOpsTest, SfaDcpRemapOutKeepsBufferAcrossGraphReplay) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+
+from xllm.python.attention.kv_shard_layout import KVShardLayout
+from xllm.python.layers.sfa_dcp_ref import remap_sparse_indices
+
+layout = KVShardLayout.from_dcp(physical_block_size=128, dcp_size=4, dcp_rank=2)
+num_tokens = 8
+topk = 2048
+device = torch.device("npu:0")
+torch.manual_seed(7)
+slots = torch.randint(0, 8 * layout.logical_block_size, (num_tokens, topk), device=device, dtype=torch.int32)
+out = torch.empty_like(slots)
+scratch = torch.empty(num_tokens * topk, dtype=torch.int32, device=device)
+out_address = out.data_ptr()
+
+
+def run_remap():
+    return torch.ops.xllm_ops.sfa_dcp_remap_out(
+        slots,
+        layout.physical_block_size,
+        layout.dcp_size,
+        layout.dcp_rank,
+        out,
+        scratch,
+    )
+
+
+eager = run_remap()
+assert eager.data_ptr() == out_address
+naive = remap_sparse_indices(slots, layout, index_topk=topk)
+assert torch.equal(eager, naive)
+
+stream = torch.npu.Stream()
+graph = torch.npu.NPUGraph()
+with torch.npu.stream(stream):
+    run_remap()
+torch.npu.synchronize()
+with torch.npu.stream(stream):
+    with torch.npu.graph(graph, stream=stream):
+        graph_result = run_remap()
+torch.npu.synchronize()
+
+replay = torch.randint(0, 8 * layout.logical_block_size, (num_tokens, topk), device=device, dtype=torch.int32)
+with torch.npu.stream(stream):
+    slots.copy_(replay)
+    graph.replay()
+torch.npu.synchronize()
+
+assert graph_result.data_ptr() == out_address
+assert torch.equal(graph_result, remap_sparse_indices(replay, layout, index_topk=topk))
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, SfaDcpAttentionUpdateKeepsBufferAcrossGraphReplay) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+import torch
+
+from xllm.python.layers.sfa_dcp import merge_dcp_outputs_with_attention_update
+from xllm.python.layers.sfa_dcp_ref import merge_dcp_outputs
+
+device = torch.device("npu:0")
+torch.manual_seed(11)
+output_recv = torch.randn((4, 8, 8, 512), dtype=torch.bfloat16, device=device)
+lse_recv = torch.randn((4, 8, 8), dtype=torch.float32, device=device)
+merged = torch.empty((8, 8, 512), dtype=torch.bfloat16, device=device)
+merged_address = merged.data_ptr()
+
+
+def run_merge():
+    return merge_dcp_outputs_with_attention_update(output_recv, lse_recv, merged)
+
+
+eager = run_merge()
+assert eager.data_ptr() == merged_address
+
+stream = torch.npu.Stream()
+graph = torch.npu.NPUGraph()
+with torch.npu.stream(stream):
+    run_merge()
+torch.npu.synchronize()
+with torch.npu.stream(stream):
+    with torch.npu.graph(graph, stream=stream):
+        graph_result = run_merge()
+torch.npu.synchronize()
+
+replay_out = torch.randn_like(output_recv)
+replay_lse = torch.randn_like(lse_recv)
+replay_lse[0, 0, 0] = float("-inf")
+with torch.npu.stream(stream):
+    output_recv.copy_(replay_out)
+    lse_recv.copy_(replay_lse)
+    graph.replay()
+torch.npu.synchronize()
+
+assert graph_result.data_ptr() == merged_address
+torch.testing.assert_close(
+    graph_result,
+    merge_dcp_outputs(replay_out, replay_lse),
+    rtol=1.56e-2,
+    atol=9.77e-4,
+)
+)PY");
+}
+
+TEST_F(NpuXllmOpsTest, SfaDcpDecodeLayerKeepsBuffersAcrossGraphReplay) {
+  py::gil_scoped_acquire gil;
+
+  py::exec(R"PY(
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import torch
+
+from xllm.python.attention.kv_shard_layout import KVShardLayout
+from xllm.python.layers.sfa_dcp import AscendSFADCPImpl
+from xllm.python.layers.sfa_dcp_ref import merge_dcp_outputs, remap_sparse_indices
+from xllm.python.model_executor.forward_context import (
+    AclGraphExecutionState,
+    ForwardContext,
+    forward_context,
+)
+
+device = torch.device("npu:0")
+layout = KVShardLayout.from_dcp(physical_block_size=128, dcp_size=4, dcp_rank=2)
+impl = AscendSFADCPImpl(
+    SimpleNamespace(world_size=4, rank_in_group=2, device_group=None),
+    scale=1.0,
+    index_topk=2048,
+    layout=layout,
+    device=device,
+)
+ctx = ForwardContext(
+    attention_backend=MagicMock(),
+    device=device,
+    metadata=MagicMock(),
+    layer_caches=[],
+    execution_state=AclGraphExecutionState(persistent_buffers={}),
+)
+
+for num_tokens in (1, 8):
+    torch.manual_seed(40 + num_tokens)
+    slots = torch.randint(
+        0,
+        8 * layout.logical_block_size,
+        (num_tokens, 2048),
+        device=device,
+        dtype=torch.int32,
+    )
+    output_recv = torch.randn(
+        (4, 8, num_tokens, 512),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    lse_recv = torch.randn((4, 8, num_tokens), dtype=torch.float32, device=device)
+
+    def run_decode_post():
+        remapped = impl._remap_sparse_indices(slots)
+        merged = impl._merge_dcp_outputs_with_torch(output_recv, lse_recv)
+        return remapped, merged
+
+    with forward_context(ctx):
+        eager_remap, eager_merge = run_decode_post()
+        remap_address = eager_remap.data_ptr()
+        merge_address = eager_merge.data_ptr()
+        assert torch.equal(
+            eager_remap,
+            remap_sparse_indices(slots, layout, index_topk=2048),
+        )
+        torch.testing.assert_close(
+            eager_merge,
+            merge_dcp_outputs(output_recv, lse_recv),
+            rtol=1.56e-2,
+            atol=9.77e-4,
+        )
+
+        stream = torch.npu.Stream()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.stream(stream):
+            run_decode_post()
+        torch.npu.synchronize()
+        with torch.npu.stream(stream):
+            with torch.npu.graph(graph, stream=stream):
+                graph_remap, graph_merge = run_decode_post()
+        torch.npu.synchronize()
+
+        replay_slots = torch.randint(
+            0,
+            8 * layout.logical_block_size,
+            (num_tokens, 2048),
+            device=device,
+            dtype=torch.int32,
+        )
+        replay_out = torch.randn_like(output_recv)
+        replay_lse = torch.randn_like(lse_recv)
+        replay_lse[0, 0, 0] = float("-inf")
+        with torch.npu.stream(stream):
+            slots.copy_(replay_slots)
+            output_recv.copy_(replay_out)
+            lse_recv.copy_(replay_lse)
+            graph.replay()
+        torch.npu.synchronize()
+
+        assert graph_remap.data_ptr() == remap_address
+        assert graph_merge.data_ptr() == merge_address
+        assert torch.equal(
+            graph_remap,
+            remap_sparse_indices(replay_slots, layout, index_topk=2048),
+        )
+        torch.testing.assert_close(
+            graph_merge,
+            merge_dcp_outputs(replay_out, replay_lse),
+            rtol=1.56e-2,
+            atol=9.77e-4,
+            msg=f"decode-layer merge graph mismatch T={num_tokens}",
+        )
+)PY");
+}
+
 }  // namespace
 }  // namespace xllm

@@ -37,10 +37,10 @@ DEFINE_int32(
 
 DEFINE_int32(kv_split_size,
              1,
-             "KV-cache split width. 0 falls back to cp_size (legacy); 1 means "
-             "no KV split (each CP rank stores full KV, skips prefix "
-             "AllGather); other K (K divides cp_size) means KV is sharded "
-             "across K ranks while token-CP still uses cp_size.");
+             "KV-cache split width. 0 falls back to cp_size (legacy). When "
+             "cp_size > 1, K must divide cp_size and shards KV along CP. When "
+             "cp_size == 1, K > 1 is Python SFA DCP width: a contiguous "
+             "partition of attention TP (K must divide tp_size).");
 
 DEFINE_int64(tp_size, 1, "Tensor parallelism size, only used for DiT model.");
 
@@ -107,6 +107,7 @@ void ParallelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(ep_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(cp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(layerwise_split_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(kv_split_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(tp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(sp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(cfg_size);
@@ -127,6 +128,8 @@ void ParallelConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, cp_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, layerwise_split_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, kv_split_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, tp_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(config_json, default_config, sp_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -157,6 +160,7 @@ void ParallelConfig::initialize() {
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
   }
+  CHECK_GE(kv_split_size_, 0) << "kv_split_size must be >= 0";
 }
 
 }  // namespace xllm

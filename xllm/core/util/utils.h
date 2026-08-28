@@ -284,7 +284,14 @@ inline int32_t kv_split_size_effective(void) {
   return ParallelConfig::get_instance().kv_split_size_effective();
 }
 
-inline bool enable_kvcache_split(void) { return kv_split_size_effective() > 1; }
+inline int32_t dcp_size(void) {
+  return ParallelConfig::get_instance().dcp_size();
+}
+
+inline bool enable_kvcache_split(void) {
+  return ParallelConfig::get_instance().cp_size() > 1 &&
+         kv_split_size_effective() > 1;
+}
 
 }  // namespace util
 }  // namespace xllm

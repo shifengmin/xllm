@@ -45,6 +45,7 @@ class ParallelConfig final {
          "ep_size",
          "cp_size",
          "layerwise_split_size",
+         "kv_split_size",
          "tp_size",
          "sp_size",
          "cfg_size",
@@ -66,7 +67,9 @@ class ParallelConfig final {
 
   PROPERTY(int32_t, layerwise_split_size) = 1;
 
-  // 0 means follow cp_size (legacy KV-split width).
+  // 0 means follow cp_size. When cp_size > 1 this is the CP-along KV shard
+  // width. When cp_size <= 1 and the effective width is > 1, it is the Python
+  // SFA DCP width (contiguous partition of attention TP).
   PROPERTY(int32_t, kv_split_size) = 1;
 
   PROPERTY(int64_t, tp_size) = 1;
@@ -91,6 +94,15 @@ class ParallelConfig final {
 
   [[nodiscard]] int32_t kv_split_size_effective() const noexcept {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
+  }
+
+  // Python SFA DCP width: kv_split_size when cp is off.
+  [[nodiscard]] int32_t dcp_size() const noexcept {
+    if (cp_size_ > 1) {
+      return 1;
+    }
+    const int32_t kv = kv_split_size_effective();
+    return kv > 1 ? kv : 1;
   }
 };
 

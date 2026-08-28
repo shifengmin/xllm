@@ -344,8 +344,9 @@ void KVCacheShape::init_value_cache_shape(const KVCacheCapacity& kv_cache_cap,
 void KVCacheShape::init_index_cache_shape(const KVCacheCapacity& kv_cache_cap,
                                           const ModelArgs& model_args) {
   int64_t index_block_count = kv_cache_cap.n_blocks();
-  if (Platform::supports_dsa_indexer_cache_sharding() &&
-      util::kv_split_size_effective() > 1) {
+  if (util::kv_split_size_effective() > 1 &&
+      (Platform::supports_dsa_indexer_cache_sharding() ||
+       util::dcp_size() > 1)) {
     index_block_count *= util::kv_split_size_effective();
   }
   index_cache_shape_ = std::vector<int64_t>{index_block_count,

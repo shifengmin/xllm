@@ -216,8 +216,13 @@ void MappingNPU::parse_parallel_info() {
 
   const int32_t cp_group_size =
       attn_cp_.group_size() > 0 ? attn_cp_.group_size() : 1;
+  // ATB kv-split groups only exist along CP. When cp_size <= 1 the process
+  // may still set kv_split_size as Python SFA DCP width; MappingNPU must not
+  // treat that as an ATB kv-split group (validate requires kv_split <= cp).
   const int32_t kv_split_group_size =
-      options_.kv_split_size() > 0 ? options_.kv_split_size() : 1;
+      cp_group_size <= 1
+          ? 1
+          : (options_.kv_split_size() > 0 ? options_.kv_split_size() : 1);
   attn_kv_split_.group_size(kv_split_group_size);
   attn_kv_split_.backend("hccl");
 

@@ -128,6 +128,7 @@ class Glm52Config:
     indexer_rope_interleave: bool = True
     num_nextn_predict_layers: int = 0
     index_share_for_mtp_iteration: bool = False
+    cp_kv_cache_interleave_size: int = 1
 
     @classmethod
     def from_dict(cls, d: dict) -> Glm52Config:
@@ -228,6 +229,7 @@ class Glm52Config:
             indexer_rope_interleave=bool(pick("indexer_rope_interleave", default=True)),
             num_nextn_predict_layers=int(pick("num_nextn_predict_layers", default=0)),
             index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
+            cp_kv_cache_interleave_size=int(pick("cp_kv_cache_interleave_size", default=1)),
         )
         cfg._resolve_indexer_types()
         cfg._resolve_mlp_layer_types()
@@ -408,7 +410,6 @@ class Glm52MLAAttention(Attention):
         k_pe = _interleave_rope_with(k_rope_raw.unsqueeze(1), cos, sin)
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
-
         attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
         v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
         v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)

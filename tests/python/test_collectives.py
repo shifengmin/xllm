@@ -163,6 +163,19 @@ def test_native_runtime_bridge_bypasses_python_process_groups(monkeypatch):
     python_gather.assert_not_called()
 
 
+def test_dcp_group_is_contiguous_within_tp(monkeypatch):
+    _, _, _, new_group = _mock_process_groups(monkeypatch, global_rank=2)
+
+    collectives.init_process_group("dcp", "127.0.0.1", 46001, 0, 2, "cuda:0", 2, 8, 1)
+
+    assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+    ]
+
+
 def test_tcp_store_master_is_global_rank_zero_not_group_rank_zero(monkeypatch):
     _, tcp_store, _, _ = _mock_process_groups(monkeypatch, global_rank=2)
 

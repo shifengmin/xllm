@@ -286,6 +286,54 @@ std::optional<std::string> validate_model_cp(const Options& options,
          "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
 }
 
+std::optional<std::string> validate_model_dcp(const Options& options,
+                                              EngineType engine_type,
+                                              const std::string& model_type,
+                                              int32_t global_world_size) {
+  const int32_t dcp_size = ParallelConfig::get_instance().dcp_size();
+  if (dcp_size < 1) {
+    return "kv_split_size used as DCP width must be greater than or equal to 1";
+  }
+  if (dcp_size == 1) {
+    return std::nullopt;
+  }
+  if (!Platform::is_npu()) {
+    return "Python DCP (kv_split_size > 1 with cp_size=1) is only supported "
+           "on NPU";
+  }
+  if (!ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    return "Python DCP (kv_split_size > 1 with cp_size=1) requires "
+           "model_impl=python; Worker keeps global KV coordinates and Python "
+           "SFA DCP localizes them";
+  }
+  if (engine_type != EngineType::LLM) {
+    return "DCP supports only LLM text generation";
+  }
+  if (options.cp_size() > 1) {
+    return "DCP keeps Worker KV metadata in global coordinates and is "
+           "mutually exclusive with CP sequence sharding (cp_size > 1)";
+  }
+  if (options.dp_size() < 1 || global_world_size % options.dp_size() != 0) {
+    return "DCP requires world_size divisible by dp_size";
+  }
+  const int32_t tp_size = global_world_size / options.dp_size();
+  if (tp_size % dcp_size != 0) {
+    return "DCP groups are contiguous partitions of TP; tp_size (" +
+           std::to_string(tp_size) + ") must be divisible by kv_split_size (" +
+           std::to_string(dcp_size) + ")";
+  }
+  static const std::unordered_set<std::string> kPythonDcpCapableModels = {
+      "glm_moe_dsa",
+  };
+  if (kPythonDcpCapableModels.find(model_type) ==
+      kPythonDcpCapableModels.end()) {
+    return "Python DCP does not support model_type=" + model_type +
+           "; only glm_moe_dsa implements SFA DCP.";
+  }
+  return std::nullopt;
+}
+
 namespace {
 
 void print_startup_banner(const std::filesystem::path& model_path,
@@ -405,10 +453,13 @@ Master::Master(const Options& options, EngineType type)
   // World size is the node count (one worker per process).
   const int32_t global_world_size = options_.nnodes();
   std::string model_type;
-  if ((options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
+  const bool need_model_type =
+      (options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
       (ModelConfig::is_python_model_impl(
            ModelConfig::get_instance().model_impl()) &&
-       options_.num_speculative_tokens() > 0)) {
+       (options_.num_speculative_tokens() > 0 ||
+        ParallelConfig::get_instance().dcp_size() > 1));
+  if (need_model_type) {
     model_type = util::get_model_type(model_path, options_.backend());
   }
   const std::optional<std::string> speculative_error =
@@ -420,6 +471,9 @@ Master::Master(const Options& options, EngineType type)
   const std::optional<std::string> cp_error =
       validate_model_cp(options_, type, model_type, global_world_size);
   CHECK(!cp_error.has_value()) << cp_error.value();
+  const std::optional<std::string> dcp_error =
+      validate_model_dcp(options_, type, model_type, global_world_size);
+  CHECK(!dcp_error.has_value()) << dcp_error.value();
   options_.enable_mla(util::should_enable_mla(model_path, options_.backend()));
   print_startup_banner(model_path, options_.backend(), options_.node_rank());
   LOG(INFO) << "Master init options: " << options_.to_string();
@@ -433,6 +487,14 @@ Master::Master(const Options& options, EngineType type)
             << ", ep_size=" << options_.ep_size()
             << ", cp_sharding_stage=" << cp_sharding_stage
             << ", instance_role=" << options_.instance_role().to_string();
+  const int32_t dcp_size = ParallelConfig::get_instance().dcp_size();
+  if (dcp_size > 1) {
+    const int32_t tp_size = global_world_size / options_.dp_size();
+    LOG(INFO) << "Resolved DCP config: kv_split_size=" << dcp_size
+              << " (used as DCP width), world_size=" << global_world_size
+              << ", dp_size=" << options_.dp_size() << ", tp_size=" << tp_size
+              << ", kv_metadata=logical_global";
+  }
 
   // Allow brpc receive SIGTREM and SIGINT signal.
   brpc::FLAGS_graceful_quit_on_sigterm = true;

@@ -171,6 +171,27 @@ struct ParallelArgs {
     return kv_split_size_ > 0 ? kv_split_size_ : cp_size_;
   }
 
+  // Python SFA DCP width: kv_split_size when cp is off.
+  [[nodiscard]] int32_t dcp_size() const noexcept {
+    if (cp_size_ > 1) {
+      return 1;
+    }
+    const int32_t kv = kv_split_size_effective();
+    return kv > 1 ? kv : 1;
+  }
+
+  // Derived: DCP rank inside the contiguous TP partition.
+  [[nodiscard]] int32_t dcp_rank() const noexcept {
+    if (dcp_group_ != nullptr) {
+      return dcp_group_->rank();
+    }
+    const int32_t size = dcp_size();
+    if (size <= 1) {
+      return 0;
+    }
+    return rank_ % size;
+  }
+
   [[nodiscard]] int32_t kv_split_rank() const noexcept {
     if (dcp_group_ != nullptr) {
       return dcp_group_->rank();
@@ -178,6 +199,9 @@ struct ParallelArgs {
     const int32_t kv = kv_split_size_effective();
     if (kv <= 1) {
       return 0;
+    }
+    if (cp_size_ <= 1) {
+      return rank_ % kv;
     }
     return rank_ / (world_size_ / kv);
   }
