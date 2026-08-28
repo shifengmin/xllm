@@ -26,6 +26,7 @@ _PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
     distributed = types.ModuleType("xllm.python.distributed")
+    distributed.dcp_group = lambda _device=None: None
 
     package = types.ModuleType("xllm.python")
     # Keep source submodules importable without executing the real package binding.

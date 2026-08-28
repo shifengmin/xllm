@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -13,7 +14,7 @@ from ...common.spec import (
     TilelangKernel,
     is_registered_kernel_class,
 )
-from ...common.toolchain import prepare_tilelang_import
+from ...common.toolchain import prepare_tilelang_import, repo_root
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,9 @@ class RegisteredKernelFamily:
 
 def _load_kernel_module(module_name: str) -> ModuleType:
     prepare_tilelang_import()
+    source_root = str(repo_root())
+    sys.path = [path for path in sys.path if path != source_root]
+    sys.path.insert(0, source_root)
     return importlib.import_module(f"{__package__}.aot.{module_name}")
 
 

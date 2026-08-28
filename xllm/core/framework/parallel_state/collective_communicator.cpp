@@ -239,11 +239,14 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
   const int32_t normalized_cp_size = cp_size > 0 ? cp_size : 1;
   const int32_t attn_tp_size = world_size / (dp_size * normalized_cp_size);
   // FLAGS_kv_split_size: 0 -> leave Options::kv_split_size = -1 so that
-  // MappingNPU falls back to cp_size (byte-equivalent). >0 -> propagate
-  // verbatim; MappingNPU::validate() enforces divisibility against cp_size.
+  // MappingNPU falls back to cp_size (byte-equivalent). >0 with cp_size > 1
+  // is the ATB CP-along KV shard. When cp_size == 1 the same flag is Python
+  // SFA DCP width; ATB kv-split groups only exist along CP, so MappingNPU
+  // must see width 1.
   const int32_t kv_split_size =
       ::xllm::ParallelConfig::get_instance().kv_split_size();
-  const int32_t mapping_kv_split_size = kv_split_size > 0 ? kv_split_size : -1;
+  const int32_t mapping_kv_split_size =
+      normalized_cp_size <= 1 ? 1 : (kv_split_size > 0 ? kv_split_size : -1);
   MappingNPU::Options mapping_options;
   mapping_options.dp_size(dp_size)
       .tp_size(attn_tp_size)
