@@ -248,6 +248,8 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             block_table=self._expanded_indexer_block_table,
             actual_seq_q=context.actual_seq_q,
             actual_seq_kv=context.actual_seq_kv,
+            index_cache_scale=context.index_cache_scale,
+            get_quant_indexer_metadata=context.get_quant_indexer_metadata,
             update_index_cache=context.update_index_cache,
         )
 
