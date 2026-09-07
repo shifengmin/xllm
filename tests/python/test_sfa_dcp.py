@@ -21,7 +21,10 @@ from unittest.mock import MagicMock
 import torch
 
 from xllm.python.attention.kv_shard_layout import KVShardLayout
-from xllm.python.layers.sfa_dcp import AscendSFADCPMetadataBuilder
+from xllm.python.layers.sfa_dcp import (
+    AscendSFADCPMetadataBuilder,
+    _lse_as_token_head,
+)
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
     ForwardContext,
@@ -88,3 +91,12 @@ def test_copy_into_execution_buffer_eager_returns_source() -> None:
     with forward_context(_cpu_context(None)):
         out = copy_into_execution_buffer(("DCP_LOCAL_SLOTS", (2,)), source)
         assert out.data_ptr() == source.data_ptr()
+
+
+def test_lse_as_token_head_squeezes_graph_leading_one() -> None:
+    num_tokens = 8
+    num_heads = 16
+    lse = torch.randn(1, num_tokens, num_heads, dtype=torch.float32)
+    out = _lse_as_token_head(lse, num_tokens, num_heads)
+    assert tuple(out.shape) == (num_tokens, num_heads)
+    torch.testing.assert_close(out, lse[0])
