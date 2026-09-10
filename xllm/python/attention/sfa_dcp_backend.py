@@ -24,7 +24,7 @@ from torch.distributed import ProcessGroup
 
 from xllm.python.attention.backend import AttentionMetadata, LayerCache, MlaIndexContext
 from xllm.python.attention.kv_shard_layout import KVShardLayout
-from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend, write_mla_paged_cache
 from xllm.python.layers.sfa_dcp import (
     AscendSFADCPImpl,
     AscendSFADCPMetadata,
@@ -192,28 +192,31 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             attn_metadata.dcp_context.block_table = self._block_table_i32[:num_reqs]
         self._sfa_metadata = attn_metadata
 
+    def indexer_block_table(self) -> torch.Tensor:
+        if self._expanded_indexer_block_table is not None:
+            return self._expanded_indexer_block_table
+        return super().indexer_block_table()
+
     def mla_index_context(self, layer: Attention) -> MlaIndexContext:
         context = super().mla_index_context(layer)
-        expanded_block_table = self._expanded_indexer_block_table
-        if expanded_block_table is None:
-            return context
+        indexer_table = self.indexer_block_table()
 
         def materialize_index_cache() -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
             index_cache, index_cache_scale, _ = context.materialize_index_cache()
-            return index_cache, index_cache_scale, expanded_block_table
+            return index_cache, index_cache_scale, indexer_table
 
         return replace(
             context,
-            block_table=expanded_block_table,
+            block_table=indexer_table,
             materialize_index_cache=materialize_index_cache,
         )
 
     def execute_mla(
         self,
         q_latent: torch.Tensor,
-        q_pe: torch.Tensor,
+        q_pe: torch.Tensor | None,
         k_latent_3d: torch.Tensor,
-        k_pe_3d: torch.Tensor,
+        k_pe_3d: torch.Tensor | None,
         layer: Attention,
         topk: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -229,11 +232,11 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         ctx = get_forward_context()
         layer_cache = ctx.layer_caches[layer.layer_id]
         nope_cache, rope_cache = layer_cache.key, layer_cache.value
-        if nope_cache is None or rope_cache is None:
+        if nope_cache is None:
             raise RuntimeError(f"MLA latent cache is missing for layer {layer.layer_id}")
 
         attn_metadata.dcp_context.gather_context = None
-        torch.ops.xllm_ops.reshape_paged_cache(
+        write_mla_paged_cache(
             attn_metadata.dcp_context.slot_mapping,
             k_latent_3d,
             k_pe_3d,

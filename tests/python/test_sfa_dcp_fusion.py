@@ -68,6 +68,19 @@ def test_remap_sparse_indices_packs_owned_slots() -> None:
     assert owned[1].tolist() == [True, True, False, False]
 
 
+def test_remap_sparse_indices_accepts_kpool_tail_wider_than_index_topk() -> None:
+    layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
+    slots = torch.tensor([[0, 5, -1, 8, 12, 1, 4]], dtype=torch.int32)
+    remapped = remap_sparse_indices(slots, layout, index_topk=4)
+    assert remapped.shape == slots.shape
+    prefix = remap_sparse_indices(slots[..., :4], layout, index_topk=4)
+    tail = layout.localize_slots(slots[..., 4:])
+    assert torch.equal(remapped[..., :4], prefix)
+    assert torch.equal(remapped[..., 4:], tail)
+    owned = remapped[remapped >= 0]
+    assert set(owned.tolist()) == {0, 4, 1}
+
+
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
 @pytest.mark.skipif(
     not _aot_remap_available(),
