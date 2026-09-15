@@ -85,6 +85,31 @@ def _can_use_fused_remap(
     )
 
 
+def _fill_wide_remap(
+    *,
+    out: torch.Tensor,
+    packed_prefix: torch.Tensor,
+    tail_slots: torch.Tensor,
+    layout: KVShardLayout,
+) -> None:
+    """Join the packed top-k prefix and the kPool tail into one valid run.
+
+    SFA walks ``sparse_indices`` until the first ``INVALID_SLOT``, so the owned
+    tail slots have to continue the owned prefix run. Parking them behind the
+    prefix's ``-1`` padding drops the newest force-selected tokens from every
+    decode step.
+    """
+    index_topk = int(packed_prefix.shape[-1])
+    owned_prefix = (packed_prefix >= 0).sum(dim=-1, keepdim=True)
+    tail_offsets = owned_prefix + torch.arange(
+        tail_slots.shape[-1],
+        device=out.device,
+    )
+    out.fill_(layout.INVALID_SLOT)
+    out[..., :index_topk].copy_(packed_prefix)
+    out.scatter_(-1, tail_offsets, layout.pack_owned_slots(tail_slots))
+
+
 class GroupCoordinator(Protocol):
     world_size: int
     rank_in_group: int
@@ -349,8 +374,12 @@ class AscendSFADCPImpl:
             ("SFA_DCP_REMAP_WIDE", tuple(topk_indices.shape)),
             lambda: torch.empty_like(topk_indices),
         )
-        out[..., :index_topk].copy_(fused)
-        out[..., index_topk:].copy_(self.layout.localize_slots(topk_indices[..., index_topk:]))
+        _fill_wide_remap(
+            out=out,
+            packed_prefix=fused,
+            tail_slots=topk_indices[..., index_topk:],
+            layout=self.layout,
+        )
         return out
 
     def _merge_dcp_outputs(

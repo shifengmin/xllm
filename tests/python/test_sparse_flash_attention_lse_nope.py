@@ -19,10 +19,9 @@ from __future__ import annotations
 import ctypes
 import os
 from ctypes import POINTER, c_bool, c_char_p, c_double, c_int64, c_uint64, c_void_p
-
-import pytest
 from typing import Any
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 

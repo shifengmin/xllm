@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from xllm.python.attention.kv_shard_layout import KVShardLayout
+from xllm.python.layers.sfa_dcp import _fill_wide_remap
 from xllm.python.layers.sfa_dcp_ref import remap_sparse_indices
 
 TOPK = 2048
@@ -55,6 +56,14 @@ def _make_logical_slots(
     return torch.where(mask, torch.full_like(slots, KVShardLayout.INVALID_SLOT), slots)
 
 
+def _assert_valid_slots_form_one_run(slots: torch.Tensor) -> None:
+    """SFA stops at the first ``-1``, so nothing valid may follow one."""
+    for row in slots.tolist():
+        invalid = [pos for pos, slot in enumerate(row) if slot < 0]
+        if invalid:
+            assert all(slot < 0 for slot in row[invalid[0] :]), f"valid slot behind the first -1: {row}"
+
+
 def test_remap_sparse_indices_packs_owned_slots() -> None:
     layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
     slots = torch.tensor(
@@ -74,14 +83,57 @@ def test_remap_sparse_indices_packs_owned_slots() -> None:
 def test_remap_sparse_indices_accepts_kpool_tail_wider_than_index_topk() -> None:
     layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
     slots = torch.tensor([[0, 5, -1, 8, 12, 1, 4]], dtype=torch.int32)
+
     remapped = remap_sparse_indices(slots, layout, index_topk=4)
+
     assert remapped.shape == slots.shape
-    prefix = remap_sparse_indices(slots[..., :4], layout, index_topk=4)
-    tail = layout.localize_slots(slots[..., 4:])
-    assert torch.equal(remapped[..., :4], prefix)
-    assert torch.equal(remapped[..., 4:], tail)
-    owned = remapped[remapped >= 0]
-    assert set(owned.tolist()) == {0, 4, 1}
+    # Owned prefix slots stay first, owned tail slots continue the same run.
+    assert remapped[remapped >= 0].tolist() == [0, 4, 1]
+    _assert_valid_slots_form_one_run(remapped)
+
+
+def test_fill_wide_remap_matches_the_whole_row_reference() -> None:
+    """The fused wide assembly has to equal packing the whole row at once.
+
+    The AOT kernel only packs the configured prefix, so the tail is joined by
+    ``_fill_wide_remap``; on CPU the packed prefix comes from the layout.
+    """
+    layout = KVShardLayout(physical_block_size=128, dcp_size=4, dcp_rank=0)
+    slots = _make_logical_slots(4, layout, device=torch.device("cpu"), width=TOPK + KPOOL_TAIL_COLS)
+
+    out = torch.empty_like(slots)
+    _fill_wide_remap(
+        out=out,
+        packed_prefix=layout.pack_owned_slots(slots[..., :TOPK]),
+        tail_slots=slots[..., TOPK:],
+        layout=layout,
+    )
+
+    assert torch.equal(out, remap_sparse_indices(slots, layout, index_topk=TOPK))
+    assert int((out >= 0).sum()) == int((layout.localize_slots(slots) >= 0).sum())
+    _assert_valid_slots_form_one_run(out)
+
+
+def test_fill_wide_remap_keeps_a_fully_owned_tail_contiguous() -> None:
+    """With every slot owned there is no ``-1`` padding to hide the tail behind."""
+    layout = KVShardLayout(physical_block_size=128, dcp_size=1, dcp_rank=0)
+    slots = torch.cat(
+        [
+            torch.arange(TOPK, dtype=torch.int32),
+            torch.arange(TOPK, TOPK + KPOOL_TAIL_COLS, dtype=torch.int32),
+        ]
+    ).unsqueeze(0)
+
+    out = torch.empty_like(slots)
+    _fill_wide_remap(
+        out=out,
+        packed_prefix=layout.pack_owned_slots(slots[..., :TOPK]),
+        tail_slots=slots[..., TOPK:],
+        layout=layout,
+    )
+
+    assert torch.equal(out, slots)
+    _assert_valid_slots_form_one_run(out)
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
@@ -91,9 +143,9 @@ def test_remap_sparse_indices_accepts_kpool_tail_wider_than_index_topk() -> None
 )
 def test_fused_remap_matches_naive() -> None:
     """Both widths the indexer emits: exactly ``index_topk``, and the wider
-    kPool tail (``topk + index_kpool - 1``, what GLM-5.3 ships). For the wide
-    case the kernel only remaps the configured prefix and the tail is localized
-    by the layout, so the assembled result is what the model actually feeds SFA.
+    kPool tail (``topk + index_kpool - 1``, what GLM-5.3 ships). The fused path
+    packs the prefix with the AOT kernel and joins the tail through
+    ``_fill_wide_remap``, which is what the model feeds SFA.
     """
     device = torch.device("npu")
     cases = (
@@ -123,8 +175,16 @@ def test_fused_remap_matches_naive() -> None:
             )
             torch.npu.synchronize()
             if width > TOPK:
-                fused = torch.cat([fused, layout.localize_slots(slots[..., TOPK:])], dim=-1)
+                wide = torch.empty_like(slots)
+                _fill_wide_remap(
+                    out=wide,
+                    packed_prefix=fused,
+                    tail_slots=slots[..., TOPK:],
+                    layout=layout,
+                )
+                fused = wide
             naive = remap_sparse_indices(slots, layout, index_topk=TOPK)
+            _assert_valid_slots_form_one_run(fused)
             assert torch.equal(fused, naive), (
                 f"remap mismatch pb={physical_block_size} dcp={dcp_size} T={num_tokens} width={width}"
             )
