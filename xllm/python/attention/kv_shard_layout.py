@@ -19,6 +19,15 @@ from __future__ import annotations
 import torch
 
 
+def has_rope_dim(tensor: torch.Tensor | None) -> bool:
+    """Whether an MLA rope operand carries a rope dimension.
+
+    NoPE models (``qk_rope_head_dim == 0``) surface the rope operand as ``None``
+    or as a zero-width tensor; both mean "skip the rope path".
+    """
+    return tensor is not None and tensor.shape[-1] > 0
+
+
 class KVShardLayout:
     """Maps a logical paged-KV coordinate onto one rank's physical cache."""
 
