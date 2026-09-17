@@ -28,11 +28,11 @@ cc_library(
 
 cc_library(
   NAME
-    push_route
+    kv_redundancy
   HDRS
-    push_route.h
+    kv_redundancy.h
   SRCS
-    push_route.cpp
+    kv_redundancy.cpp
 )
 
 cc_library(
@@ -95,7 +95,7 @@ cc_library(
     :cache_layout
     :common
     :kv_cache
-    :push_route
+    :kv_redundancy
     :reshard_planner
     :xtensor
     :util

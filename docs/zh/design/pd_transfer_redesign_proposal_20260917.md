@@ -1,0 +1,499 @@
+# PD 传输重构方案（基于 KV 冗余模型）
+
+## 溯源与状态
+
+- 日期：2026-09-17
+- 基线 commit：`200939593`
+- 本文性质：**重构方案**（设计 + 迁移计划，不含代码改动）
+- 依据：`kv_redundancy_model_and_pd_routing_20260917.md`（模型）、`pd_routing_simplification_20260917.md`（现状盘点）
+- 验收场景：`pd_route_verification_plan_glm53flash_20260917.md`（GLM 5.3 flash，P `TP8+DCP4` → D `DP4+TP2+DCP2`）
+- 证据口径：**[读码]** 静态阅读
+
+> **本文已按 review 修订**（详见验证文档第一部分）：`S_eff` 按组派生（F1）、`G` 按组（F2）、边表改为拓扑局部 + DP 偏移（F3）、补本地行↔规范块映射（F4）、`B_token` 绑定已有字段（F5）、`bind` 分桶（F7）、边表缓存键（F8）、`repeat/stride` 保留（F9）。
+
+---
+
+## 0. 目标与非目标
+
+**目标**：让 PD 传输的"谁给谁搬哪一段"变成**由拓扑元组唯一决定的纯算术结果**，从而删除现有的特例分支、死代码与两套并行实现。
+
+**非目标**：
+- 不改 `MooncakeTransferEngine` 之下的 RDMA 会话/注册/搬运原语；
+- 不改 XTensor 的页映射机制（它只是物理层的一种实现）；
+- 不改 prefix cache 的 `remote_shared_num` 语义；
+- 不动 sequence-scoped 缓存（SSM / CONV / LINEAR / EMBEDDING）的 slot 语义（见 §6）。
+
+---
+
+## 1. 核心简化：一句话 + 三个删除
+
+> **把 manifest 从「逻辑归属的描述」降级为「物理缓冲的目录」；逻辑归属完全由拓扑元组 `(DP, CP, TP, G, S, B_token)` 决定，两侧独立推出同一张边表。**
+
+由此得到三个删除：
+
+| # | 删除 | 理由 |
+|---|---|---|
+| **D1** | **逻辑归属的全部表达**：`LogicalShardDescriptor` / `LogicalSpan.logical_*` / `owner_tp_rank` / `LogicalShardKind` | 归属 = `(h, t, c)` 三个纯算术索引，不需要描述符承载 |
+| **D2** | **区间求交式规划器**：`ReshardPlanner` 的 `select_sources` / `select_collapsed_writers` / `validate_writer_coverage` / `has_logical_overlap` / `expand_manifest` / 全部 `supports_*` `same_partition*` `kv_split_spans_cp_and_tp` | 覆盖不变量在模型下按构造成立，退化为一条 O(1) 算术断言 |
+| **D3** | **modulo 时代的两套配对实现**：base `KVCacheTransfer::merge_kv_blocks`、`push_route.{h,cpp}`、`filter_kv_split_infos`、`rotate_dst_rank`、`LLMEngine::pull_kv_blocks` 的取模路由 | 全部由同一张边表替代 |
+
+**净效果**：路由逻辑从「三套实现 + 18 类特例分支 + 两处死代码」收敛为「一个纯算术模块 + 一张边表 + 一个绑定函数」。
+
+---
+
+## 2. 新分层
+
+```
+┌─ L0 拓扑层 KvTopology ─────────────────────────────────────────┐
+│  纯数据：DP/CP/TP/G/S/B_token。由启动配置与 InstanceInfo 提供。 │
+└────────────────────────┬───────────────────────────────────────┘
+                         │ derive()  ── C1 整除 / C2 上限校验（fail-fast）
+┌────────────────────────▼───────────────────────────────────────┐
+│ L1 冗余层 KvRedundancy + KvLayoutIndex                         │
+│  D_tp / H_l / H_c / D / N_rep；rank <-> (h, t, c)              │
+│  纯算术，无状态，无 IO。可被单测穷举覆盖。                     │
+└────────────────────────┬───────────────────────────────────────┘
+                         │ build()
+┌────────────────────────▼───────────────────────────────────────┐
+│ L2 边表层 PdRouteTable                                         │
+│  RouteEdge{src, dst, dp, head[lo,hi), t_P, t_D}                │
+│  建链期算一次，与请求无关。                                    │
+└────────────────────────┬───────────────────────────────────────┘
+                         │ bind()
+┌────────────────────────▼───────────────────────────────────────┐
+│ L3 绑定层 RouteBinder                                          │
+│  规范块列表 + 本侧/对侧物理目录 → ByteRegion 列表              │
+│  规范坐标（peer 无关）↔ 物理坐标（peer 相关）的唯一换算点      │
+└────────────────────────┬───────────────────────────────────────┘
+                         │ move_memory_regions(opcode)
+┌────────────────────────▼───────────────────────────────────────┐
+│ L4 搬运层（现有，不动）MooncakeTransferEngine                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**关键分界线在 L2/L3 之间**：L2 以上只认规范块号与 head 类（peer 无关）；L3 以下只认 buffer id 与字节偏移（peer 相关）。**这条线一旦划清，"折叠公式写反"这一类问题在结构上不可能发生** —— 因为两侧共用同一个坐标系。
+
+---
+
+## 3. 关键数据结构
+
+### 3.1 L0/L1：拓扑与冗余
+
+**`KvTopology` 分两层**：实例级（并行与切分）+ 每组级（head 几何）。原因见 §6 与验证文档 F2：同一个 rank 上不同 cache 组的 `G` 不同（GLM5-next 的 MLA/indexer `G=1`，KDA `G=64`），而 `TP/CP/S` 是实例共享的。
+
+```cpp
+struct KvTopology {                      // 实例级
+  int32_t dp_size = 0, cp_size = 0, tp_size = 0;
+  int32_t kv_split_size = 0;             // S
+  int32_t tokens_per_block = 0;          // B_token（= CacheTensorManifest::block_token_capacity）
+};
+
+struct GroupTopology {                   // 每个 (namespace, role, group_id)
+  int32_t global_head_count = 0;         // G
+  uint64_t head_bytes = 0;               // 一个 head 的字节数
+  CacheResourceScope scope = CacheResourceScope::BLOCK;
+};
+
+struct KvRedundancy {
+  int32_t Hl = 0;      // 每 rank 本地 head 数   = max(G / TP, 1)
+  int32_t D_tp = 0;    // TP 冗余度              = max(TP / G, 1)
+  int32_t Hc = 0;      // head 类数              = TP / D_tp
+  int32_t D = 0;       // 复合冗余度             = CP * D_tp
+  int32_t S_eff = 0;   // 本组实际切分宽度
+  int32_t N_rep = 0;   // 残余冗余度             = D / S_eff
+
+  // C1: (G % TP == 0 || TP % G == 0)
+  //     S_eff = (S <= D && D % S == 0) ? S : 1     <-- 见 §6
+  // C2: 1 <= S_eff <= D
+  static Status derive(const KvTopology&, const GroupTopology&, KvRedundancy*);
+};
+
+class KvLayoutIndex {
+ public:
+  KvLayoutIndex(const KvTopology&, const GroupTopology&, const KvRedundancy&);
+
+  int32_t rank(int32_t dp, int32_t cp, int32_t tp) const;
+  int32_t head_begin(int32_t h) const;      // h * Hl
+  int32_t head_end(int32_t h) const;        // (h+1) * Hl
+
+  int32_t head_class(int32_t tp) const;     // tp / D_tp
+  int32_t slice(int32_t cp, int32_t tp) const;    // (cp * D_tp + tp % D_tp) % S_eff
+  int32_t replica(int32_t cp, int32_t tp) const;  // (cp * D_tp + tp % D_tp) / S_eff
+
+  // 写者去重：c == 0 的唯一 rank
+  bool writer_of(int32_t dp, int32_t h, int32_t t, int32_t* rank) const;
+  // 副本全填：c ∈ [0, N_rep)
+  void copies_of(int32_t dp, int32_t h, int32_t t,
+                 std::vector<int32_t>* ranks) const;
+};
+```
+
+### 3.2 L1：规范地址
+
+```cpp
+struct CanonicalBlock {
+  int32_t tokens_per_block = 0;             // = manifest.block_token_capacity
+  int32_t split = 1;                        // 本侧 S_eff
+
+  // 规范块号由 token 区间导出，与 S / TP / 物理几何无关
+  int64_t block_of_token(int64_t token_index) const;
+  int64_t token_begin(int64_t block) const;   // block * tokens_per_block
+  int64_t token_end(int64_t block) const;
+
+  // 本地物理行 <-> 规范块（DCP 分配：一个逻辑 block 的 split 个规范块
+  // 由本组 split 个 rank 各持一个）
+  int64_t local_row(int64_t canonical_block) const {   // canonical / split
+    return canonical_block / split;
+  }
+  int64_t canonical_of_row(int64_t row, int32_t slice_rank) const {
+    return row * split + slice_rank;
+  }
+};
+
+// (block, head, tau) -> 规范线性偏移；BlockLogicalBytes 与 S / 物理几何无关。
+// 内部类型：只被 RouteBinder 使用，不对外暴露。
+struct CanonicalAddr {
+  int32_t kv_head_num = 0;
+  uint64_t head_bytes = 0;                     // 一个 head 的字节数
+  int64_t tokens_per_block = 0;
+
+  uint64_t block_bytes() const {
+    return static_cast<uint64_t>(tokens_per_block) * kv_head_num * head_bytes;
+  }
+  uint64_t linear(int64_t block, int32_t head, int32_t tau) const {
+    return static_cast<uint64_t>(block) * block_bytes() +
+           static_cast<uint64_t>(tau) * kv_head_num * head_bytes +
+           static_cast<uint64_t>(head) * head_bytes;
+  }
+};
+```
+
+### 3.3 L2：边表
+
+```cpp
+struct RouteEdge {                    // 全部索引都是 DP 组内局部量
+  int32_t src_local_rank = 0;         // = cp_P * TP_P + tp_P
+  int32_t dst_local_rank = 0;         // = cp_D * TP_D + tp_D
+  int32_t head_begin = 0, head_end = 0;   // 全局 head 半开区间
+  int32_t src_slice = 0;                  // t_P
+  int32_t dst_slice = 0;                  // t_D
+};
+// 全局 rank = dp * (CP * TP) + local_rank；DP 配对由调度层给出
+// （TransferKVInfo.dp_rank），不进边表 —— 因此一张边表服务全部 DP 对，
+// 边数不随 DP 增长，且 P(DP1)→D(DPn) 的展开天然可表达。
+
+class PdRouteTable {
+ public:
+  // 只需两侧拓扑；两侧各算一次，结果逐边相同（可互为断言）。
+  // 缓存键 = (本侧 KvTopology, 对侧 KvTopology)：同一拓扑的多个 peer 复用。
+  static Status build(const KvTopology& src, const GroupTopology& src_group,
+                      const KvTopology& dst, const GroupTopology& dst_group,
+                      std::vector<RouteEdge>* edges);
+
+  // 覆盖不变量：模型下按构造成立，此处只做 O(#edges) 断言
+  static Status validate(const std::vector<RouteEdge>& edges,
+                         const KvTopology& src, const GroupTopology& src_group,
+                         const KvTopology& dst, const GroupTopology& dst_group);
+};
+```
+
+`build` 的语义（即模型文档 §4.3）：
+
+```
+for (hP,hD,lo,hi) in head_pairs(src, dst):
+  for tP in [0, S_P):
+    src = src_idx.writer_of(dp, hP, tP)
+    for tD in block_map(tP):                 // (tP + k*S_P) % S_D, k ∈ [0, m)
+      for cD in [0, N_rep_D):
+        dst = 唯一 rank，h(tp)=hD ∧ t(cp,tp)=tD ∧ c(cp,tp)=cD
+        emit {dp, src, dst, lo, hi, tP, tD}
+```
+
+### 3.4 L3：绑定
+
+```cpp
+// 物理目录：manifest 精简后的形态，只描述"本侧哪些 buffer、多大、怎么寻址"
+struct BufferDirectoryEntry {
+  int64_t  buf_id = 0;
+  int32_t  group_id = 0;
+  int32_t  role = 0;                 // KVCacheTensorRole
+  uint64_t resource_count = 0;       // 本侧物理行数
+  uint64_t resource_stride_bytes = 0;// 一行（= 一个规范块）的字节数
+  uint64_t buffer_bytes = 0;
+  bool     explicit_offsets = false; // XTensor 页映射
+};
+
+class RouteBinder {
+ public:
+  // canonical_blocks: 本请求涉及的规范块号（升序）
+  // local/remote    : 两侧物理目录
+  // local_offsets/remote_offsets: explicit_offsets 时的页内字节基点
+  // local_split/remote_split    : 两侧的 S_eff（用于 row <-> canonical 映射）
+  static Status bind(const std::vector<RouteEdge>& edges,
+                     Span<const int64_t> canonical_blocks,
+                     int64_t layer,
+                     const BufferDirectory& local,
+                     const BufferDirectory& remote,
+                     Span<const uint64_t> local_offsets,
+                     Span<const uint64_t> remote_offsets,
+                     int32_t local_split, int32_t remote_split,
+                     std::vector<ByteRegion>* regions);
+};
+```
+
+`bind` 的实现要点：
+
+1. **按 `canonical % S_eff` 预分桶**请求的规范块列表（F7），使每条边只遍历属于自己的桶 ⇒ 复杂度 `O(#blocks)` 而非 `O(#edges × #blocks)`；
+2. 对每条边、每个属于它的规范块：
+   - `local_row = canonical / local_split`（若 `local_split == 1` 则 `local_row = canonical`）
+   - `remote_row = canonical / remote_split`
+   - `local_off = local.explicit_offsets ? local_offsets[local_row] : local_row * local.resource_stride_bytes`（remote 同理）
+   - head 区间与块内 token 区间映射到资源内偏移（`CanonicalAddr`）
+3. **块内 token 维仍用 `repeat_count / local_stride / remote_stride` 压缩**（F9）——被删除的只是跨资源的区间求交与折叠公式。
+
+**没有任何区间求交、没有 sweepline、没有折叠公式。**
+
+---
+
+## 4. 数据面收敛：PUSH / PULL 合一
+
+现状是两条各写一遍的路：
+
+| | 现状 | 新 |
+|---|---|---|
+| PUSH | `merge_kv_blocks`(C) → `bind_outgoing_regions` → `move_memory_regions(WRITE)` | `PdRouteTable` → `RouteBinder::bind` → `move_memory_regions(WRITE)` |
+| PULL | `LLMEngine::pull_kv_blocks` 取模 → `append_buffer_mappings` → `move_memory_groups(READ)` | `PdRouteTable` → `RouteBinder::bind` → `move_memory_regions(READ)` |
+
+合并为一个入口：
+
+```cpp
+Status KVCacheTransfer::transfer(const std::vector<RouteEdge>& edges,
+                                 Span<const int64_t> canonical_blocks,
+                                 MoveOpcode opcode);   // WRITE=PUSH, READ=PULL
+```
+
+**方向只影响 opcode，不影响任何配对计算。** 这直接消除了"PUSH 与 PULL 对同一问题给两套答案"的现状。
+
+---
+
+## 5. 控制面收敛
+
+### 5.1 建链只连有边的对端
+
+现状：`LLMEngine::link_cluster` 让每个 D worker 与**全部** P worker 建链，再用 `CachePeerMode::ACTIVE / PLAN_ONLY` 区分。新方案：
+
+```
+边表算完后，只对 edges 非空的对端建链；无边的对端完全不建链。
+```
+
+⇒ **`CachePeerMode` 三态退化为"连 / 不连"两态**，`PLAN_ONLY` 及其分支、`cache_peer_links_[addr].mode` 的判断全部删除。
+
+**边表缓存键 = `(本侧 KvTopology, 对侧 KvTopology)` + group**，不是 peer 地址。一个 P 实例若服务多个不同拓扑的 D 实例（异构舰队），同一拓扑的多个 peer 复用同一张表。
+
+**DP 配对属调度层**：P(DP1)→D(DPn) 的 1→n 展开由 `TransferKVInfo.dp_rank` 决定，不进边表。绑定阶段把局部 rank 加上 DP 偏移：
+
+```
+src_global = src_dp * (CP_P * TP_P) + edge.src_local_rank
+dst_global = dst_dp * (CP_D * TP_D) + edge.dst_local_rank
+```
+
+### 5.2 计划不再需要跨 RPC 传递
+
+现状：D 侧算出 writer 集后通过 `SetCachePeer` 把 mode 告诉 P，P 侧再 `build_outgoing_plan` 生成并缓存 `ReshardPlanTemplate`。
+
+新方案：`PdRouteTable::build` 是**两侧拓扑的纯函数**，两侧各自算一次即可得到逐边相同的边表，无需传递计划。控制面只剩：
+
+| RPC | 内容 | 频率 |
+|---|---|---|
+| `GetCacheLayoutManifest` | **精简后的物理目录**（buffer 表 + 拓扑元组），仅用于寻址与校验 | 建链时一次 |
+| `SetCachePeer` | **仅表示"我要跟你建链"**（不再携带 mode 与 plan） | 建链时一次 |
+
+`ReshardPlanTemplate` / `StridedRegionTemplate` / `RequestRegionBinder` 全部删除；`MooncakeTransferEngineCore` 的 `cache_peer_links_` 退化为一个 `std::unordered_set<std::string>`（已连接的 addr）。
+
+### 5.3 门禁提前到建链前
+
+`PdTopo {dp_size, tp_size}` 扩展为完整 `KvTopology` + 每组 `GroupTopology`（含 `G`、`S`、`cp_size`、`tokens_per_block`），由 `KvRedundancy::derive` 在**建链前**拒绝 C1/C2 违规、`tokens_per_block_P ≠ tokens_per_block_D`、以及 `S_eff` 两侧不可配对（`S_eff_P ∤ S_eff_D` 且反之不成立）的组合。
+
+⇒ 违规配置不再等到覆盖率校验才以 `"no source writer"` 的形式暴露。
+
+---
+
+## 6. 适用范围边界
+
+### 6.1 由 `S_eff` 推导，而不是按 BlockType 白名单
+
+C2（`S ≤ D`）必须作用在**每个 cache 组**上，因为 `D = CP × D_tp` 依赖该组的全局 head 数 `G`，而 `S` 是实例级的。GLM5-next 就是反例：KDA 状态 `G = kda_num_heads = 64`，`TP = 8` ⇒ `D = 1`，而实例 `S = 4` —— 按实例级 C2 会被误拒。
+
+因此定义：
+
+```
+S_eff(group) = (S <= D(group) && D(group) % S == 0) ? S : 1
+```
+
+语义：**能被冗余度吸收的缓存才切分；不能被吸收的缓存整体复制到每个 rank**（`S_eff = 1 ⇒ t ≡ 0`，每 rank 持完整序列）。
+
+这**推导出**了现有实现里硬编码的白名单（`block/block.h:75-88` `is_kv_split_cache_block_type`：`KV/SWA/C4/C128` 为 true，`EMBEDDING/LINEAR` 为 false），因此改造后该函数应降级为断言：`EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`。详见验证文档 F1。
+
+### 6.2 按 scope 分类
+
+| scope | 组 | `t` 维度 | 说明 |
+|---|---|---|---|
+| `BLOCK` | KV / SWA / C4 / C128 / MLA latent / INDEX | 有 | 主路径，`S_eff` 由 §6.1 推导 |
+| `BLOCK` | spec-draft（MTP）缓存 | 有 | 独立 namespace 的第二套 `(G, TP, S_eff)` |
+| `SEQUENCE` | SSM / CONV / LINEAR / EMBEDDING | **`t ≡ 0`** | per-sequence slot，只有 `h` 与 `c` 两个维度；通常 `G ≥ TP` ⇒ `D_tp = 1` ⇒ `S_eff = 1` |
+
+对 `SEQUENCE` 组，模型只做一件事：**把 `owner_tp_rank` 去重替换为 `c == 0` 判定**，不引入 `t`。若某天出现 `G < TP` 的 sequence-scoped 缓存，`S_eff` 规则同样适用（此时 `D > 1`、可切分）。
+
+---
+
+## 7. 与现有代码的对应关系
+
+### 7.1 删除
+
+| 目标 | 位置 |
+|---|---|
+| `push_route.{h,cpp}` + `push_route_test.cpp` + 无用 include | `kv_cache_transfer/push_route.*`、`tests/.../push_route_test.cpp`、`mooncake_kv_cache_transfer.cpp:30` |
+| base `merge_kv_blocks`（modulo 路由，约 108 行） | `kv_cache_transfer.cpp:266-373` |
+| `rotate_dst_rank` | `kv_cache_transfer.cpp:199-210` + `.h:73` |
+| `filter_kv_split_infos` | `kv_cache_transfer.cpp:145-196` + `.h:56` |
+| `LLMEngine::pull_kv_blocks` 的取模配对 | `llm_engine.cpp:814-843` |
+| `select_sources` / `select_collapsed_writers` / `validate_writer_coverage` / `validate_coverage_for_sources` / `has_logical_overlap` / `expand_manifest` / `validate_source_instance` / `validate_tensor_pair` / `compact_planned_regions`，以及 `bind_regions` 里的**区间求交与折叠**逻辑 | `reshard_planner.cpp` 主体。注意：`bind_regions` 的 `repeat_count / local_stride / remote_stride`（**块内 token 维**压缩）**保留**，只是被 `RouteBinder` 重新实现 |
+| `same_partition` / `same_partition_sizes` / `kv_split_spans_cp_and_tp` / `supports_kv_split_topology` / `supports_partition_layout` / `supports_partition_pair` / `validate_compatibility` | `reshard_planner.cpp:80-139` |
+| `CoverageKey` / `RegionGroups` / `AtomicLogicalRegion` / `PlannedAtomicRegion` / `BoundRegion` | `reshard_planner.cpp:33-66` |
+| `LogicalShardKind` / `LogicalSpan` / `LogicalShardDescriptor` / `owner_tp_rank` | `logical_cache_layout.h` |
+| `CacheTensorManifest` 的 `shard` / `logical_*` 字段 | `cache_layout.h:43-68` |
+| `only_static_owner` 及其 3 个调用点 | `reshard_planner.cpp:155,479,854,869` |
+| `CachePeerMode::PLAN_ONLY` 及其分支 | `mooncake_transfer_engine.{h,cpp}` |
+| `ReshardPlanTemplate` / `StridedRegionTemplate` / `ExplicitResourceMapping` 的 plan 依赖 | `reshard_planner.h:24-81` |
+| `rank_local_mapping` / `has_rank_preserving_kv_groups` | `disagg_pd_scheduler.cpp:162-173,668` |
+| `RemoteWorker::pull_kv_blocks` 路径的 kv_split 无关校验 | `kv_cache_transfer.cpp:118-133` |
+
+### 7.2 修改
+
+| 目标 | 位置 | 改法 |
+|---|---|---|
+| `MooncakeKVCacheTransferBase::merge_kv_blocks` | `mooncake_kv_cache_transfer.cpp:635-659` | 退化为按边表分组 |
+| `bind_outgoing_regions[_explicit]` | `mooncake_transfer_engine.cpp:493-548` | 退化为查表 + 偏移计算 |
+| `push_kv_blocks` / `pull_kv_blocks` | `mooncake_kv_cache_transfer.cpp:607-720, 854-878` | 各自调用统一入口 `transfer(opcode)` |
+| `validate_transfer_mappings` | `kv_cache_transfer.cpp:33-93` | 删除 kv_split 覆盖区间校验，只留 group 唯一性 |
+| `PdTopo` / `check_pd_topo` | `pd_topology_guard.{h,cpp}` | 扩为 `KvTopology`，调用 `KvRedundancy::derive` |
+| `CacheRegistrationContext` / `publish_cache_layout` | `mooncake_kv_cache_transfer.cpp:154-221, 409-445` | 只发布物理目录 + 拓扑元组；删除 spec fingerprint 拼接与 `layout_generation` 的语义负担 |
+| `InstanceInfo` | `common/types.h:225` | 增加 `kv_head_num` / `kv_split_size` / `cp_size` / `tokens_per_block` |
+| `configure_cache_layout` | `mooncake_kv_cache_transfer.cpp:154-221` | 只算物理几何 |
+
+### 7.3 保留不动
+
+- `MooncakeTransferEngine` 的会话、注册、`move_memory_regions`；
+- `GlobalXTensor` 与 `explicit_resource_offsets`（物理层的一种实现，由 `BufferDirectoryEntry::explicit_offsets` 承接）；
+- spec-draft 双布局机制（作为第二个 namespace）；
+- `remote_shared_num` 与 prefix cache 游标推进；
+- `is_spec_draft` 在 `push_kv_blocks` 中的 layout 选择语义（改为选第二套 `KvTopology`）。
+
+### 7.4 新增
+
+| 新增 | 规模 |
+|---|---|
+| `KvTopology` / `KvRedundancy` / `KvLayoutIndex` | 约 200 行，纯算术 |
+| `CanonicalBlock` / `CanonicalAddr` | 约 60 行 |
+| `PdRouteTable`（build + validate） | 约 150 行 |
+| `RouteBinder` | 约 120 行 |
+| `BufferDirectory` | 约 80 行 |
+
+---
+
+## 8. 迁移阶段与验收
+
+| 阶段 | 内容 | 风险 | 验收 |
+|---|---|---|---|
+| **S0** | 删除 §7.1 中不参与运行时的死代码（`push_route.*`、base `merge_kv_blocks`、无用 include） | 零 | 四种构建配置全树编译；现有单测全绿 |
+| **S1** | 新增 L0/L1（`KvTopology` / `GroupTopology` / `KvRedundancy` / `KvLayoutIndex` / `CanonicalBlock`）与穷举单测，不改调用方 | 低 | `G∈{1,2,4,8,16,32,64}` × `TP∈{1,2,4,8}` × `CP∈{1,2}` × `S` 全枚举：(a) 每 `(h,t)` 恰一个 `c=0` 写者；(b) `N_rep == D/S_eff`；(c) `H_c·H_l == G`；(d) 负例 `TP=8,G=2,S=3` 被拒；(e) `S_eff` 与 `is_kv_split_cache_block_type` 在 GLM5-next 的 5 个组上一致（验证文档 T1/T2） |
+| **S2** | 新增 L2/L3（`PdRouteTable` / `RouteBinder` / `BufferDirectory`）；与旧计划器**并行**跑，逐边比对 | 中 | 对同构/异构配置，新边表与原 `select_sources` 的 ACTIVE 集合**逐边一致**；`S_P = S_D` 时 `RouteBinder` 输出的 `ByteRegion` 与 `bind_outgoing_regions` 逐字节一致；**GLM 5.3 flash 场景边表 golden 通过（验证文档 T3/T4）** |
+| **S2'** | host 侧 mock 端到端：真实内存 + 本地 memcpy 代替 RDMA | 低 | **验证文档 T5 八个用例全绿** —— 这是"GLM 5.3 flash 尚不支持 PD 分离"约束下的主要验收手段 |
+| **S3** | 数据面切到 `transfer(opcode)`：先切 PULL，再切 PUSH（PUSH 有 layer synchronizer，最后切） | 中 | PD 端到端字节正确；PULL/PUSH 结果一致 |
+| **S4** | 删除 D1/D2/D3 全部旧路径与 `rank_local_mapping`；`SetCachePeer` 去掉 mode/plan | 中 | 全树编译 + 单测 + 端到端 |
+| **S5** | 门禁提前（`PdTopo` → `KvTopology`）；建链只连有边的对端 | 低 | 配置矩阵负例；建链 RPC 数下降可观测 |
+
+**关键顺序原则**：S2 必须"新旧并行 + 逐边/逐字节比对"通过后才进入 S3；S3 先切 PULL（无 layer synchronizer，失败面小）。**不要在新旧路径切换的同时改变量语义**（例如同时解除 `block_size × kv_split_size` 绑定）——后者单列为 S6，独立评估。
+
+| 阶段 | 内容 | 风险 |
+|---|---|---|
+| **S6**（可选，独立） | 解除 `block_size × kv_split_size`（`llm_engine.cpp:653`），让规范块与物理资源彻底解耦；`B_token` 收敛为调度侧基础块大小 | 中（触及 BlockManager / prefix cache 哈希） |
+
+---
+
+## 8.1 实施进展
+
+### S0 已完成（2026-09-17）
+
+删除的不可达代码：
+
+| 项 | 证据 |
+|---|---|
+| `xllm/core/framework/kv_cache_transfer/push_route.{h,cpp}` | 全树生产调用点为 0；`mooncake_kv_cache_transfer.cpp` 只 `#include` 不调用 |
+| `tests/core/framework/kv_cache_transfer/push_route_test.cpp` + 两处 CMake 条目 | 随库一并删除 |
+| `KVCacheTransfer::merge_kv_blocks` 的基类实现（`kv_cache_transfer.cpp:266-373`，108 行 modulo 路由） | 唯一子类 `MooncakeKVCacheTransferBase` 已 `override`；工厂只构造 Mooncake 实现，故基类实现不可达。现改为 **纯虚**，杜绝后续后端再继承这段死逻辑 |
+| `kv_cache_transfer.h` 中 `merge_kv_blocks` 的声明 | `= 0`，并加注释说明为何必须由后端实现 |
+
+验证：`kv_cache_transfer.h` 与 `mooncake_kv_cache_transfer.h` 的参数列表规范化后**逐字符相同**（`virtual`/`override`/`= 0` 之外无差异），因此 `MooncakeKVCacheTransferDefault` 仍是具体类。
+
+### S1 已完成（2026-09-17）
+
+新增 `xllm/core/framework/kv_cache_transfer/kv_redundancy.{h,cpp}`（L0/L1，约 220 行）：
+
+- `KvTopology`（实例级：dp/cp/tp/kv_split/tokens_per_block）
+- `GroupTopology`（每组：global_head_count / head_bytes / sequence_scoped）
+- `KvRedundancy::derive` —— 校验 C1（`G % TP == 0 || TP % G == 0`）与 C2（`S_eff` 必须整除并 ≤ `D`），派生 `Hl / D_tp / Hc / D / S_eff / N_rep`，并断言 `Hc × Hl == G`
+- `KvLayoutIndex` —— `rank ↔ (h, t, c)` 双向映射、`writer_of`（`c == 0` 唯一写者）、`replicas_of`（`N_rep` 个副本）
+- `CanonicalBlock` —— 规范块 ↔ 本地物理行（`local_row = canonical / S_eff`）
+
+**`S_eff` 派生规则**（本方案的核心修正，见 §6.1）：
+
+```
+sequence_scoped            => S_eff = 1     （无块维可切）
+D == 1                     => S_eff = 1     （无冗余可消）
+S <= D 且 D % S == 0       => S_eff = S
+其余                        => 报错（不做静默降级）
+```
+
+**该层零非标准库依赖**，可被穷举单测完全覆盖。
+
+### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
+
+环境：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（cmake 3.27.9 / ninja 1.11.1 / gtest 1.14.0），
+工作树 `~/workspace/xllm-pdroute`（`xllm-dcp-fp32` 的副本，原树未被改动）。
+
+| 验证项 | 结果 |
+|---|---|
+| `kv_redundancy.cpp` 用**项目真实编译命令**（取自 `compile_commands.json`，含全部 CANN / torch / torch_npu include 与宏）编译 | ✅ 通过 |
+| `kv_redundancy_test.cpp` 编译 + 链接 vcpkg `libgtest`/`libgtest_main` | ✅ 通过 |
+| 运行 `kv_redundancy_test` | ✅ **10 tests from 3 test suites，全部 PASSED**（含 `G×TP×CP×S` 穷举不变量扫描、GLM 5.3 flash 场景表、`TP=8,G=4,S=4` 与 `TP=8,G=2,S=3` 判别性负例） |
+| 两处 CMakeLists 语法（用真实 cmake 3.27.9 + 桩宏 `include` 整个文件） | ✅ `CMakeLists syntax OK`，且新条目 `cc_library(kv_redundancy)` / `cc_test(kv_redundancy_test)` 字段正确 |
+| `kv_cache_transfer.cpp` / `mooncake_kv_cache_transfer.cpp` 编译 | ⚠️ **环境性失败**：`platform/stream.h:33` 的 `#include <torch_npu/torch_npu.h>` 在三个可用镜像中都无法满足（实际文件在 `torch_npu/include/torch_npu/csrc/libs/torch_npu.h`）。**对照实验**：用同一套 flags 编译 `git show HEAD:` 取出的**改动前**同名文件，失败信息**逐字相同**，证明与本变更无关 |
+
+复现命令（在 jd-node-98 上）：
+
+```bash
+# 手动编译 + 链接 + 运行新层单测（绕开需要整树 vcpkg 重装的 reconfigure）
+sudo docker run --rm --privileged \
+  -v ~/workspace/xllm-pdroute:/export/home/shifengmin.3/workspace/xllm-dcp-fp32 \
+  -v ~/pdroute_tools/pdroute_container_manual.py:/tmp/manual.py:ro \
+  --entrypoint bash \
+  quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911 \
+  -c 'cd /export/home/shifengmin.3/workspace/xllm-dcp-fp32 && python3 /tmp/manual.py'
+```
+
+> **未覆盖的一环**：`ninja kv_redundancy_test` 这条 CMake 驱动的完整构建在本环境跑不通 —— 原 `build/` 目录是在 `xllm-dcp-fp32` 路径下配置的，换路径后 vcpkg 需要从零重装 242 个 port（实测启动后即放弃）。因此 CMake 侧只做到**语法 + 条目正确性**验证，链接顺序等仍待一次正常 CI 构建确认。
+
+---
+
+## 9. 风险与回退
+
+| 风险 | 缓解 |
+|---|---|
+| 规范坐标与现状不等价，导致静默错字节 | S2 强制"逐边 + 逐字节"比对；不等价则不进入 S3 |
+| 两侧独立推导边表出现分歧（实现/版本不一致） | `PdRouteTable::validate` 作为两侧互相断言；拓扑元组进 `fingerprint`，不一致直接拒链 |
+| XTensor 页映射与规范块语义冲突 | `explicit_offsets` 作为 `BufferDirectoryEntry` 的一个标志位，规范层不感知；S1/S2 单测覆盖 XTensor 形态 |
+| sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
+| 建链收敛后，运行期新增对端无法建链 | 保留 on-demand 建链路径：`PdRouteTable` 可在运行期对新的拓扑元组补算边表 |
+
+**回退点**：S0 / S1 完全独立可回退；S2 是纯新增并行路径；S3 起才切换行为，切换前保留旧路径的编译开关（`--pd_route=legacy|canonical`）以便灰度与快速回退。

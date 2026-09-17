@@ -127,10 +127,13 @@ class KVCacheTransfer {
       bool is_spec_draft);
 #endif
 
+  // Merge per-request transfer infos into per-destination-worker batches.
+  // Every backend must implement this: the rank pairing is backend-specific
+  // (Mooncake derives it from the cache layout manifests).
   virtual void merge_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       const std::vector<TransferKVInfo>& transfer_kv_infos,
-      const ParallelArgs& parallel_args);
+      const ParallelArgs& parallel_args) = 0;
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   virtual bool push_kv_blocks(

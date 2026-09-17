@@ -12,11 +12,11 @@ cc_test(
 
 cc_test(
   NAME
-    push_route_test
+    kv_redundancy_test
   SRCS
-    push_route_test.cpp
+    kv_redundancy_test.cpp
   DEPS
-    :push_route
+    :kv_redundancy
     GTest::gtest_main
 )
 
