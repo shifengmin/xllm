@@ -1,0 +1,349 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "framework/kv_cache_transfer/kv_redundancy.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace xllm {
+
+namespace {
+
+// GLM 5.3 flash (glm5_next) target scenario:
+//   prefill: 8 ranks, dp1 tp8 cp1 kv_split4
+//   decode : 8 ranks, dp4 tp2 cp1 kv_split2
+// MLA latent and the shared-head indexer have exactly one global head, so they
+// are the only groups whose redundancy can absorb a split; the KDA
+// conv/recurrent states expose kda_num_heads (64) global heads and therefore
+// have no redundancy to remove.
+constexpr int32_t kMlaGlobalHeads = 1;
+constexpr int32_t kKdaGlobalHeads = 64;
+constexpr int32_t kTokensPerBlock = 128;
+
+KvTopology make_topology(int32_t dp_size,
+                         int32_t cp_size,
+                         int32_t tp_size,
+                         int32_t kv_split_size) {
+  KvTopology topology;
+  topology.dp_size = dp_size;
+  topology.cp_size = cp_size;
+  topology.tp_size = tp_size;
+  topology.kv_split_size = kv_split_size;
+  topology.tokens_per_block = kTokensPerBlock;
+  return topology;
+}
+
+GroupTopology make_group(int32_t global_head_count, bool sequence_scoped) {
+  GroupTopology group;
+  group.global_head_count = global_head_count;
+  group.head_bytes = 1024;
+  group.sequence_scoped = sequence_scoped;
+  return group;
+}
+
+// Returns the derived redundancy, asserting the configuration is accepted.
+KvRedundancy derive_ok(const KvTopology& topology, const GroupTopology& group) {
+  KvRedundancy redundancy;
+  std::string error;
+  EXPECT_TRUE(KvRedundancy::derive(topology, group, &redundancy, &error))
+      << error;
+  return redundancy;
+}
+
+void expect_rejected(const KvTopology& topology, const GroupTopology& group) {
+  KvRedundancy redundancy;
+  std::string error;
+  EXPECT_FALSE(KvRedundancy::derive(topology, group, &redundancy, &error));
+  EXPECT_FALSE(error.empty());
+}
+
+}  // namespace
+
+TEST(KvRedundancyTest, DerivesTheGlm53FlashPilotScenario) {
+  // Prefill MLA latent / indexer: G=1, TP=8 => D_tp=8, D=8, split=4, N_rep=2.
+  const KvRedundancy prefill =
+      derive_ok(make_topology(/*dp_size=*/1,
+                              /*cp_size=*/1,
+                              /*tp_size=*/8,
+                              /*kv_split_size=*/4),
+                make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
+  EXPECT_EQ(prefill.local_head_count(), 1);
+  EXPECT_EQ(prefill.tp_redundancy(), 8);
+  EXPECT_EQ(prefill.head_class_count(), 1);
+  EXPECT_EQ(prefill.redundancy(), 8);
+  EXPECT_EQ(prefill.split(), 4);
+  EXPECT_EQ(prefill.replica_count(), 2);
+
+  // Decode MLA latent: G=1, TP=2 => D=2, split=2, N_rep=1.
+  const KvRedundancy decode =
+      derive_ok(make_topology(/*dp_size=*/4,
+                              /*cp_size=*/1,
+                              /*tp_size=*/2,
+                              /*kv_split_size=*/2),
+                make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
+  EXPECT_EQ(decode.tp_redundancy(), 2);
+  EXPECT_EQ(decode.redundancy(), 2);
+  EXPECT_EQ(decode.split(), 2);
+  EXPECT_EQ(decode.replica_count(), 1);
+}
+
+TEST(KvRedundancyTest, SequenceScopedGroupsAreNeverSplit) {
+  // The KDA conv / recurrent states are sequence scoped: there is no block
+  // dimension to split, so the whole sequence stays on every rank even though
+  // the instance is configured with kv_split > 1.
+  const KvRedundancy prefill =
+      derive_ok(make_topology(1, 1, 8, 4), make_group(kKdaGlobalHeads, true));
+  EXPECT_EQ(prefill.local_head_count(), 8);
+  EXPECT_EQ(prefill.head_class_count(), 8);
+  EXPECT_EQ(prefill.tp_redundancy(), 1);
+  EXPECT_EQ(prefill.redundancy(), 1);
+  EXPECT_EQ(prefill.split(), 1);
+  EXPECT_EQ(prefill.replica_count(), 1);
+  EXPECT_TRUE(prefill.sequence_scoped());
+
+  const KvRedundancy decode =
+      derive_ok(make_topology(4, 1, 2, 2), make_group(kKdaGlobalHeads, true));
+  EXPECT_EQ(decode.local_head_count(), 32);
+  EXPECT_EQ(decode.head_class_count(), 2);
+  EXPECT_EQ(decode.split(), 1);
+}
+
+TEST(KvRedundancyTest, GroupsWithoutRedundancyKeepSplitOne) {
+  // G >= TP shards the heads; there is nothing to remove, so a configured
+  // split larger than 1 degrades to 1 instead of failing.
+  const KvRedundancy sharded =
+      derive_ok(make_topology(1, 1, 8, 4), make_group(/*G=*/8, false));
+  EXPECT_EQ(sharded.tp_redundancy(), 1);
+  EXPECT_EQ(sharded.redundancy(), 1);
+  EXPECT_EQ(sharded.split(), 1);
+}
+
+TEST(KvRedundancyTest, CpMultipliesTheRedundancy) {
+  // CP replicates KV, so D = CP * D_tp.
+  const KvRedundancy redundancy =
+      derive_ok(make_topology(1, /*cp_size=*/2, 8, 2), make_group(8, false));
+  EXPECT_EQ(redundancy.tp_redundancy(), 1);
+  EXPECT_EQ(redundancy.redundancy(), 2);
+  EXPECT_EQ(redundancy.split(), 2);
+  EXPECT_EQ(redundancy.replica_count(), 1);
+}
+
+TEST(KvRedundancyTest, RejectsHeadCountThatIsNeitherDivisibleNorDividing) {
+  expect_rejected(make_topology(1, 1, 8, 1), make_group(/*G=*/3, false));
+  expect_rejected(make_topology(1, 1, /*tp_size=*/3, 1), make_group(8, false));
+  expect_rejected(make_topology(1, 1, 8, 1), make_group(/*G=*/0, false));
+}
+
+TEST(KvRedundancyTest, RejectsSplitThatExceedsOrDoesNotDivideRedundancy) {
+  // G=4, TP=8 => D=2, so a split of 4 cannot be absorbed. This is the
+  // discriminating negative case for the pilot scenario: it is exactly why the
+  // pilot requires a single global KV head.
+  expect_rejected(make_topology(1, 1, 8, 4), make_group(/*G=*/4, false));
+  // G=2, TP=8 => D=4, and 3 does not divide 4.
+  expect_rejected(make_topology(1, 1, 8, 3), make_group(/*G=*/2, false));
+  // CP=2, G=TP=8 => D=2 < 4.
+  expect_rejected(make_topology(1, 2, 8, 4), make_group(8, false));
+}
+
+TEST(KvRedundancyTest, HeadClassesTileTheGlobalHeadRange) {
+  const std::vector<int32_t> head_counts = {1, 2, 4, 8, 16, 32, 64};
+  const std::vector<int32_t> tp_sizes = {1, 2, 4, 8};
+  const std::vector<int32_t> cp_sizes = {1, 2};
+  int32_t accepted = 0;
+  for (int32_t global_heads : head_counts) {
+    for (int32_t tp_size : tp_sizes) {
+      for (int32_t cp_size : cp_sizes) {
+        for (int32_t split = 1;
+             split <= cp_size * std::max(tp_size / global_heads, 1) + 1;
+             ++split) {
+          const KvTopology topology = make_topology(1, cp_size, tp_size, split);
+          const GroupTopology group = make_group(global_heads, false);
+          KvRedundancy redundancy;
+          std::string error;
+          if (!KvRedundancy::derive(topology, group, &redundancy, &error)) {
+            continue;
+          }
+          ++accepted;
+          EXPECT_EQ(
+              redundancy.head_class_count() * redundancy.local_head_count(),
+              global_heads);
+          EXPECT_GE(redundancy.split(), 1);
+          EXPECT_LE(redundancy.split(), redundancy.redundancy());
+          EXPECT_EQ(redundancy.redundancy() % redundancy.split(), 0);
+          EXPECT_EQ(redundancy.replica_count(),
+                    redundancy.redundancy() / redundancy.split());
+        }
+      }
+    }
+  }
+  EXPECT_GT(accepted, 100);
+}
+
+TEST(KvLayoutIndexTest, EverySliceHasOneWriterAndNrepReplicas) {
+  const std::vector<int32_t> head_counts = {1, 2, 4, 8, 16, 32, 64};
+  const std::vector<int32_t> tp_sizes = {1, 2, 4, 8};
+  const std::vector<int32_t> cp_sizes = {1, 2};
+  for (int32_t global_heads : head_counts) {
+    for (int32_t tp_size : tp_sizes) {
+      for (int32_t cp_size : cp_sizes) {
+        for (int32_t split = 1;
+             split <= cp_size * std::max(tp_size / global_heads, 1);
+             ++split) {
+          const KvTopology topology =
+              make_topology(/*dp_size=*/2, cp_size, tp_size, split);
+          const GroupTopology group = make_group(global_heads, false);
+          KvRedundancy redundancy;
+          std::string error;
+          if (!KvRedundancy::derive(topology, group, &redundancy, &error)) {
+            continue;
+          }
+          const KvLayoutIndex index(topology, redundancy);
+          const std::string tag = "G=" + std::to_string(global_heads) +
+                                  " TP=" + std::to_string(tp_size) +
+                                  " CP=" + std::to_string(cp_size) +
+                                  " S=" + std::to_string(split);
+
+          for (int32_t dp = 0; dp < topology.dp_size; ++dp) {
+            for (int32_t h = 0; h < redundancy.head_class_count(); ++h) {
+              EXPECT_EQ(index.head_begin(h), h * redundancy.local_head_count())
+                  << tag;
+              EXPECT_EQ(index.head_end(h),
+                        (h + 1) * redundancy.local_head_count())
+                  << tag;
+
+              std::map<int32_t, int32_t> slice_histogram;
+              for (int32_t cp = 0; cp < cp_size; ++cp) {
+                for (int32_t tp = 0; tp < tp_size; ++tp) {
+                  if (index.head_class_of(tp) != h) {
+                    continue;
+                  }
+                  const int32_t slice = index.slice_of(cp, tp);
+                  const int32_t replica = index.replica_of(cp, tp);
+                  EXPECT_GE(slice, 0) << tag;
+                  EXPECT_LT(slice, redundancy.split()) << tag;
+                  EXPECT_GE(replica, 0) << tag;
+                  EXPECT_LT(replica, redundancy.replica_count()) << tag;
+                  ++slice_histogram[slice];
+                }
+              }
+              // No gaps and no extra slices; each slice is held exactly
+              // N_rep times, once per redundant copy.
+              EXPECT_EQ(static_cast<int32_t>(slice_histogram.size()),
+                        redundancy.split())
+                  << tag;
+              for (const auto& [slice, count] : slice_histogram) {
+                EXPECT_EQ(count, redundancy.replica_count()) << tag;
+              }
+
+              std::set<int32_t> writers;
+              for (int32_t slice = 0; slice < redundancy.split(); ++slice) {
+                int32_t writer = -1;
+                ASSERT_TRUE(index.writer_of(dp, h, slice, &writer)) << tag;
+                EXPECT_TRUE(writers.insert(writer).second) << tag;
+                const int32_t cp = (writer % (cp_size * tp_size)) / tp_size;
+                const int32_t tp = writer % tp_size;
+                EXPECT_EQ(index.head_class_of(tp), h) << tag;
+                EXPECT_EQ(index.slice_of(cp, tp), slice) << tag;
+                EXPECT_EQ(index.replica_of(cp, tp), 0) << tag;
+
+                std::vector<int32_t> replicas;
+                ASSERT_TRUE(index.replicas_of(dp, h, slice, &replicas)) << tag;
+                EXPECT_EQ(static_cast<int32_t>(replicas.size()),
+                          redundancy.replica_count())
+                    << tag;
+                EXPECT_EQ(
+                    std::set<int32_t>(replicas.begin(), replicas.end()).size(),
+                    replicas.size())
+                    << tag;
+                EXPECT_EQ(replicas.front(), writer) << tag;
+                for (int32_t rank : replicas) {
+                  const int32_t replica_cp =
+                      (rank % (cp_size * tp_size)) / tp_size;
+                  const int32_t replica_tp = rank % tp_size;
+                  EXPECT_EQ(index.head_class_of(replica_tp), h) << tag;
+                  EXPECT_EQ(index.slice_of(replica_cp, replica_tp), slice)
+                      << tag;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(KvLayoutIndexTest, RejectsOutOfRangeQueries) {
+  const KvTopology topology = make_topology(1, 1, 8, 4);
+  const KvRedundancy redundancy =
+      derive_ok(topology, make_group(kMlaGlobalHeads, false));
+  const KvLayoutIndex index(topology, redundancy);
+
+  int32_t rank = -1;
+  EXPECT_FALSE(index.writer_of(/*dp_rank=*/-1, 0, 0, &rank));
+  EXPECT_FALSE(index.writer_of(/*dp_rank=*/topology.dp_size, 0, 0, &rank));
+  EXPECT_FALSE(index.writer_of(0, /*head_class=*/-1, 0, &rank));
+  EXPECT_FALSE(index.writer_of(
+      0, /*head_class=*/redundancy.head_class_count(), 0, &rank));
+  EXPECT_FALSE(index.writer_of(0, 0, /*slice=*/-1, &rank));
+  EXPECT_FALSE(index.writer_of(0, 0, /*slice=*/redundancy.split(), &rank));
+  EXPECT_FALSE(index.writer_of(0, 0, 0, nullptr));
+
+  std::vector<int32_t> ranks;
+  EXPECT_FALSE(index.replicas_of(/*dp_rank=*/-1, 0, 0, &ranks));
+  EXPECT_FALSE(index.replicas_of(/*dp_rank=*/topology.dp_size, 0, 0, &ranks));
+  EXPECT_FALSE(index.replicas_of(0, 0, /*slice=*/redundancy.split(), &ranks));
+  EXPECT_FALSE(index.replicas_of(0, 0, 0, nullptr));
+}
+
+TEST(CanonicalBlockTest, RowMappingRoundTripsForOwnedBlocks) {
+  // Prefill split 4 and decode split 2 of the pilot scenario share the same
+  // canonical block unit (the physical row = tokens_per_block tokens).
+  const CanonicalBlock prefill(kTokensPerBlock, /*split=*/4);
+  const CanonicalBlock decode(kTokensPerBlock, /*split=*/2);
+
+  EXPECT_EQ(prefill.block_of_token(0), 0);
+  EXPECT_EQ(prefill.block_of_token(kTokensPerBlock - 1), 0);
+  EXPECT_EQ(prefill.block_of_token(kTokensPerBlock), 1);
+  EXPECT_EQ(prefill.token_begin(3), 3 * kTokensPerBlock);
+  EXPECT_EQ(prefill.token_end(3), 4 * kTokensPerBlock);
+
+  for (int64_t block = 0; block < 64; ++block) {
+    for (int32_t slice = 0; slice < 4; ++slice) {
+      EXPECT_EQ(prefill.owns(block, slice), block % 4 == slice);
+      if (!prefill.owns(block, slice)) {
+        continue;
+      }
+      EXPECT_EQ(prefill.canonical_of_row(prefill.local_row(block), slice),
+                block);
+    }
+  }
+  // Decode collapses two canonical blocks into one physical row.
+  EXPECT_EQ(decode.local_row(0), 0);
+  EXPECT_EQ(decode.local_row(2), 1);
+  EXPECT_EQ(decode.local_row(4), 2);
+  EXPECT_EQ(decode.canonical_of_row(2, 1), 5);
+  EXPECT_TRUE(decode.owns(5, 1));
+  EXPECT_FALSE(decode.owns(5, 0));
+}
+
+}  // namespace xllm

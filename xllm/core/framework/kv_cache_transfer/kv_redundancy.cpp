@@ -1,0 +1,222 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "framework/kv_cache_transfer/kv_redundancy.h"
+
+#include <algorithm>
+
+namespace xllm {
+
+namespace {
+
+void set_error(std::string* error, const std::string& message) {
+  if (error != nullptr) {
+    *error = message;
+  }
+}
+
+}  // namespace
+
+bool KvRedundancy::derive(const KvTopology& topology,
+                          const GroupTopology& group,
+                          KvRedundancy* redundancy,
+                          std::string* error) {
+  if (redundancy == nullptr) {
+    set_error(error, "redundancy output must not be null");
+    return false;
+  }
+  if (topology.cp_size <= 0 || topology.tp_size <= 0 || topology.dp_size <= 0) {
+    set_error(error, "parallel sizes must be positive");
+    return false;
+  }
+  if (group.global_head_count <= 0) {
+    set_error(error, "global_head_count must be positive");
+    return false;
+  }
+
+  // C1: the global head count must be evenly divisible by the TP width
+  // (sharding) or divide it (replication).
+  const int32_t tp_size = topology.tp_size;
+  const int32_t global_heads = group.global_head_count;
+  if (global_heads % tp_size != 0 && tp_size % global_heads != 0) {
+    set_error(error,
+              "global_head_count (" + std::to_string(global_heads) +
+                  ") must be divisible by tp_size (" + std::to_string(tp_size) +
+                  ") or divide it: neither sharding nor replication is "
+                  "possible");
+    return false;
+  }
+
+  KvRedundancy derived;
+  derived.sequence_scoped_ = group.sequence_scoped;
+  // G >= TP shards the heads; G < TP replicates them.
+  derived.local_head_count_ = std::max(global_heads / tp_size, 1);
+  derived.tp_redundancy_ = std::max(tp_size / global_heads, 1);
+  derived.head_class_count_ = tp_size / derived.tp_redundancy_;
+  derived.redundancy_ = topology.cp_size * derived.tp_redundancy_;
+
+  // C2: the split may never exceed this group's redundancy, and it must divide
+  // it so that the redundant group decomposes into whole complete groups.
+  //
+  // Two cases legitimately keep the whole sequence on every rank:
+  //   - sequence-scoped groups (SSM / CONV / linear state slots) have no block
+  //     dimension to split at all;
+  //   - D == 1 means the group has no redundancy to remove.
+  // Any other mismatch is a configuration error: silently degrading to 1 would
+  // leave the operator believing a wider split is active.
+  const int32_t configured_split = std::max(topology.kv_split_size, 1);
+  if (group.sequence_scoped || derived.redundancy_ == 1) {
+    derived.split_ = 1;
+  } else if (configured_split <= derived.redundancy_ &&
+             derived.redundancy_ % configured_split == 0) {
+    derived.split_ = configured_split;
+  } else {
+    set_error(error,
+              "kv_split_size (" + std::to_string(configured_split) +
+                  ") must divide the group redundancy (" +
+                  std::to_string(derived.redundancy_) +
+                  ") and not exceed it; use 1 to disable the split for this "
+                  "group");
+    return false;
+  }
+  derived.replica_count_ = derived.redundancy_ / derived.split_;
+
+  // Post-condition: head classes tile the global head range exactly.
+  if (derived.head_class_count_ * derived.local_head_count_ != global_heads) {
+    set_error(error,
+              "head classes do not tile the global head range: head classes (" +
+                  std::to_string(derived.head_class_count_) +
+                  ") * local heads (" +
+                  std::to_string(derived.local_head_count_) +
+                  ") != " + std::to_string(global_heads));
+    return false;
+  }
+
+  *redundancy = derived;
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+KvLayoutIndex::KvLayoutIndex(const KvTopology& topology,
+                             const KvRedundancy& redundancy) {
+  dp_size_ = topology.dp_size;
+  cp_size_ = topology.cp_size;
+  tp_size_ = topology.tp_size;
+  tp_redundancy_ = redundancy.tp_redundancy();
+  head_class_count_ = redundancy.head_class_count();
+  local_head_count_ = redundancy.local_head_count();
+  split_ = redundancy.split();
+  replica_count_ = redundancy.replica_count();
+}
+
+int32_t KvLayoutIndex::rank(int32_t dp_rank,
+                            int32_t cp_rank,
+                            int32_t tp_rank) const {
+  return dp_rank * (cp_size_ * tp_size_) + cp_rank * tp_size_ + tp_rank;
+}
+
+int32_t KvLayoutIndex::head_begin(int32_t head_class) const {
+  return head_class * local_head_count_;
+}
+
+int32_t KvLayoutIndex::head_end(int32_t head_class) const {
+  return (head_class + 1) * local_head_count_;
+}
+
+int32_t KvLayoutIndex::head_class_of(int32_t tp_rank) const {
+  return tp_rank / tp_redundancy_;
+}
+
+int32_t KvLayoutIndex::slice_of(int32_t cp_rank, int32_t tp_rank) const {
+  const int32_t group_slot =
+      cp_rank * tp_redundancy_ + tp_rank % tp_redundancy_;
+  return group_slot % split_;
+}
+
+int32_t KvLayoutIndex::replica_of(int32_t cp_rank, int32_t tp_rank) const {
+  const int32_t group_slot =
+      cp_rank * tp_redundancy_ + tp_rank % tp_redundancy_;
+  return group_slot / split_;
+}
+
+bool KvLayoutIndex::writer_of(int32_t dp_rank,
+                              int32_t head_class,
+                              int32_t slice,
+                              int32_t* rank_out) const {
+  if (rank_out == nullptr || dp_rank < 0 || dp_rank >= dp_size_ ||
+      head_class < 0 || head_class >= head_class_count_ || slice < 0 ||
+      slice >= split_) {
+    return false;
+  }
+  // The replica-0 ranks are exactly those whose group slot equals the slice,
+  // because replica == group_slot / split and slice == group_slot % split.
+  const int32_t cp_rank = slice / tp_redundancy_;
+  const int32_t offset_in_replica = slice % tp_redundancy_;
+  const int32_t tp_rank = head_class * tp_redundancy_ + offset_in_replica;
+  *rank_out = rank(dp_rank, cp_rank, tp_rank);
+  return true;
+}
+
+bool KvLayoutIndex::replicas_of(int32_t dp_rank,
+                                int32_t head_class,
+                                int32_t slice,
+                                std::vector<int32_t>* ranks) const {
+  if (ranks == nullptr || dp_rank < 0 || dp_rank >= dp_size_ ||
+      head_class < 0 || head_class >= head_class_count_ || slice < 0 ||
+      slice >= split_) {
+    return false;
+  }
+  ranks->clear();
+  ranks->reserve(static_cast<size_t>(replica_count_));
+  for (int32_t replica = 0; replica < replica_count_; ++replica) {
+    const int32_t group_slot = replica * split_ + slice;
+    const int32_t cp_rank = group_slot / tp_redundancy_;
+    const int32_t offset_in_replica = group_slot % tp_redundancy_;
+    const int32_t tp_rank = head_class * tp_redundancy_ + offset_in_replica;
+    ranks->emplace_back(rank(dp_rank, cp_rank, tp_rank));
+  }
+  return true;
+}
+
+CanonicalBlock::CanonicalBlock(int32_t tokens_per_block, int32_t split)
+    : tokens_per_block_(tokens_per_block), split_(std::max(split, 1)) {}
+
+int64_t CanonicalBlock::block_of_token(int64_t token_index) const {
+  return token_index / tokens_per_block_;
+}
+
+int64_t CanonicalBlock::token_begin(int64_t block) const {
+  return block * tokens_per_block_;
+}
+
+int64_t CanonicalBlock::token_end(int64_t block) const {
+  return (block + 1) * tokens_per_block_;
+}
+
+int64_t CanonicalBlock::local_row(int64_t block) const {
+  return block / split_;
+}
+
+int64_t CanonicalBlock::canonical_of_row(int64_t row, int32_t slice) const {
+  return row * split_ + slice;
+}
+
+bool CanonicalBlock::owns(int64_t block, int32_t slice) const {
+  return block % split_ == slice;
+}
+
+}  // namespace xllm

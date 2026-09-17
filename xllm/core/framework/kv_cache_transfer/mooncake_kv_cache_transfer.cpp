@@ -27,7 +27,6 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_utils.h"
-#include "framework/kv_cache_transfer/push_route.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #include "util/net.h"
