@@ -74,7 +74,9 @@ struct CacheRowBases {
 // `unit * local_heads * head_bytes + (head - first_local_head) * head_bytes`,
 // a descriptor is accepted only when it provably describes that layout; the
 // span arithmetic is what makes the acceptance a proof rather than a
-// convention.
+// convention. A descriptor whose single span covers the whole cache resource
+// carries no head axis at all: it is accepted only for a group with one local
+// head, and which head that is comes from the rank that published it.
 class PeerDirectory final {
  public:
   // Interprets `manifest` and produces one view per published cache tensor.

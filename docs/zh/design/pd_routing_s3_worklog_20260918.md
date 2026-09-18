@@ -13,8 +13,8 @@
 |---|---|---|---|
 | S3-0 | **解除生产 TU 的编译阻塞**：镜像里 `<torch_npu/torch_npu.h>` 路径不符（真身在 `torch_npu/include/torch_npu/csrc/libs/torch_npu.h`）。做一个 include shim 后，让 `kv_cache_transfer.cpp` / `mooncake_kv_cache_transfer.cpp` 能在容器内编过 | 两个 TU 用真实 flags 编译成功（或证明失败发生在无关的第三方头） | ✅ 第 1 轮 |
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
-| S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具按 builder 公式手写，未链 torch；见第 3 轮说明） |
-| S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ☐ |
+| S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
+| S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
 | S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ☐ |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ☐ |
 
@@ -33,6 +33,13 @@
 6. 构建沙箱 `~/workspace/xllm-pdroute`：base `72e0ea817`（相关目录与基线 `200939593` 无差异），
    S2 文件靠 scp 同步；**权威副本是 git 分支 `pd-routing-s0s1`（origin）**。
 7. 容器镜像：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`。
+8. **torch 手编链接可用**（第 4 轮验证）：真实 `describe_cache_tensor` + `torch::zeros` 在容器内能编能链：
+   `-L<site-packages>/torch/lib -Wl,-rpath-link,<site-packages>/torch.libs
+   -Wl,-rpath,<torch/lib>:<torch.libs> -ltorch -ltorch_cpu -lc10`。
+   `torch.libs` 是必须的（`libtorch_cpu.so` 依赖的 openblas 需要里面的 `libgfortran-e1b7dfc8.so.5.0.0`，
+   少了会报未定义符号）。容器里 `import torch` 会失败（缺 NPU 运行时），所以路径从 compile flags 里的
+   `/torch/include` 反推，不要 import。harness 已支持：`s2_host_test.py` 的 `"torch": True` 目标
+   （`pd_route_integration_test`）。
 
 ## 2. 锁定决策（不要重开）
 
@@ -210,4 +217,58 @@ cache_directory_test 18/18 PASSED
   在"规范块 ↔ 请求 block id"换算落地前必须统一，否则无法判断请求里的 id 属于哪个 rank 的切片。
 - `bind` 的 `local_rank` 校验只覆盖 MAIN 命名空间；SPEC_DRAFT 视图填 `-1`（其描述符自带 placement，而坐标是
   MAIN 的），调用方需自行过滤边。
+
+### 2026-09-18（第 4 轮）——S3-3 ✅ 端到端 host 集成测试（真实 builder 输出）
+
+**新增**：`tests/core/framework/kv_cache_transfer/pd_route_integration_test.cpp`（4 个场景，全部逐字节比对）、
+`tests/.../CMakeLists.txt` 的 `pd_route_integration_test`（链接 `:kv_cache`，与 `cache_layout_builder_test` 同款），
+以及 harness 的 torch 目标（配方见 §1.8）。**S3-2 遗留的"真实 `describe_cache_tensor`"要求由此关闭。**
+
+链路：`torch::zeros` → 真实 `describe_cache_tensor` → manifest（字段赋值照抄 `register_kv_cache`）→
+`PeerDirectory::describe` → `PdRouteTable::build`/`validate` → `RouteBinder::bind` → host memcpy。
+
+**判别性设计**：期望值不由 bind 算出，而是"规范内容函数 + 目标侧自己的描述符"两条独立信息合成：
+
+- `content_byte(group, 资源, head, 子单元, 偏移)` 只依赖逻辑身份；
+- 每个字节的物理位置由**该侧描述符**的 span 推出（整资源 span 按其 head 轴展开）；
+- `资源 = row * split + slice` 由模型（`KvLayoutIndex` / `CanonicalBlock`）推出。
+⇒ 字节落到错的 (资源, head, 子单元, 偏移) 必然不匹配；没被写到的字节留在 poison 上也不匹配。
+
+| 场景 | 覆盖 |
+|---|---|
+| `AnchoredEqualSplitReproducesTheSourceLayout`（MLA，kv4 → kv4） | 等价锚点（handover 要求每步保留） |
+| `TargetSplitMismatchFoldsFourSlicesIntoTwo`（MLA，kv4 → kv2） | **目标形状** `S_P ≠ S_D`（旧路径不支持的形状） |
+| `ReverseSplitMismatchExpandsTwoSlicesIntoFour`（MLA，kv2 → kv4） | 发散方向：一个源切片扇出到两个目的切片 |
+| `ShardedHeadsReshardAcrossHeadClasses`（非 MLA，cp4/tp8/kv4 → cp4/tp4/kv2） | head class 交集（`H_l` 1→2）、indexer 全副本扇出、sequence-scoped SSM |
+
+MLA 场景每个都覆盖 4 个 role：KEY（MLA latent）、INDEX（全序列副本）、SSM（sequence-scoped）、
+CONV（**整资源打包行**）。非 MLA 场景不构造 CONV，因为那时 builder 会给出 COMPOSITE 描述符、规范路由按设计拒绝
+（`RejectsCompositeCacheGroups` 已断言）。
+
+**修正 S3-2 的一条结论（重要）**：整资源 span 的准入条件不是"`G == 1`"，而是"**本地只有 1 个 head**"，
+且**该 head 的身份来自 rank**（`head_class_of(tp_rank) * H_l`），不来自 span。原因：`describe_replicated_tensor`
+在 MLA 实例里会给**所有** role 整资源 span（`enable_mla` 分支最先命中），包括 SSM/CONV；这些 rank 物理上只持有
+自己的本地 head，而描述符的 `logical_offset` 恒为 0、无法表达"我持有哪个 head"。按旧规则（要求 `G == 1`）时
+MLA 实例下的 SSM/CONV 只有 rank 0 能通过，整条链路建不起来 —— 本轮第一次跑集成测试就撞上：
+`role 4, group 1: the descriptor holds head class 0 but tp rank 1 owns class 1`。
+现在 `H_l == 1` + rank 推出 `head_begin` ⇒ MLA 下的 SSM/CONV 可路由（两侧都必须 `H_l == 1`，否则报错要求
+producer 改成每 head 一个 span）。`H_l == 1` 这个限制同时保住了 CONV 的安全：只有一个 head 时资源内部没有 head
+顺序可言（打包的 key_a/key_b/value 作为一个整体搬运），不会猜错 component 布局。
+
+⇒ **结论修正：COMPOSITE（CONV）只在非 MLA 实例出现**（`enable_mla == false` 时 `describe_conv` 才可达）；
+MLA 实例里 CONV 走整资源路径，`H_l == 1` 时正确、`H_l > 1` 时被拒。
+
+**仍未覆盖 / 未验证**（文档继续标注）：
+
+- `MixedLayers`（同一 rank 上不同层的 role 集合不同）：夹具是单层；目录按 `(namespace, layer, role, group)`
+  查找，多层只是多几份拷贝，未单独建例。
+- `DpExpansion`（P DP1 → D DP4）：`RouteEdge` 不含 DP 维（F3 的设计），DP 展开在 S2 单测里已固定；本集成测试
+  只覆盖 DP=1。
+- `XTensor explicit_offsets` 的端到端：适配器字段由 `cache_directory_test`、字节 golden 由 `pd_route_test` 覆盖，
+  集成测试用的是按 stride 寻址的缓冲。
+- 真实运行时（RDMA / NPU / 真实调度 block id）仍未验证：GLM5.3flash 尚不支持 PD 分离（§1.3）。
+
+**验证汇总**（容器内，`~/pdroute_tools/s2_host_test.py`）：`kv_redundancy_test` 11/11、`pd_route_test` 12/12、
+`cache_directory_test` 19/19、`pd_route_integration_test` 4/4 **全绿**。
+搬运量打印：MLA kv4→kv4 6.6 MB、kv4→kv2 8.9 MB、kv2→kv4 6.6 MB、非 MLA 12.6 MB（含 indexer 全副本扇出）。
 

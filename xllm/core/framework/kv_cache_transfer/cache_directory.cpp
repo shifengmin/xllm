@@ -115,39 +115,37 @@ bool derive_head_geometry(const WorkerCacheLayoutManifest& manifest,
   const bool whole_resource = spans.size() == 1 &&
                               spans.front().repeat_count == 1 &&
                               head_bytes == tensor.resource_stride_bytes;
-  if (whole_resource && global_heads == kSingleHead) {
-    // One head, so the whole resource is that head's data and there is no head
-    // axis left to address: the row is `units` consecutive heads' worth of
-    // bytes. A wider group must publish per-head spans instead, because a
-    // single span cannot say which of its heads it holds.
-    if (units == 0 || tensor.resource_stride_bytes % units != 0 ||
-        spans.front().logical_offset_bytes != 0 ||
-        spans.front().owner_tp_rank != 0) {
+  if (whole_resource) {
+    // The descriptor gives no head axis: the whole resource is one local head's
+    // data, `units` sub-units of it. Requiring a single local head is what
+    // keeps the byte order inside the resource unconstrained -- with one head
+    // there is nothing to order -- which is also what makes a packed component
+    // layout (CONV) safe to move as one run. A group with more local heads has
+    // to publish one span per head instead.
+    if (local_heads != kSingleHead || units == 0 ||
+        tensor.resource_stride_bytes % units != 0) {
       set_error(error,
-                id +
-                    ": a whole-resource replica must be the single head of its "
-                    "group and cover a whole number of sub-units");
+                id + ": a whole-resource descriptor holds no head axis and " +
+                    std::to_string(local_heads) +
+                    " local heads; publish one span per local head instead");
+      return false;
+    }
+    // Which head it holds comes from the rank, because the descriptor cannot
+    // say: every replica of a whole resource publishes the same span.
+    int32_t head_begin = 0;
+    if (tensor.cache_namespace == CacheNamespace::MAIN) {
+      head_begin = manifest.coordinates.tp_rank / tp_redundancy;
+    } else if (global_heads != kSingleHead) {
+      set_error(error,
+                id + ": a whole-resource descriptor of a draft body whose rank "
+                     "is unknown cannot be placed in the global head range");
       return false;
     }
     geometry->head_bytes = tensor.resource_stride_bytes / units;
-    geometry->head_begin = 0;
+    geometry->head_begin = head_begin;
     geometry->local_head_count = kSingleHead;
     geometry->whole_resource = true;
     return true;
-  }
-
-  // The remaining ambiguous shape is a single span covering the whole resource:
-  // it is a whole-resource replica when the group has one head, and otherwise a
-  // one-head resource only if the span really is a single head's worth of one
-  // sub-unit. Anything else has no head axis to route by.
-  if (whole_resource && (local_heads != kSingleHead || units != 1)) {
-    set_error(error,
-              id +
-                  ": a whole-resource descriptor carries no head axis, so it "
-                  "cannot serve a group of " +
-                  std::to_string(global_heads) +
-                  " global heads; publish one span per local head instead");
-    return false;
   }
 
   if (spans.size() != static_cast<size_t>(local_heads)) {

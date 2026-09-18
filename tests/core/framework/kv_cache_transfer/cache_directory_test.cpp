@@ -743,36 +743,120 @@ TEST(PeerDirectoryTest, RejectsTheDescriptorOfAnotherRank) {
   EXPECT_NE(error.find("owns class"), std::string::npos) << error;
 }
 
-TEST(PeerDirectoryTest, RejectsAWholeResourceReplicaOfAMultiHeadGroup) {
-  // An MLA-style whole-resource descriptor says nothing about which heads it
-  // holds, so it cannot serve a group with more than one head.
-  const WorkerCacheLayoutManifest manifest = make_replicated_manifest(
-      /*tp_rank=*/0,
-      /*tp_size=*/8,
-      /*cp_rank=*/0,
-      /*cp_size=*/1,
-      /*kv_split_size=*/4,
-      kKeyRole,
-      /*group_id=*/0,
-      /*shape=*/{6513, 128, 1, 576},
-      /*rows_per_resource=*/1,
-      /*block_token_capacity=*/128);
+TEST(PeerDirectoryTest, DescribesAWholeResourceReplicaOfAReplicatedHeadGroup) {
+  // In an MLA instance every tensor goes through describe_replicated_tensor,
+  // so a linear-state slot arrives as a whole-resource span even though the
+  // group has eight global heads: each rank keeps exactly one of them, and the
+  // rank is what says which.
+  WorkerCacheLayoutManifest manifest;
+  set_coordinates(&manifest,
+                  /*tp_rank=*/3,
+                  /*tp_size=*/8,
+                  /*cp_rank=*/0,
+                  /*cp_size=*/1,
+                  /*kv_split_size=*/4);
+  CacheTensorManifest tensor;
+  tensor.role = kSsmRole;
+  tensor.group_id = kLinearGroup;
+  tensor.mooncake_buffer_id = 9;
+  tensor.block_token_capacity = 128;
+  set_geometry(&tensor,
+               /*shape=*/{8, 1, 4, 4},
+               kElementBytes,
+               /*rows_per_resource=*/1);
+  LogicalShardDescriptor descriptor;
+  descriptor.kind = LogicalShardKind::REPLICATED;
+  descriptor.resource_scope = CacheResourceScope::SEQUENCE;
+  descriptor.spans.emplace_back(make_span("SSM",
+                                          /*logical_offset=*/0,
+                                          /*physical_offset=*/0,
+                                          /*bytes_per_region=*/32,
+                                          /*repeat_count=*/1,
+                                          /*logical_stride=*/0,
+                                          /*physical_stride=*/0,
+                                          /*owner_tp_rank=*/0));
+  tensor.shard = std::move(descriptor);
+  manifest.tensors.emplace_back(std::move(tensor));
+
   const std::vector<CacheTensorDeclaration> declarations = {
-      make_declaration(kKeyRole,
-                       /*group_id=*/0,
+      make_declaration(kSsmRole,
+                       kLinearGroup,
                        /*cp_size=*/1,
                        /*tp_size=*/8,
                        /*kv_split_size=*/4,
                        /*tokens_per_block=*/128,
                        /*global_head_count=*/8,
                        /*head_bytes=*/0,
-                       /*sequence_scoped=*/false,
+                       /*sequence_scoped=*/true,
+                       /*full_sequence_replica=*/false)};
+  PeerDirectory directory;
+  std::string error;
+
+  ASSERT_TRUE(describe(manifest, declarations, &directory, &error)) << error;
+  const PeerCacheView* view =
+      directory.find(CacheNamespace::MAIN, 0, kSsmRole, kLinearGroup);
+  ASSERT_NE(view, nullptr);
+  // 32 bytes over one sub-unit is one value head of the linear state.
+  EXPECT_EQ(view->group.head_bytes, 32U);
+  EXPECT_EQ(view->entry.units_per_resource, 1U);
+  EXPECT_EQ(view->entry.resource_count, 8U);
+  KvRedundancy redundancy;
+  ASSERT_TRUE(
+      KvRedundancy::derive(view->topology, view->group, &redundancy, &error))
+      << error;
+  EXPECT_EQ(redundancy.local_head_count(), 1);
+  EXPECT_EQ(redundancy.head_class_count(), 8);
+}
+
+TEST(PeerDirectoryTest, RejectsAWholeResourceDescriptorWithSeveralLocalHeads) {
+  // The same shape over four TP ranks leaves two local heads per rank, and a
+  // whole-resource span cannot say how they are ordered.
+  WorkerCacheLayoutManifest manifest;
+  set_coordinates(&manifest,
+                  /*tp_rank=*/1,
+                  /*tp_size=*/4,
+                  /*cp_rank=*/0,
+                  /*cp_size=*/1,
+                  /*kv_split_size=*/4);
+  CacheTensorManifest tensor;
+  tensor.role = kSsmRole;
+  tensor.group_id = kLinearGroup;
+  tensor.mooncake_buffer_id = 9;
+  tensor.block_token_capacity = 128;
+  set_geometry(&tensor,
+               /*shape=*/{8, 2, 4, 4},
+               kElementBytes,
+               /*rows_per_resource=*/1);
+  LogicalShardDescriptor descriptor;
+  descriptor.kind = LogicalShardKind::REPLICATED;
+  descriptor.resource_scope = CacheResourceScope::SEQUENCE;
+  descriptor.spans.emplace_back(make_span("SSM",
+                                          /*logical_offset=*/0,
+                                          /*physical_offset=*/0,
+                                          /*bytes_per_region=*/64,
+                                          /*repeat_count=*/1,
+                                          /*logical_stride=*/0,
+                                          /*physical_stride=*/0,
+                                          /*owner_tp_rank=*/0));
+  tensor.shard = std::move(descriptor);
+  manifest.tensors.emplace_back(std::move(tensor));
+
+  const std::vector<CacheTensorDeclaration> declarations = {
+      make_declaration(kSsmRole,
+                       kLinearGroup,
+                       /*cp_size=*/1,
+                       /*tp_size=*/4,
+                       /*kv_split_size=*/4,
+                       /*tokens_per_block=*/128,
+                       /*global_head_count=*/8,
+                       /*head_bytes=*/0,
+                       /*sequence_scoped=*/true,
                        /*full_sequence_replica=*/false)};
   PeerDirectory directory;
   std::string error;
 
   EXPECT_FALSE(describe(manifest, declarations, &directory, &error));
-  EXPECT_NE(error.find("whole-resource"), std::string::npos) << error;
+  EXPECT_NE(error.find("one span per local head"), std::string::npos) << error;
 }
 
 TEST(PeerDirectoryTest, RejectsALayoutThatIsNotTokenMajor) {
