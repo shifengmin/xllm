@@ -960,4 +960,56 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 ### 建议次序
 
 A2（便宜且修的是"静默走错路径"）→ A1 → A3 → E1（受资源决策约束）→ 其余。
-**A 组不依赖实机，做完即到 PUSH 在 host 上的可验证上限；E 组才是"打通"二字的本体。**
+**A 组不依赖实机，做完即到 PUSH 上的可验证上限；E 组才是"打通"二字的本体。**
+
+### 2026-09-18（第 15 轮）——用户改向：**用 GLM-5.2（支持 PD 分离）+ 4 层减层模型做单机端到端验证**
+
+**(1) 用户指令（原文要点）**
+
+- 用 **GLM-5.2 python**（支持 PD 分离）端到端验证 **prefill/decode DCP 异构 + indexer full sequence** 的逻辑；
+- GLM-5.2 单实例占满单机、PD 需两机，"当前没有资源" ⇒ **抽一个 4 层减层模型，单机即可测**（后续确认：直接用现成的 4 层模型）。
+- GLM-5.2 **没有 linear 层**；linear（SSM/CONV 角色）的处理相对独立，等 glm-next 具备 PD 分离再说。
+
+⇒ 这条指令把 §5 的 **E 组（运行时真机验收）** 从"受 §1.3 阻塞"变成当前主线；A1（mock 单测）暂停。
+
+**(2) 本轮已完成的 A2（先落地，已提交 `d71abf6c0`）**
+
+`--pd_route=canonical` 之前**静默**让 PULL 走 legacy（`kv_cache_transfer.cpp:120-140` 无 canonical 分支）。
+现在加了 `pull_kv_blocks_canonical` 虚接口（基类默认 `LOG(ERROR)` + `false`）并在 `pull_kv_blocks_async` 分流；
+三个生产 TU 编译 rc=0。**dispatch 本身仍无单测**（要链 folly/torch/threadpool，见第 15 轮 A1 的否决结论）。
+
+**(3) A1 的"mock 引擎单测"路线**当轮否决**（证据）**
+
+- `KVPushSynchronizerImpl` = `NPULayerSynchronizerImpl`：构造函数**无条件** `aclrtCreateEventWithFlag` +
+  `aclrtGetCurrentContext` 并 `CHECK` 成功 ⇒ host 上任何派生 fake 构造即死；`synchronize_layer` 也**不是虚函数**。
+- 引擎侧可注入（`unique_ptr<MooncakeTransferEngine>` + 虚 `move_memory_regions`），但 `peer_cache_layout` 非虚
+  （可绕过：`set_peer_cache_layout` 是 public）+ 仍需链 `mooncake_transfer_engine.cpp`（mooncake/brpc/protobuf）。
+- ⇒ 要"纯 mock"必须给 NPU 运行时类加抽象接口，代价与不可验证性都太高。**改为**：把 canonical push 的编排抽成纯函数
+  （`plan_canonical_push`，落 `pd_route_transfer`，host 可测），glue 只剩 `synchronize_layer` + `move_memory_regions`。
+  **该重构本轮未开工**（被用户改向打断）。
+
+**(4) 环境侦察结论（本轮最有价值的产出，后续不用重查）**
+
+| 事实 | 值 |
+|---|---|
+| 空闲机型 | **jd-node-83 全空（16/16 chip free，~3GB/64GB 占用）**；.82 10/16 free；.99 7/16；.100 8/16；**98 已满（每 chip 61/64GB）** |
+| 卡 | 每机 8 NPU × 2 chip = 16 chip，64GB HBM/chip |
+| 减层模型 | `GLM-5.2-W8A8-EcoTech-4layers`：`num_hidden_layers=4`、`indexer_types=['full','full','full','shared']`、`num_nextn_predict_layers=0`。98 的 `/export/home/models/` 有（**symlink** 到 `../GLM-5.2-W8A8-EcoTech/`），CFS `/mnt/cfs/9n-das-admin/llm_models/GLM-5.2-W8A8-EcoTech-4layers` 有**真文件**（5 个 shard ≈ 20GB） |
+| CFS 权限漂移 | 83 上普通用户**读不了** CFS 该目录（`drwxr-x--- 1080`），容器内 root 可以；`/mnt/cfs` 本身在 83 可穿越 |
+| `/export/home` | **各机本地 xfs**（83 是 `/dev/md0`）⇒ 83 上没有 GLM-5.2 权重，只有 `-MTP` |
+| 现成 PD 配方（**已验证**，别人的） | `/export/home/shifengmin.3/workspace/glm5_2_pd/`：`README.md`（19KB 操作手册，root 600）、`start_prefill.sh`、`start_decode.sh`、`start_colocate_83.sh`、`test_smoke_83.sh`、`hccl_atb_env.sh`、`hook_aclcreate.so` |
+| 配方拓扑 | Prefill `cp_size=2, kv_split_size=2, tp=8`；Decode `dp_size=2, tp=8, layerwise_split_size=4`（`kv_split` 默认 1）⇒ **S_P=2 vs S_D=1 已是 DCP 异构** |
+| 管控面 | 83 容器 `fengmin-cann9-0801`：etcd `4389`、`xllm_master_serving` `48888/48889`（HTTP 口是 readiness，P+D 齐了才 listen）。**别杀** |
+| KV 后端 | `LlmDataDist`（layerwise 用；Mooncake 不兼容）/ **Mooncake（非 layerwise）** |
+| 配方已知坑（= S2/S3 要解决的） | ① Decode `layerwise>1` 时未持有层共享同一 scratch KV ⇒ Mooncake `registerLocalMemory` 重叠报错，需按 `data_ptr` 去重；② 去重后 P/D **buffer 数不匹配**（`local=234, remote=63`）⇒ `move_memory_groups` 要求两边 `buffers.size()` 相同，**逻辑 buf_id 与物理 MR 别名未对齐**；③ 结论：`layerwise=1` 时两边都是 234，legacy 路径能通 |
+| 构建树 | 98 上多棵树有可用 `build.ninja`，`ninja` 会**重跑 cmake 并成功**（§1.1 的"重配置不可用"只对某些容器成立）。`xllm-pdroute` = **我的探针树**（已含我的文件、ELF Sep 16、`glm5_2.py` 在）；README 那套来自 `xllm_coding/xllm`（HEAD `b448eb5a`，**仅 root 可见**，与我的基线不同源）；ccache 目录是**空的** |
+| 我的 delta 相对分支基线 `200939593` | **37 个文件，全部落在 kv_cache_transfer 层内**（+ `config/disagg_pd_config.*`、`kv_cache/cache_layout_builder.cpp`、`kv_cache/kv_cache_tensor_role.h`、测试、CMakeLists、设计文档）；**不含** `llm_engine.cpp` 等外部文件 ⇒ 移植成本低 |
+
+**(5) 本轮发现的疑点（等用户裁决，影响后续路线）**
+
+主线**本来就有** `kv_cache_transfer/push_route.{h,cpp}`（由 `feat: support heterogeneous qwen3.5 PD disaggregation. (#1995)`
+引入），被我的第一个提交 `9605a7c6a`（"drop dead routing code"）**删除**，`push_route_test.cpp` 一并删。
+而 README 那套 GLM-5.2 PD 依赖主线近期的 `align pd link_cluster with kv-split owners` / `gate pd link_cluster on
+tp-invariant kv cache` 两个提交。⇒ **"验证 P/D DCP 异构 + indexer full sequence"到底验哪条实现**：
+(a) 我这条 `--pd_route=canonical`；(b) 主线 `push_route` + link_cluster gating；(c) 只验这个**配置/语义**本身（不绑实现）。
+**未定，下一步先问清再动手**（编译 + 部署成本高，走错方向代价大）。
