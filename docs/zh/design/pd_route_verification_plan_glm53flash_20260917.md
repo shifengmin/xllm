@@ -387,6 +387,23 @@ P 侧 rank 0..7 的 `(h, t, c)`：
 | `DpExpansion_1to4` | P DP1 → D DP4 的 1→4 展开（F3） |
 | `X tensor_ExplicitOffsets` | `explicit_offsets = true` 形态 |
 
+**T5 实现状态（2026-09-18，S3-3）**：落在 `tests/core/framework/kv_cache_transfer/pd_route_integration_test.cpp`，
+链路是**真实张量 → 真实 `describe_cache_tensor` → manifest → `PeerDirectory` → `PdRouteTable` →
+`RouteBinder::bind` → memcpy**，期望值由"规范内容函数 + 目的侧描述符"独立合成（不经过 bind 的算路），
+因此是逐字节判别性校验。
+
+| 计划用例 | 实现情况 |
+|---|---|
+| `MlaLatent_S4toS2` | ✅ `TargetSplitMismatchFoldsFourSlicesIntoTwo`（MLA kv4 → kv2） |
+| `MlaLatent_S2toS4` | ✅ `ReverseSplitMismatchExpandsTwoSlicesIntoFour`（kv2 → kv4） |
+| `Indexer_S4toS2` | ✅ 每个场景都带 INDEX role（`S_eff=1`、全序列副本、多副本扇出） |
+| `Kda_Ssm_NoSplit` | ✅ 每个场景都带 SSM role（sequence-scoped；非 MLA 场景里 `H_l` 1→2，真正走 head class 切分） |
+| `Kda_Conv_NoSplit` | ⚠️ 只在 MLA 实例里覆盖（整资源打包行，`H_l == 1`）。非 MLA 实例的 CONV 是 COMPOSITE 描述符，规范路由**按设计拒绝**（`RejectsCompositeCacheGroups`） |
+| `MixedLayers` | ☐ 未建例：夹具单层；目录按 `(namespace, layer, role, group)` 查找，多层只是多份拷贝 |
+| `DpExpansion_1to4` | ☐ 未建例：`RouteEdge` 不含 DP 维（F3），展开逻辑在 S2 单测中已固定；集成测试覆盖 DP=1 |
+| `Xtensor_ExplicitOffsets` | ⚠️ 端到端未做：适配器字段由 `cache_directory_test`、字节 golden 由 `pd_route_test` T4 覆盖 |
+| 等价锚点 `S_P = S_D` | ✅ `AnchoredEqualSplitReproducesTheSourceLayout`（MLA kv4 → kv4） |
+
 ### 3.7 T6 真实 PD 验收（后续，非本次交付）
 
 GLM 5.3 flash 支持 PD 分离后：

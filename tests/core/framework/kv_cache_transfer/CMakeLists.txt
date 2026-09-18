@@ -44,6 +44,26 @@ cc_test(
     GTest::gtest_main
 )
 
+# Builds real cache tensors through the layout builder, so it links :kv_cache
+# like cache_layout_builder_test does.
+cc_test(
+  NAME
+    pd_route_integration_test
+  SRCS
+    pd_route_integration_test.cpp
+  DEPS
+    :cache_directory
+    :kv_cache
+    GTest::gtest_main
+)
+target_link_libraries(pd_route_integration_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 cc_test(
   NAME
     pd_topology_guard_test

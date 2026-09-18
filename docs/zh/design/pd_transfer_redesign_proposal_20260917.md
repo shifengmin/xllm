@@ -503,8 +503,8 @@ S <= D 且 D % S == 0       => S_eff = S
 
 **两个实现层面的发现**：
 
-1. **COMPOSITE（CONV）描述符无法用"每条边一个 head 区间"表达**：`describe_conv` 把 `conv_key_a` / `conv_key_b` / `conv_value` 打进同一行，各 component 的 head 空间彼此独立、物理偏移还带 component 偏移，而 `RouteBinder` 的寻址只认"一个 head 区间 × 单元步长"。适配器**显式拒绝**（不静默降级）。S3-4 需要二选一：COMPOSITE 组继续走旧 planner，或给 `RouteEdge` / `PeerCacheView` 增加 per-component 字节偏移。
-2. **整资源（whole-resource）描述符只对单 head 组可路由**：`describe_replicated_tensor` 只给一个覆盖整行的 span、不带 head 轴。适配器仅在 `G == 1` 时接受（MLA latent、indexer kPool 及其它无 head 轴 role 都满足），更宽的组必须改成每 head 一个 span。
+1. **COMPOSITE（CONV）描述符无法用"每条边一个 head 区间"表达**：`describe_conv` 把 `conv_key_a` / `conv_key_b` / `conv_value` 打进同一行，各 component 的 head 空间彼此独立、物理偏移还带 component 偏移，而 `RouteBinder` 的寻址只认"一个 head 区间 × 单元步长"。适配器**显式拒绝**（不静默降级）。S3-4 需要二选一：COMPOSITE 组继续走旧 planner，或给 `RouteEdge` / `PeerCacheView` 增加 per-component 字节偏移。**（第 4 轮补充：该分支只在 `enable_mla == false` 的实例可达；MLA 实例里 CONV 走整资源路径，见下。）**
+2. **整资源（whole-resource）描述符只在本地只有 1 个 head 时可路由**：`describe_replicated_tensor` 只给一个覆盖整行的 span、不带 head 轴，且 `logical_offset` 恒为 0，所以"我持有哪个 head"只能由 rank 推出（`head_class_of(tp_rank) × H_l`），准入条件是 `H_l == 1`。**（第 4 轮修正：第 3 轮曾写成"`G == 1`"，那样会让 MLA 实例下的 SSM/CONV 只有 rank 0 通过；详见第 4 轮进展。）**
 
 顺带给 `PeerCacheView` 增加了 `local_rank`（`cp_rank * tp_size + tp_rank`，未知为 `-1`）：`bind` 据此跳过不属于本源 rank 的边，并拒绝与 `dst_local_rank` 不符的目的视图，避免把区间落到别的 rank 的 buffer。S2 既有单测不受影响（默认 `-1` 即不校验）。
 
@@ -513,6 +513,35 @@ S <= D 且 D % S == 0       => S_eff = S
 夹具是**照 `cache_layout_builder.cpp` 公式手写的约定夹具**（host 侧手编回路不链接 torch），builder 本身由既有 `tests/core/framework/kv_cache/cache_layout_builder_test.cpp` 覆盖。真实构建里可再用 `torch::zeros` + `describe_cache_tensor` 生成 manifest 喂给适配器，属后续增强。
 
 **未决项**：manifest 里的 `coordinates.kv_split_rank`（运行时取 DCP 分组 rank）尚未与 `KvLayoutIndex::slice_of(cp_rank, tp_rank)` 对账。两者必须在"规范块 ↔ 请求 block id"换算落地前统一，否则无法判断请求里的 id 属于哪个 rank 的切片 —— 属 S3-4/S3-5。
+
+### S3-3 已完成（2026-09-18）：端到端 host 集成测试
+
+`tests/core/framework/kv_cache_transfer/pd_route_integration_test.cpp` 把整条链路跑通并**逐字节**校验：
+`torch::zeros` 造真实张量 → 真实 `describe_cache_tensor` → manifest（字段赋值照抄 `register_kv_cache`）→
+`PeerDirectory::describe` → `PdRouteTable::build`/`validate` → `RouteBinder::bind` → host `memcpy`。
+S3-2 遗留的"用真实 `describe_cache_tensor` 做 host 单测"由此关闭（容器内手编也能链 torch：见工作日志 §1.8）。
+
+期望值的设计是关键：它不是 bind 算出来的，而是"规范内容函数 + 目的侧自己的描述符"两条独立信息合成 ——
+字节内容只依赖 `(group, 规范资源, head, 子单元, 字节偏移)`，物理位置来自该侧描述符的 span，
+`规范资源 = row × split + slice` 来自模型。因此字节落到错的坐标必然不匹配，未被写到的字节留在 poison 上也不匹配。
+
+| 场景 | 覆盖 |
+|---|---|
+| MLA kv4 → kv4 | 等价锚点 |
+| MLA kv4 → kv2 | **目标形状**（`S_P ≠ S_D`） |
+| MLA kv2 → kv4 | 发散方向（一个源切片扇出到两个目的切片） |
+| 非 MLA cp4/tp8/kv4 → cp4/tp4/kv2 | head class 交集（`H_l` 1→2）+ indexer 全副本扇出 + sequence-scoped SSM |
+
+MLA 场景每个覆盖 KEY / INDEX / SSM / CONV 四个 role。**此处修正了 S3-2 的一条结论**：整资源 span 的准入条件
+是"本地只有 1 个 head"（`H_l == 1`）而不是"`G == 1`"，且 head 身份取自 rank —— MLA 实例下所有 role 都走
+`describe_replicated_tensor`，SSM/CONV 因此都是整资源 span；旧规则会让它们只有 rank 0 通过、链路根本建不起来。
+`H_l == 1` 同时保住了 CONV 的安全：单 head 时资源内部没有 head 顺序可言，打包的 component 作为整体搬运。
+⇒ **COMPOSITE（CONV）只在非 MLA 实例出现**；MLA 实例里 CONV 走整资源路径（`H_l == 1` 正确，`H_l > 1` 被拒）。
+
+仍未覆盖：`MixedLayers`（多层不同 role 集合）、`DpExpansion`（`RouteEdge` 不含 DP 维，S2 单测已固定）、
+XTensor `explicit_offsets` 的端到端（适配器与 T4 golden 已覆盖）、真实运行时（GLM5.3flash 尚不支持 PD 分离）。
+实跑结果：`kv_redundancy_test` 11/11、`pd_route_test` 12/12、`cache_directory_test` 19/19、
+`pd_route_integration_test` 4/4。
 
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 
@@ -551,7 +580,8 @@ sudo docker run --rm --privileged \
 | 两侧独立推导边表出现分歧（实现/版本不一致） | `PdRouteTable::validate` 作为两侧互相断言；拓扑元组进 `fingerprint`，不一致直接拒链 |
 | XTensor 页映射与规范块语义冲突 | `explicit_offsets` 作为 `BufferDirectoryEntry` 的一个标志位，规范层不感知；S1/S2 单测覆盖 XTensor 形态 |
 | sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
-| COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2） | 适配器显式拒绝而非静默降级；S3-4 决定"COMPOSITE 走旧 planner"还是"边表/视图增加 per-component 字节偏移" |
+| COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2/S3-3） | 只在非 MLA 实例可达（`enable_mla == false`）；适配器显式拒绝而非静默降级。S3-4 决定"COMPOSITE 走旧 planner"还是"边表/视图增加 per-component 字节偏移" |
+| MLA 实例下的 SSM/CONV 是整资源 span，只有 `H_l == 1` 时可路由 | 适配器按 `H_l == 1` 准入并从 rank 取 head 身份；`H_l > 1` 时报错要求 producer 改成每 head 一个 span（GLM5-next `TP8` + `linear_*_head_count = 8` 落在 `H_l == 1`） |
 | 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | 适配器暂不据此判断；S3-4/S3-5 落地"规范块 ↔ 请求 block id"换算前必须先统一，否则会静默错块 |
 | 建链收敛后，运行期新增对端无法建链 | 保留 on-demand 建链路径：`PdRouteTable` 可在运行期对新的拓扑元组补算边表 |
 

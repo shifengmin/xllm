@@ -346,13 +346,17 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 
 **S3 进展（2026-09-18，详见 `pd_routing_s3_worklog_20260918.md` 与 proposal §8.1）**：
 
-- ① **已完成**：`cache_directory.{h,cpp}` + `cache_directory_test.cpp`（18/18），并给出两条实现约束——
-  **COMPOSITE（CONV）描述符不在"每条边一个 head 区间"的表达范围内**（适配器显式拒绝，S3-4 需要决定走旧 planner
-  还是给边表加 per-component 偏移）；**整资源描述符只对 `G == 1` 的组可路由**。
+- ① **已完成**：`cache_directory.{h,cpp}` + `cache_directory_test.cpp`（19/19）与
+  `pd_route_integration_test.cpp`（4/4，真实 `describe_cache_tensor` + memcpy 逐字节），给出两条实现约束——
+  **COMPOSITE（CONV）描述符不在"每条边一个 head 区间"的表达范围内**（只在非 MLA 实例可达；适配器显式拒绝，
+  S3-4 需要决定走旧 planner 还是给边表加 per-component 偏移）；**整资源描述符只在本地 1 个 head 时可路由**
+  （`H_l == 1`，head 身份取自 rank）。MLA 实例下的 SSM/CONV 正是整资源形态，因此这条准入规则是链路能否建立的前提。
+- **S3-3 已完成**：链路 `真实张量 → describe_cache_tensor → manifest → PeerDirectory → PdRouteTable → bind → memcpy`
+  在 4 个场景（MLA kv4→kv4/kv4→kv2/kv2→kv4、非 MLA 头分片 cp4/tp8/kv4→cp4/tp4/kv2）逐字节正确。
 - 探针全部关闭（§6.1/6.2/6.3 见 §6），S3-0（torch_npu include shim）也已完成，生产 TU 可编译验证。
 - 未决：`coordinates.kv_split_rank`（运行时 DCP rank）与 `KvLayoutIndex::slice_of` 尚未对账，必须在
   "规范块 ↔ 请求 block id"换算落地前统一。
-- ② 数据面切换与 ③ 规范逻辑地址层**未开始**。
+- ② 数据面切换与 ③ 规范逻辑地址层**未开始**（S4/S5 的前置都已就绪）。
 
 **下一个会话的第一件事（建议顺序）**：
 
@@ -367,18 +371,21 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
     | `explicit_offsets` | `CacheTensorManifest::explicit_resource_offsets` |
     | `units_per_resource` | BLOCK 组取 `block_token_capacity`；SEQUENCE 组取 `physical_rows_per_resource` |
     | `topology.{cp,tp,kv_split}_size`、`tokens_per_block` | `ParallelCoordinates` / `options_.block_size()` |
-    | `group.global_head_count` | MLA/indexer 为 1；SSM 取 `linear_value_head_count`；KV 取 `kv_head_count`。**CONV 无法表达**（见下） |
+    | `group.global_head_count` | MLA/indexer 为 1；SSM 取 `linear_value_head_count`；KV 取 `kv_head_count`。**非 MLA 实例的 CONV 无法表达**（见下） |
     | `group.head_bytes` | 由描述符的 `bytes_per_region` 推出（整资源 span 则 `resource_stride_bytes / units`）；声明值非 0 时必须相符 |
     | `group.sequence_scoped` | `CacheResourceScope::SEQUENCE`，且必须与声明一致 |
     | `group.full_sequence_replica` | **只有 indexer kPool 声明 `true`**；MLA latent 声明 `false`（实测 KV 行数 `6513 = 26052/4` ⇒ `S_eff=4`）。此处原表格把二者混为一谈，已更正 |
     | `row_offsets` | 仅 `explicit_offsets` 时填，来自 `GlobalXTensor` 的页基点；非页映射张量给出基点即报错 |
 
-    **落地时新发现的两条约束**（详见 proposal §8.1）：
+    **落地时新发现的两条约束**（详见 proposal §8.1 与工作日志第 3、4 轮）：
     - `describe_conv` 的 **COMPOSITE 描述符**（`conv_key_a` / `conv_key_b` / `conv_value` 混在一行）不落在
       "每条边一个 head 区间"的表达范围内，适配器**显式拒绝**；S3-4 需决定 COMPOSITE 组继续走旧 planner
-      还是给边表加 per-component 字节偏移。
-    - **整资源（whole-resource）描述符只对 `G == 1` 的组可路由**（它不带 head 轴）。
-3. 然后按 S3 → S4 → S5 推进；每一步都保持 `S_P = S_D` 的退化配置作为等价锚点。
+      还是给边表加 per-component 字节偏移。该分支**只在非 MLA 实例可达**（`enable_mla == true` 时先命中
+      replicated 分支）。
+    - **整资源（whole-resource）描述符只在本地 1 个 head 时可路由**（`H_l == 1`）：它不带 head 轴，
+      head 身份只能由 rank 推出。MLA 实例下 SSM/CONV 也是整资源 span，所以这条规则决定链路能否建立。
+3. 然后按 S3 → S4 → S5 推进；每一步都保持 `S_P = S_D` 的退化配置作为等价锚点（已在
+   `pd_route_integration_test.cpp` 里固化为第一个场景）。
 
 **已锁定的决策（不要再翻）**：
 - `S_eff` 不匹配时**报错**，不静默退 1；语义性全序列保留必须显式声明（`sequence_scoped` / `full_sequence_replica`）；
