@@ -1268,3 +1268,198 @@ D：brpc `29994+`、transfer `47100+`、disagg `9878`、master `19888`。
   合入前要么删掉、要么按规范改写。
 - 树上未跟踪残留：`third_party/dependencies.sh`、`xllm/core/framework/kv_cache_transfer/push_route.{h,cpp}`
   （CMake 不引用它们，**不参与编译**，属主线遗留副本）。
+
+---
+
+## 第 19 轮（2026-09-18 14:40–15:05）：链接缺陷（真 bug）修复；构建复跑中；GitHub 分叉的真相
+
+### (1) **本轮的硬产出：发现并修复我分支里一个真实缺陷**（之前一直没暴露）
+
+第 18 轮的全量编译跑到 `[1396/1396]` **全部编译通过**，但**链接失败**：
+
+```
+FAILED: build/lib.linux-aarch64-cpython-311/xllm/xllm
+/usr/bin/ld: kv_cache_transfer.cpp: undefined reference to `xllm::pd_route_mode_name(xllm::PdRouteMode)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::declare_cache_group(...)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::PeerDirectory::describe(...)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::canonical_blocks_of_request(...)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::build_route_peer(...)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::PdRouteTransfer::plan(...)'
+mooncake_kv_cache_transfer.cpp: undefined reference to `xllm::flatten_route_for_layers(...)'
+collect2: error: ld returned 1 exit status
+```
+
+**根因**（不是"符号没写"，`pd_route_mode_name` 定义在 `pd_route_transfer.cpp:331`，7 个符号全都存在）：
+
+`xllm/core/framework/kv_cache_transfer/CMakeLists.txt` 里
+`pd_route_table` / `route_binder` / `cache_directory` / `pd_route_transfer` **四个 `cc_library` 都声明了**，
+但**最后一个 `kv_cache_transfer` 目标的 DEPS 里一个都没引用**。
+CMake 里没有依赖边的静态库**根本不会被 ninja 构建** ⇒
+`pd_route_transfer.cpp` / `cache_directory.cpp` / `pd_route_table.cpp` / `route_binder.cpp`
+**四个实现文件从未被编译**（`.o` 不存在，`find`/`ar t` 全查不到），
+只有头文件参与编译，所以语法检查**全过** ⇒ 直到链接才炸。
+
+**为什么以前没发现**：第 15/17 轮只做了"3 个生产 TU 编译 rc=0"，**从来没有链接过**。
+这是"编译通过 ≠ 能跑"的教科书案例。
+
+**修复**（一行，`CMakeLists.txt` 的第 147 行前后）：
+
+```diff
+   SRCS
+     ...
+     $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.cpp>
+   DEPS
++    :pd_route_transfer
+     :cache_layout
+     :common
+```
+
+（`:pd_route_transfer` 自己 DEPS `:cache_directory` / `:kv_redundancy` / `:pd_route_table` / `:route_binder`，
+`:cache_directory` 又 DEPS `:cache_layout` / `:route_binder` / `:pd_route_table` ⇒ 一条边足够，传递闭包覆盖全部 7 个符号。）
+备份文件：`CMakeLists.txt.bak-r18`（同目录）。
+
+### (2) **另一个坑：构建期间提交会让 bdist_wheel 挂掉**（自伤，已记牢）
+
+第 18 轮第一次构建时，`setup.py build` 编译成功后我**提交了 round-18 工作日志**，
+repo HEAD 从 `d68d7eda2` → `ac972b728`。随后脚本里的 `bdist_wheel` 再跑一遍
+`utils.py:_ensure_xllm_ops_rebuild_state()`：
+
+```
+ℹ️ Installed xllm_ops marker does not match third_party/xllm_ops HEAD. A rebuild is required.
+   installed git HEAD: d68d7eda22de090ef84e8e17eb406705772b8e22
+   source git HEAD:    ac972b7284fa44c6b71b8d4fb3323a353de1820d
+```
+
+⇒ marker 与 HEAD 不匹配 ⇒ 重新触发预编译 ⇒ `third_party/xllm_ops/build.sh` 不存在 ⇒ cmake `error 127`。
+
+**结论/规矩**：
+- `xllm_ops` 门的输入是 **repo HEAD**（`git -C third_party/xllm_ops rev-parse HEAD` 会向上冒泡到本仓）。
+  **构建期间不要 commit / checkout / rebase。**
+- 如果非要动，动完**立刻**把 `$ASCEND_OPP_PATH/vendors/custom_xllm_math/.xllm_ops_git_head`
+  写成**新的** HEAD，再进行下一次 `setup.py`（`utils.py` 也会读这个 marker 来决定是否 pop 环境变量）。
+- 重跑只需要跑 `setup.py build` + `bdist_wheel`，**不要**像 `std_build.sh` 那样
+  `rm -rf CMakeFiles`（那会把 1396 个 `.o` 全丢掉、退化成全量重编）。本轮用的是 `resume_build.sh`（不删任何东西）。
+
+### (3) 当前构建状态（**续接点**）
+
+- 脚本：`~/work/resume_build.sh`（本机）→ 容器内 `/tmp/resume_build_inner.sh`，日志 `/tmp/std_build_resume.log`。
+- 它做的事：① 把 ops marker 对齐到当前 HEAD（`ac972b728`）② 导出第 18 轮那套环境（`PYTHON_EXECUTABLE`
+  /`PYTORCH_NPU_INSTALL_PATH`/`MAX_JOBS=12`/`XLLM_OPS_GIT_HEAD_CACHED`）③ `setup.py build --device npu`
+  ④ `setup.py bdist_wheel --device npu` ⑤ `ls -l dist/*.whl`。
+- 15:00 时进度 **`[697/1380]`**，`undefined reference` 计数 **0**，无 `error:`（CMakeLists 变更导致 reconfigure，
+  目标数从 1396 变 1380，许多 TU 被重编）。
+- 等待器：本机后台 job 跑 `~/work/wait_build2.sh`（每 20s 查 `WHEEL_EXIT`，最多 100 分钟）。
+- 产物预期：`$TREE/build/lib.linux-aarch64-cpython-311/xllm/xllm`（ELF，带 debug 约 **559MB**）+
+  `$TREE/dist/xllm_npu_torch2_9_0-*.whl`。
+
+### (4) GitHub 远端分叉的真相（**虚惊一场，不要 force push**）
+
+`git fetch shifengmin` 在重试 **~39 次**后成功（GitHub SSH 大量 `message authentication code incorrect`，
+小流量 `ls-remote` 有时能过、`fetch` 的 pack 传输几乎必挂；试过 `IPQoS=0`/换 MAC/关压缩，只有
+`-o IPQoS=0 -o TCPKeepAlive=yes` 偶尔能过）。fetch 后看清：
+
+| | commit | 内容 |
+|---|---|---|
+| GitHub `pd-routing-s0s1` tip | `8ac7b411b` | **只改工作日志**，追加第 16+17 轮（+129 行）|
+| 它上面一个 | `e057637a8` | 同样只改工作日志（第 16 轮）|
+| 我本地 tip | `ac972b728` | **只改工作日志**，追加第 18 轮（+126 行）|
+| **共同基点** | `d68d7eda2` | 文件到第 1013 行完全相同（第 15 轮末尾）|
+
+⇒ **两边都是在同一个基点上"往文件尾部追加"**，只是分别发生在**不同的 clone**（所以 `8ac7b411b`
+在本树对象库里原本不存在）。**两边都是文档，没有任何内容冲突**，只是追加位置相同。
+
+**处置（下次做）**：把本地那**唯一一个** commit rebase 到远端之上，冲突时取"远端文件 + 追加第 18/19 轮"，
+结果 = 第 15→16→17→18→19 轮连续完整，且 push 是 **fast-forward，无需 force**：
+
+```bash
+cd $TREE
+git stash push -- scripts/build_support/utils.py       # 保住 PDROUTE_BUILD_ONLY_BYPASS
+git rebase --onto 8ac7b411b d68d7eda2 pd-routing-s0s1  # 只 replay ac972b728
+#   冲突时：git checkout 8ac7b411b -- <worklog>，再把本轮文本追加进去，然后 git add + git rebase --continue
+git stash pop
+# 然后把 ops marker 重新对齐到新 HEAD（见 (2)），再 push
+GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ControlPath=none -o IPQoS=0 -o TCPKeepAlive=yes" \
+  git push shifengmin pd-routing-s0s1
+```
+
+**注意**：rebase 会改 HEAD ⇒ **必须在构建结束之后再做**（见 (2)）。
+
+### (5) 字节级验证的落地设计（代码已写好，等跑通就插桩）
+
+判据**不依赖我自己的路由代码**，而是用 **token 语义**：
+
+> `DECODE.physical_block[r]  ==  PREFILL(dcp_rank = r % S).physical_block[r // S]`
+
+推导：`KVShardLayout` 里 `localize_slots()` 返回的物理块号 = **逻辑块号**；
+canonical block = `logical * S + slice`（`cache_directory.h` 注释：
+"A block-scoped group's id names one *logical* block, which spans `kv_split_size` canonical blocks"）。
+所以 P（S=2）rank 上物理块 `b` 装的是 canonical `2b+j`；D（S=1）物理块 `r` 装的是 canonical `r`。
+并且 P 的 `tp_rank = rank % 2`、`dcp_rank = rank // 2` ⇒ D 的 rank `d` 对应
+`prefill_rank = (r % 2) * 2 + (d % 2)`。
+
+已写好的两个文件（在本机 `~/work/pdtrace/`，**未提交**）：
+
+- `_pd_trace.py`：env `XLLM_PD_TRACE_DIR` 开关；每个 rank 每层每个 slot（`key/value/index/conv/ssm/indexer_scale`）
+  逐**物理块**算 sha256 写 JSONL，行内含 role/rank/layer/slot/shape/dtype/block/nbytes/sha256；
+  从 `/proc/self/cmdline` 解析 `instance_role/node_rank/kv_split_size` 做身份；
+  `XLLM_PD_TRACE_BLOCKS`（默认 64）限制每张量哈希的块数，避免拖慢。
+- `compare_kv.py`：按上式比对，输出 match rate、per-slot 统计、首批 mismatch 明细。
+- `executor_hook_tail.py`：**追加到** `xllm/python/model_executor/executor.py` 末尾的临时代码，
+  包一层 `ModelExecutor.execute`（前后各 dump 一次 + `bump()`）。取
+  `P = prefill 调用后的 after dump`、`D = decode 调用前的 before dump`（两者数据都稳定）。
+- 用完必须**删掉**这个 tail + `_pd_trace.py`（或明确标注为验证专用）。
+
+### (6) 部署路线（98 → 83，已验证通路）
+
+- **CFS 不共享**：`/mnt/cfs/9n-das-admin` 在 98 和 83 上都可写，但**互相看不到**对方写的文件
+  （各机自己的挂载）⇒ 不能当中转盘。
+- **98 → 83 直连 SSH 可用**：`ssh -i /export/home/shifengmin.3/.ssh/id_rsa -o IdentitiesOnly=yes
+  shifengmin.3@11.87.191.83` 从 98 上直接通。
+- 脚本已写好（本机 `~/work/`）：
+  - `deploy_stage98.sh`：容器内 → 98 host `/tmp`（wheel + `libasio.so`）→ scp 到 83 `/tmp` → 两边 `md5sum` 对比。
+  - `deploy_install83.sh`：83 host → `docker cp` 进 `fengmin-pdroute-83` → `pip install --force-reinstall --no-deps`
+    → 校验 `$SP/xllm/xllm`、`$SP/xllm/python/models/glm5_2.py`、`$SP/xllm/libasio.so`，
+    并确认新 ELF 的 `--help` 里有 **`--pd_route`**。
+  - 参照别人的教训：大文件用 `ssh cat` 比 `scp` 稳（`scp` 中断会出"Wheel is invalid"）；装完若报
+    `libasio.so: cannot open shared object file`，把 `libasio.so` 放到 `LD_LIBRARY_PATH` 里
+    （`/export/home/shifengmin.3/workspace/pdroute83/lib/`）。
+- **`libasio.so` 的位置**：`$TREE/build/cmake.linux-aarch64-cpython-311/mooncake-common/libasio.so`。
+
+### (7) 83 侧脚手架（已上传到 `/export/home/shifengmin.3/workspace/pdroute83/`）
+
+`env.sh`、`start_workers.sh`（decode 先起、8s 后 prefill；`--npu_kernel_backend=TORCH`；`--pd_route=$PD_ROUTE`）、
+`stop_workers.sh`（按 ELF 路径匹配，避免自杀）、`watch.sh`（扫 `Brpc Server started` + etcd keys）、
+`smoke.sh`（先 `/v1/models` 再 chat）、`npu_init.sh`、`preflight.sh`、`start_control.sh`、
+`run_all.sh`（停残留 → 起管控面 → 起 P/D → 等 300s → 报告）、`check_env2.sh`、`check_env3.sh`。
+
+要点：端口 **5389/58888/58889**（避开别人在跑的 4389/48888/48889，**别杀**）；
+P：brpc `28994+`、transfer `46100+`、disagg `9877`、master `18888`、`HCCL_IF_BASE_PORT=48439`；
+D：brpc `29994+`、transfer `47100+`、disagg `9878`、master `19888`、`HCCL_IF_BASE_PORT=48539`；
+`unset HCCL_OP_EXPANSION_MODE`（不走 AIV ⇒ 不需要 ranktable）；容器内**没有 `ss`**（`start_control.sh` 已改成回退 netstat/跳过）。
+
+### (8) 83 预检结论（已核实）
+
+16/16 chip 空闲（~3GB/64GB）；`hccn address_0=11.83.191.11`；`torch 2.9.0+cpu` / `torch_npu 2.9.0.post2`，16 卡；
+4 层模型 181 个 shard + tokenizer 齐；`custom_xllm_math`（135MB）已从 `fengmin-cann9-0801` 复制进我的容器，
+两边 vendor 集合**完全一致**（只有 `custom_transformer` + `custom_xllm_math`；
+python 路径期望的 `glm_next_transformer` 缺失是**安全 no-op**）；
+`etcd` / `xllm_master_serving` 二进制在位；`/usr/lib64/libtcmalloc.so.4` 存在；**xllm 包尚未安装**。
+
+### (9) 续接清单（按顺序）
+
+1. 等 `wait_build2.sh` 报 `WHEEL_EXIT=0`；若链接仍报 undefined，先查是不是又没被链接（`ar t` 看 archive）。
+2. `rrun ... < deploy_stage98.sh` → `rrun -F ~/work/.ssh-xllm-nocm jd-node-83 < deploy_install83.sh`
+   （注意 `deploy_install83.sh` 是**在 83 的 host 上**跑，不是容器里）。
+3. 83 容器内：`bash npu_init.sh 0,1,2,3,4,5`（重启后必须）→ `bash run_all.sh`。
+4. 就绪后 `bash smoke.sh`（先 `/v1/models` 拿真实 model 名）。
+5. 通了之后再插桩做字节比对：把 `_pd_trace.py` 装到 83 的 `$SP/xllm/python/`，把 `executor_hook_tail.py`
+   追加到 `$SP/xllm/python/model_executor/executor.py`，`export XLLM_PD_TRACE_DIR=...`，重跑，
+   `python3 compare_kv.py <dir>`。
+6. 最后（**构建空闲时**）做 (4) 的 rebase + push，并把本机 `~/work/pdtrace/` 之外的工具一起归档说明。
+
+### (10) 仍未清掉的树上残留（合入前必须处理）
+
+- `scripts/build_support/utils.py` 里的 `PDROUTE_BUILD_ONLY_BYPASS`（子模块门早返回）**未提交**。
+- `xllm/core/framework/kv_cache_transfer/CMakeLists.txt.bak-r18`（我本轮建的备份）。
+- 未跟踪残留：`third_party/dependencies.sh`、`push_route.{h,cpp}`（CMake 不引用、不参与编译）。
+- `~/work/pdtrace/` 三个文件是**验证专用**，不要直接合进主线（或明确标注）。
