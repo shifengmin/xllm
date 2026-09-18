@@ -1,14 +1,17 @@
-# PD 路由重构 · 交接说明（S0/S1 已落地，S2 待做）
+# PD 路由重构 · 交接说明（S0/S1/S2 已落地，下一步 S3）
 
 ## 0. 一句话现状
 
-按「KV 冗余模型」重写 PD 传输路由的**前两步已实现并在开发机上验证通过**：删掉了两套死代码，
-新增了零依赖的 `(h, t, c)` 纯算术层 + 10 个穷举单测。**下一步是 S2：新增 `PdRouteTable` /
-`RouteBinder` / `BufferDirectory`，与旧计划器并行跑逐边比对。**
+按「KV 冗余模型」重写 PD 传输路由的**前三步已实现并在开发机容器内验证通过**：删掉两套死代码，
+新增零依赖的 `(h, t, c)` 纯算术层（L1）与**规范块边表 + 绑定层（L2/L3）**，
+host 侧 23 个用例全绿。**但新层目前没有任何生产调用点**：`PdRouteTable` / `RouteBinder`
+只被单测引用，生产仍是旧计划器。**下一步是 S3：接入并切换数据面**（先 PULL 后 PUSH），
+同时引入规范逻辑地址层；S2 原定的"与旧计划器逐边比对"已按 §7.1 取消。
 
-- 日期：2026-09-17
-- 本地基线：`200939593`（detached HEAD）
-- 存档分支：`pd-routing-s0s1`（本地，未 push）
+- 日期：2026-09-17（S0/S1）→ 2026-09-18（S2）
+- 基线：`200939593`
+- 存档分支：`pd-routing-s0s1` = `9605a7c6a`（S0/S1）+ `abfcdc422`（S2），**已 push 到
+  `origin`（`git@github.com:shifengmin/xllm.git`）**
 
 ---
 
@@ -298,12 +301,59 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 
 **顺序原则不变**：S3 之前不要同时改 `block_size` 语义（那是独立的 S6）。
 
+### 7.4 未完成清单与下一个会话的起点
+
+**最重要的前提**：S2 只交付了 L1/L2/L3 与 host 验证，`PdRouteTable` / `RouteBinder` 在
+`xllm/` 下的**生产调用点为 0**（`grep -rn "PdRouteTable\|RouteBinder" xllm | grep -v kv_cache_transfer/` 为空）。
+所以"端到端 PD 测试"目前**不可能**跑：既没有接线，目标模型也还不支持 PD 分离。
+
+| 剩余 | 内容 | 前置 |
+|---|---|---|
+| **S3** | ① 写 manifest → `PeerCacheView` 适配器；② 统一入口 `KVCacheTransfer::transfer(edges, canonical_blocks, opcode)`，先切 PULL 再切 PUSH；③ 引入规范逻辑地址层（`logical_offset` 改规范块坐标，`bind` 只做物理换算） | S2 ✅ |
+| **S4** | 删旧路径（§7.1 的 D1/D2/D3）、删 `rank_local_mapping`、`SetCachePeer` 去掉 mode/plan、建链收敛 | S3 |
+| **S5** | 门禁提前：`PdTopo` → 完整 `KvTopology`，`KvRedundancy::derive` 在建链前报 C1/C2 与 `B_token` 不一致 | S3 |
+| **S6（可选、独立）** | 解除 `block_size × kv_split_size` 绑定（`llm_engine.cpp:653`），触及 BlockManager / prefix cache 哈希 | S3 之后独立评估 |
+| **探针** | §6.1 index 行数比、§6.2 kPool 打包宽度（128 / 257）、§6.3 `filter_kv_split_infos` 是否真被跳过 | 需要真实实例 |
+| **T6** | 真实 PD 逐 `(block, group)` 字节/校验和验收 | **GLM5.3flash 尚不支持 PD 分离** |
+
+**下一个会话的第一件事（建议顺序）**：
+
+1. 复跑一次 S2 的 host 测试，确认环境仍然可用（命令见 §7.3）。若 `s2_host_test.py` 不在，
+   用 §5.11 的规则重建（`compile_commands.json` 取 flags + 最小链接 gtest）。
+2. 写适配器：从 `CacheTensorManifest` 生成 `BufferDirectoryEntry` + `PeerCacheView`。字段对应关系：
+
+    | L3 字段 | 来源 |
+    |---|---|
+    | `buffer_id` | `CacheTensorManifest::mooncake_buffer_id` |
+    | `resource_count` / `resource_stride_bytes` / `buffer_bytes` | 同名字段 |
+    | `explicit_offsets` | `CacheTensorManifest::explicit_resource_offsets` |
+    | `units_per_resource` | BLOCK 组取 `block_token_capacity`；SEQUENCE 组取 `physical_rows_per_resource` |
+    | `topology.{cp,tp,kv_split}_size`、`tokens_per_block` | `ParallelCoordinates` / `options_.block_size()` |
+    | `group.global_head_count` | MLA/indexer 为 1；CONV/SSM 取 `linear_*_head_count`；KV 取 `kv_head_count` |
+    | `group.head_bytes` | 由 `bytes_per_head`（`describe_*` 里已算好）或 shape/stride 推导 |
+    | `group.sequence_scoped` | `CacheResourceScope::SEQUENCE` |
+    | `group.full_sequence_replica` | `enable_mla` 分支（MLA/indexer）当前都应声明 |
+    | `row_offsets` | 仅 `explicit_offsets` 时填，来自 `GlobalXTensor` 的页基点 |
+
+   注意：适配器是"S3 的第一块砖"，它一旦落地，S2 的三层就真正进入生产路径。
+3. 然后按 S3 → S4 → S5 推进；每一步都保持 `S_P = S_D` 的退化配置作为等价锚点。
+
+**已锁定的决策（不要再翻）**：
+- `S_eff` 不匹配时**报错**，不静默退 1；语义性全序列保留必须显式声明（`sequence_scoped` / `full_sequence_replica`）；
+- `full_sequence_replica` 承载 indexer kPool（同组内 MLA latent 与 indexer 的 `S_eff` 不同）；
+- 取消"与旧 ReshardPlanner 逐边比对"（原因见 §7.1），S2 验收 = golden + mock；
+- F1 的 `EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff > 1)` 断言作废。
+
+**环境禁忌（详见 §5.10–5.12）**：不要指望 `ninja`/cmake 重配置；不要用 21:58 预编译树里的
+`libcommon.a`（坏档案）与 `-lcust_opapi`（镜像里没有）；新层只依赖标准库 + gtest，正是为了绕开这些。
+
 ## 8. 交接清单
 
 | 项 | 位置 |
 |---|---|
-| 本地改动（S0/S1，已提交） | `xllm` 仓库分支 **`pd-routing-s0s1`**（本地，未 push）。见 `git log -1 --format=%H pd-routing-s0s1`；subject：`refactor(kv_cache_transfer): add KV redundancy layer, drop dead routing code` |
-| 本地改动（S2，**尚未提交**） | 同一工作区：新增 `pd_route_table.{h,cpp}` / `route_binder.{h,cpp}` / `pd_route_test.cpp`，改 `kv_redundancy.{h,cpp}`、`kv_redundancy_test.cpp`、两处 `CMakeLists.txt`、本文档与另外两份设计文档 |
+| S0/S1（已提交） | `9605a7c6a`，subject：`refactor(kv_cache_transfer): add KV redundancy layer, drop dead routing code` |
+| S2（已提交并 push） | `abfcdc422`，subject：`refactor: resolve pd transfers through canonical block edges.`（14 files, +2013/-53） |
+| 分支 | **`pd-routing-s0s1`**，已 push 到 `origin` = `git@github.com:shifengmin/xllm.git`（upstream 已设）。Review 只见 S2 一笔：`https://github.com/shifengmin/xllm/compare/9605a7c6a...abfcdc422` |
 | 四份设计文档 + 本文 | `docs/zh/design/{kv_redundancy_model_and_pd_routing,pd_routing_simplification,pd_route_verification_plan_glm53flash,pd_transfer_redesign_proposal,pd_routing_handover}_20260917.md`（已随该 commit 一并提交） |
 | 开发机工作树（含改动 + 可手动编译） | jd-node-98 `~/workspace/xllm-pdroute` |
 | 开发机验证脚本 | jd-node-98 `~/pdroute_tools/`（S2 用 `s2_host_test.py`） |
@@ -314,8 +364,9 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 
 ```bash
 cd <xllm 仓库>
-git checkout pd-routing-s0s1          # 从 detached HEAD 切过来
-git log --oneline -1                  # refactor(kv_cache_transfer): add KV redundancy layer, ...
+git fetch origin pd-routing-s0s1      # 若换机器/换 clone
+git checkout pd-routing-s0s1
+git log --oneline -2                  # abfcdc422 (S2) -> 9605a7c6a (S0/S1) -> 200939593
 ```
 
 - 该分支基于 detached HEAD `200939593` 建立，**未 push**；
