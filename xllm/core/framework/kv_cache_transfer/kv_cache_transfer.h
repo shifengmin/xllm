@@ -83,6 +83,12 @@ class KVCacheTransfer {
 
   virtual void free_kv_cache() {};
 
+  // Which data plane this instance uses, resolved once when the transfer object
+  // is created. The two never fall back into each other: a route that cannot be
+  // built has to fail, not quietly remap blocks the legacy way.
+  void set_canonical_route(bool canonical) { canonical_route_ = canonical; }
+  bool canonical_route() const { return canonical_route_; }
+
   virtual void configure_cache_layout(const ParallelArgs& parallel_args,
                                       const ModelArgs& model_args,
                                       int32_t block_token_capacity,
@@ -142,6 +148,22 @@ class KVCacheTransfer {
       bool is_spec_draft,
       int32_t kv_split_rank,
       int32_t kv_split_size) = 0;
+
+  // The canonical data plane: moves the request's canonical blocks through the
+  // route tables instead of remapping the destination block ids by kv-split
+  // rank. Backends that do not publish per-layer buffers (XTensor) refuse.
+  virtual bool push_kv_blocks_canonical(
+      const std::vector<TransferKVInfo>& transfer_kv_infos,
+      const ParallelArgs& parallel_args,
+      std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+      bool is_spec_draft) {
+    (void)transfer_kv_infos;
+    (void)parallel_args;
+    (void)layer_synchronizer;
+    (void)is_spec_draft;
+    LOG(ERROR) << "This KV cache transfer backend has no canonical data plane.";
+    return false;
+  }
 #endif
 
  protected:
@@ -154,6 +176,9 @@ class KVCacheTransfer {
   static bool validate_transfer_mappings(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       int32_t kv_split_size);
+
+  // True when the canonical route is the data plane of this instance.
+  bool canonical_route_ = false;
 
   // working thread
   ThreadPool threadpool_{/*num_threads=*/1,
