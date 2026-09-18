@@ -915,3 +915,49 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
   （它是 `MooncakeKVCacheTransferDefault` 的成员，`MooncakeTransferEngine` 的方法是 virtual，理论上可派生 mock）；
 - 未覆盖的 T5 项：`MixedLayers`、`DpExpansion`、XTensor `explicit_offsets` 端到端；
 - `ContextParallelTopology` 的 DCP **组组成**判据（第 9 轮主动放弃）仍未钉死，与路由契约无关。
+
+## 5. 剩余工作清单（第 15 轮盘点，按"是否依赖实机"分组）
+
+用户要求先列清单再动工。下列每项都注明了**能否在本地/容器内闭合**。
+
+### A. 把 PUSH 的可验证性推到顶（**不依赖实机**，优先级最高）
+
+| # | 事项 | 为什么 | 闭合标准 |
+|---|---|---|---|
+| A2 | **`canonical` 下 PULL 静默走 legacy**（本轮新发现，见下） | 开关语义不自洽：`--pd_route=canonical` 只改了 PUSH，PULL 无分支 ⇒ 混合语义，且**静默** | canonical 下 PULL 要么显式拒绝（loud fail）要么接通；有单测钉住 |
+| A1 | 用 **mock `MooncakeTransferEngine`** 给 `push_kv_blocks_canonical` 做单测 | 它是唯一"编译过但没测过"的成员；其调用的纯函数都测过，但"串起来是否对"没测过 | 真实 `describe_cache_tensor` 造 manifest + mock 记录 `(addr, regions, opcode)`，断言逐层 byte region 集合 == 纯函数期望 |
+| A3 | 两处**读码假设**加运行时前哨 | ① `InstanceInfo.addrs` 下标 == 实例全局 rank；② 每个目的局部 rank 的 manifest 可 `peer_cache_layout` 取到。二者错了会**搬错字节**而不是报错 | 加 CHECK/计数+明确日志，使实机上第一时间炸掉；host 上用 mock 覆盖"缺失 manifest"分支 |
+| A4 | canonical ↔ legacy **等价性**再做交叉对照 | 目前只在 host 上跑过锚点与折叠场景，没跟 legacy 的纯函数（`filter_kv_split_infos`/`rotate_dst_rank`）对过 | 多拓扑（`S_P=S_D` 锚点、DP 扩张、TP 扩张）下逐块坐标一致 |
+
+**A2 的证据**（本轮核过）：`KVCacheTransfer::pull_kv_blocks_async`（`kv_cache_transfer.cpp:120-140`）
+**没有** `canonical_route_` 分支，直接调 `pull_kv_blocks`；全文件 `canonical` 只出现在 `:228`（PUSH 分流）
+与 `:320`（`set_canonical_route`）。⇒ 开着 canonical 的实例，PUSH 走新路径、PULL 走旧路径，
+且没有任何日志提示这一点。
+
+### B. PULL 方向（用户已停放，等指示）
+
+- B1 取回 `pd-routing-pull-wip`（`8526462c5`）→ 跑 host 全量 → 补 `src_addr → 源 DP 组` 定位的单测 → 决定是否并入主线。
+- B2 canonical 下 PULL 的语义与 A2 是同一处；做完 A2 再决定 B 的合并时机。
+
+### C. T5 覆盖面（host 可闭合）
+
+- C1 `MixedLayers`（同请求跨层组）；
+- C2 `DpExpansion`（`S_P ≠ S_D` 的扩张方向）；
+- C3 XTensor `explicit_offsets` 端到端 —— 当前**显式拒绝**（`canonical_ready_=false`）：要么支持，要么把"不支持"写进配置校验/文档，不能只留一条警告。
+
+### D. 交付物与文档
+
+- D1 **运维可见的适用范围**：哪些模型/拓扑/开关组合能开 canonical，不满足时在哪一行、以什么形式拒绝。
+- D2 `handover` / `redesign_proposal` 的状态回写（现在文档还停在 S2 口径）。
+- D3 写清"**验收 PUSH 需要什么**"：模型（需支持 PD 分离）、拓扑（prefill `cp4/tp8/kv4` × decode `dp4/cp1/tp2/kv2`）、字节比对方法。
+
+### E. 运行时验证（**唯一真正的验收**，受 §1.3 阻塞）
+
+- E1 最小路径：单机 co-located P/D，或**进程内两个引擎**（mock 引擎 + 真实 tensor）跑一次 canonical PUSH 字节比对 —— 不必等 PD-capable 模型。
+- E2 真机 PD：需一个支持 PD 分离的模型 + 上述拓扑。
+- E3 真机上与 legacy 做 A/B 字节对照。
+
+### 建议次序
+
+A2（便宜且修的是"静默走错路径"）→ A1 → A3 → E1（受资源决策约束）→ 其余。
+**A 组不依赖实机，做完即到 PUSH 在 host 上的可验证上限；E 组才是"打通"二字的本体。**
