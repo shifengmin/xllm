@@ -199,6 +199,10 @@ sudo docker run --rm --privileged \
    （实际在 `torch_npu/include/torch_npu/csrc/libs/torch_npu.h`）。
    → 任何包含 `platform/stream.h` 的生产 TU 都编不过。**这是环境问题，不是本次改动引入的**
    （已做对照实验：用同一套 flags 编译 `git show HEAD:` 的改动前同名文件，失败信息逐字相同）。
+   **2026-09-18 更新：已可绕过。** 建 `/tmp/torch_npu_shim/torch_npu/torch_npu.h`
+   （`#pragma once` + `#include "<真实路径>"`），在真实 flags 后加 `-I/tmp/torch_npu_shim`，
+   则 `kv_cache_transfer.cpp` 与 `mooncake_kv_cache_transfer.cpp` 都能编过（实测 rc=0）。
+   脚本：`~/pdroute_tools/probe_compile.py`（见 S3 工作日志）。
 9. 批量 `sed` 改 build 目录时**务必用 `grep -rIl`（大写 I 跳过二进制）** —— 否则会把
    `libopencv_core4.a` 这类静态库改坏。
 10. **CMake 重配置在这棵树里已经不可能成功**（2026-09-18 复核）：
