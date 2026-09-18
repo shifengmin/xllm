@@ -1142,3 +1142,129 @@ ninja 文件里所有源码路径都写死指向 `xllm-dcp-fp32`。⇒ **那次�
 3. 写 `start_workers.sh` + `smoke.sh`，`scp` 到 83，起 control(D) → P，做 smoke。
 4. 字节级验证探针（设计见第 16 轮 §(4).6）。
 5. 所有结论回写本文件并 push。
+
+---
+
+## 第 18 轮（2026-09-18 14:16–14:40）：标准构建打通；python+PD 的 DCP 契约彻底查清
+
+用户裁定：验 **(a) 我这条 `--pd_route=canonical`**，判据 = **KV 传输结果的字节级比对**。
+本轮把"标准构建"这条路彻底走通，并把 python 路径下 P/D 该怎么配查到了源码级。
+
+### (1) 三个"门"逐个解决（都写清了真因，后续不用重查）
+
+**(a) 依赖门**：`python setup.py build` 在 `dependencies.sh -y` 上 dnf 失败
+（`Unable to find a match: boost1.78-devel msgpack-devel` / `epel-release`）。
+**真因不是缺依赖**，而是 `utils.py:_get_required_dependency_files()` 检查的路径与安装路径**不一致**：
+它查 `/usr/local/lib/cmake/yalantinglibs/config.cmake`，而实际装在 `/usr/local/yalantinglibs/`。
+- 解法①：把 yalantinglibs 按标准 prefix 布局软链到 `/usr/local`
+  （`/usr/local/lib/cmake/yalantinglibs` → `…/yalantinglibs/lib/cmake/yalantinglibs`，以及 7 个 include 项）。
+- 解法②：装 **Go 1.25.9** 到 `/usr/local/go`。注意 `Mooncake/dependencies.sh` 的 `GOVER=1.25.9`，
+  而 `_is_mooncake_go_ready()` 要求**精确版本相等**（复制别的容器的 1.25.10 不行）；
+  `https://dl.google.com/go/go1.25.9.linux-arm64.tar.gz` 可达（55MB）。
+- 验收方式：直接调 utils.py 自己的函数 ⇒ `missing dependencies: NONE`、`go ready: True`。
+- 六个必查项（记下来）：yalantinglibs cmake config、zstd.h、libzstd.so、xxhash.h、libxxhash.so、msgpack.hpp。
+  本容器 zstd/xxhash 在 `/usr/include` + `/usr/lib64`，msgpack.hpp 在 `/usr/local/include`。
+
+**(b) xllm_ops 门**：`CMakeLists.txt:72` 的判据是
+`NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED`；
+`XLLM_OPS_GIT_HEAD` 由 `:51` 的 `execute_process` 得到（= `git -C third_party/xllm_ops rev-parse HEAD`，
+而该目录**不是真子模块**：真正的 `.git` 在 `third_party/xllm_ops/xllm_ops/.git`，内容指向不存在的
+`../../.git/modules/third_party/xllm_ops` ⇒ git 向上冒泡返回**本仓 HEAD**）。
+- cache 被删后只能靠 **env** 满足；但 `utils.py:665` 在 marker 不匹配时会 **主动 `os.environ.pop`** 该 env。
+- 且 `third_party/xllm_ops/build.sh` **不存在** ⇒ 一旦触发预编译即 `error code: 127`（假"编译成功"的真凶）。
+- **解法**：把 `$ASCEND_OPP_PATH/vendors/custom_xllm_math/.xllm_ops_git_head` 写成**当前 repo HEAD**
+  （= 一次成功预编译后 CMake 自己会写的内容；`CMakeLists.txt:106`）。ops 早已编译安装（`custom_xllm_math` 135MB）。
+- 注意：**marker 不是 CMake 读的**，读它的是 utils.py；CMake 只认 env/cache。两侧都要满足。
+
+**(c) CPU 过订阅**：`nproc=12`，原 `MAX_JOBS=64` ⇒ 改 `MAX_JOBS=12`。
+
+### (2) 设备映射（同机混布 P/D 的依据）
+
+`distributed_runtime/master.cpp:449` + `platform/device_name_utils.cpp:40`：
+`device_idx = node_rank % visible_device_count`，`visible_device_count = Platform::device_count()`
+（受 `ASCEND_RT_VISIBLE_DEVICES` 影响）。
+⇒ 同一容器里跑 P 和 D，**每个进程只暴露自己的那几张卡**即可：
+P `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`（nnodes=4，node_rank 0..3 → device 0..3）；
+D `=4,5`（nnodes=2，node_rank 0..1 → device 0..1 → 物理 4,5）。互不冲撞。
+
+### (3) 标志集（旧二进制 `--help` + 源码双重确认）
+
+存在：`--pd_route`（默认 `legacy`，取值 `legacy`/`canonical`）、`--kv_cache_transfer_mode`（PUSH/PULL）、
+`--communication_backend`、`--python_model_path`、`--enable_pd_ooc`、`--kv_push_dst_rotate`、
+`--model_impl`、`--backend`、`--host/--port/--master_node_addr/--etcd_addr`、`--nnodes/--node_rank`、
+`--cp_size/--dp_size/--kv_split_size`、`--npu_kernel_backend`（AUTO/ATB/TORCH）、
+`--enable_disagg_pd`、`--instance_role`、`--disagg_pd_port`、`--transfer_listen_port`、
+`--enable_prefix_cache`、`--enable_chunked_prefill`、`--enable_schedule_overlap`、
+`--max_memory_utilization`、`--block_size`、`--num_speculative_tokens`、`--draft_model`、`--indexer_cache_dtype`。
+**不存在**：`--layerwise_split_size`、`--kv_cache_transfer_type`、`--dispatch_policy`。
+（第 15 轮记录里"`communication_backend` 不在生产代码里"是**错的**——`--help` 里有；当时 grep 没覆盖到定义点。）
+
+### (4) python 路径的 DCP 契约（**本轮最重要的产出**，直接决定 P/D 配置）
+
+- `master.cpp:395 resolve_npu_kernel_backend_for_options()`：`--model_impl=python` **强制**
+  `npu_kernel_backend=TORCH`（并打日志）。⇒ 启动脚本直接传 `TORCH`（传 ATB 会被覆盖）。
+- `xllm.cpp:740`：python 路径期望的 OPP vendor 顺序是
+  `glm_next_transformer, custom_transformer, custom_xllm_math`；但 83 上与**已能跑通 GLM-5.2 的**
+  `fengmin-cann9-0801` 一致，只有 `custom_transformer` + `custom_xllm_math`（缺 `glm_next_transformer`
+  在该代码里是**安全 no-op**，因为只保留 `op_api/lib/libcust_opapi.so` 真实存在的 vendor）。
+- **DCP 契约**（`framework/parallel_state/context_parallel_topology.h` 注释即规范）：
+  `pcp_size = cp_size`，`dcp_size = kv_split_size_effective()`；`cp_rank` = PCP rank，`kv_split_rank` = DCP rank。
+  合法形状：`dcp_size | pcp_size`（partitions_pcp），或 `dcp_size == pcp_size * tp_size`（= dp_stride）。
+  `dcp_rank` = 物理 KV slice 的属主；`KVShardLayout.logical_block_size = physical_block_size * dcp_size`，
+  rank `r` 拥有每个逻辑块内 `[r*B, (r+1)*B)` 这一段。
+- **NPU 上不物化 dcp 通信组**：`collective_communicator.cpp:542` 的 dcp 组创建在
+  `if constexpr (Platform::is_mlu())` 里；另一处 NPU 创建分支（:586）显式写了 `!is_python_model_impl(...)`。
+  ⇒ python 侧 `distributed.dcp_group()` 恒为 `None`。
+- 因此 `xllm/python/model_executor/executor.py:74` 的 `SfaDcpAttentionBackend`（条件：
+  `cp_size == 1 && dcp_group is not None && dcp_group.size() > 1`）在 **NPU + python 下不可达**；
+  实际总是 `NpuPagedAttentionBackend`。**这不影响 PD 路由要从 P 搬到 D 的物理 KV 布局**（那是另一条路）。
+- **python 的 prefill KV 分片走另一条路**：`core/runtime/py_executor_impl.cpp:214` 要求
+  `enable_mla && cp_size > 1 && kv_split_size > 1`（且 prefill/chunked_prefill）才构建
+  `kv_shard_batch_metadata`，把 `new_cache_slots` 本地化到本 rank 的物理 slice。
+  ⇒ **P 侧必须 `cp_size > 1` 且 `kv_split_size > 1`**，否则根本不发生 DCP 分片。
+- `parallel_args.h:177 kv_split_rank()`：无 dcp_group 时退化为 `rank / (world_size / kv)`；
+  在 `partitions_pcp` 情形与拓扑 `dcp_rank` **完全一致**（P：`rank/2` → 0,0,1,1）。
+- D 侧（`kv_split=1`）不需要分片元数据；`worker_impl.cpp:1408` 只在 `dcp_group != nullptr` 时本地化槽位。
+
+### (5) 本轮确定的 P/D 配置（S_P=2 vs S_D=1，真异构）
+
+| 角色 | ranks | cp | dp | kv_split | tp | 可见卡 | S |
+|---|---|---|---|---|---|---|---|
+| PREFILL | 4 | 2 | 1 | 2 | 2 | 0,1,2,3 | **2** |
+| DECODE | 2 | 1 | 1 | 1 | 2 | 4,5 | **1** |
+
+拓扑推导（P）：`world=4, dp=1, pcp=2` ⇒ `tp = 4/(1*2) = 2`，`dp_stride = 2*2 = 4`；
+`dcp=2 ≤ pcp=2` 且 `2 % 2 == 0` ⇒ `partitions_pcp`；`pcp_per_dcp=1` ⇒ `dcp_rank = pcp_rank`，
+`kv_split_rank = rank/2`（0,0,1,1）✅ 两者一致。
+映射：P rank0/1（pcp=0, tp=0/1）持 slice 0；rank2/3（pcp=1）持 slice 1；
+D rank0/1（tp=0/1）各持**整块**。
+⇒ canonical 路由必须把**同一逻辑块的两个 P slice 拼成 D 的整块**（不是恒等搬），
+这正是要字节级验证的 reshard；`INDEX/INDEX_SCALE` 角色还带 `full_sequence_replica`（indexer full sequence）。
+
+### (6) 83 侧脚手架已落盘（`/export/home/shifengmin.3/workspace/pdroute83/`）
+
+`env.sh`、`start_workers.sh`（decode 先起、8s 后 prefill）、`stop_workers.sh`（按 ELF 路径匹配，避免自杀）、
+`watch.sh`（扫 `Brpc Server started`）、`smoke.sh`（先 `/v1/models` 再 chat）、`npu_init.sh`、`preflight.sh`、`start_control.sh`。
+端口 **5389 / 58888 / 58889**（避开别人在跑的 4389 / 48888 / 48889，**别杀**）。
+P：brpc `28994+`、transfer `46100+`、disagg `9877`、master `18888`；
+D：brpc `29994+`、transfer `47100+`、disagg `9878`、master `19888`。
+`HCCL_IF_BASE_PORT` P=48439 / D=48539 分开；`unset HCCL_OP_EXPANSION_MODE`（不走 AIV ⇒ 不需要 ranktable）。
+
+### (7) 83 预检结果
+
+16/16 chip 空闲（~3GB/64GB）；hccn `address_0=11.83.191.11`；torch 2.9.0+cpu / torch_npu 2.9.0.post2，16 卡；
+4 层模型 181 个 shard 齐全 + tokenizer；`custom_xllm_math` 已从 `fengmin-cann9-0801` 复制进我的容器
+（两边 vendor 集合一致）；`etcd` / `xllm_master_serving` 二进制在位；**xllm 包尚未安装**（等 wheel）。
+
+### (8) 构建状态
+
+`SKIP_TEST=1 python setup.py build --device npu` → 越过两个门后在编译，
+`[621/1396]`（12 核；ccache 目录空 ⇒ 全量编译，预计较久）。bdist_wheel 紧随其后。
+产物：`build/lib.linux-aarch64-cpython-311/xllm/xllm` + `dist/*.whl`。
+
+### (9) 仍需注意的树上残留
+
+- `scripts/build_support/utils.py` 里的 `PDROUTE_BUILD_ONLY_BYPASS`（子模块门早返回）**仍未提交**，
+  合入前要么删掉、要么按规范改写。
+- 树上未跟踪残留：`third_party/dependencies.sh`、`xllm/core/framework/kv_cache_transfer/push_route.{h,cpp}`
+  （CMake 不引用它们，**不参与编译**，属主线遗留副本）。
