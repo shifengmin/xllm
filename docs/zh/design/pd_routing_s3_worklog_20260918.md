@@ -502,3 +502,37 @@ id 单独寻址缓冲（生产里 Mooncake 按注册顺序给全局唯一 id）�
 
 **仍未做**：上面的 (b)+并集换算的代码、`ContextParallelTopology` 本体 oracle、`MixedLayers`/`DpExpansion`/
 XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash 不支持 PD 分离，§1.3）。
+
+#### 第 8 轮补充：S3-5 的"请求 id ↔ 规范块"换算**卡在一个未解的事实上**（必须先把这一条查清，再写码）
+
+上面把并集接法写成了"已定案"，但随后追 id 的真实语义时发现**缺一个关键事实**，先把已经查实的部分与缺口列清楚，
+避免下一轮照着一个可能错的假设写码。
+
+**已查实的数字与代码路径**（GLM5-next pilot，`kv_split = 4`，`block_size = 128`）：
+
+| 事实 | 出处 |
+|---|---|
+| 调度侧 block 大小 = `block_size × kv_split` = **512 token** | `distributed_runtime/llm_engine.cpp:653`（`options.block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff : block_size)`），即 S6 要解的那个绑定 |
+| 缓存 tensor 的**行** = `kv_cache_cap.block_size()` = **128 token** | `kv_cache_estimation.cpp:695`（`.block_size(options.block_size)`，用户配置值）+ `init_key_cache_shape` 用 `kv_cache_cap.block_size()` 作 dim 1 |
+| KV 行数 = `n_blocks` = 6513；INDEX 行数 = `n_blocks × S` = 26052，两者每行都是 128 token | `init_key_cache_shape` / `init_index_cache_shape`（后者乘 `kv_split_size_effective()`，见上文依据 2）；实测日志 `[26052 128 1 257]` 与 `blocks: 6513` |
+| 一个调度 block（512 token）在 4 个 DCP rank 上各驻留 1/4，即 rank 的 KV 行 `r` 持有规范块 `r*S + slice` | `kv_shard_layout.cpp` 的 `globalize`（第 5 轮已钉死） |
+| 传输映射的 `local_ids` = `sequence->kv_state().blocks(type)` 的 **block id**，且**同一个 id 列表被套用到该 group 的每个 buffer**（KEY 与 INDEX 同为 `BlockType::KV` ⇒ 同一 group） | `batch_input_builder.cpp:334-340`、`mooncake_kv_cache_transfer.cpp::append_buffer_mappings`（`buffer_mapping.local_ids = mapping.local_ids`，按 `buffer.group_id` 取表） |
+
+**缺口**：上面两行合起来是矛盾的 —— 一次 id 映射不可能同时满足
+
+- KV：id `r` = 本 rank 的第 `r` 行 = 规范块 `r*S + slice`（128 token，**每个调度 block 只取 1/4**）；
+- INDEX：id `r` = 第 `r` 行 = 规范块 `r`（INDEX 是全序列副本，26052 行覆盖**全部**规范块，且 DSA 的 top-k 需要整条序列的 gate/valid）。
+
+要么 KV 行其实是 512 token（那 `n_blocks` 就该是 6513 个 512-token 行，与"INDEX 行数 = n_blocks × S"的 4 倍关系另有解释），
+要么 INDEX 的行号不是 id 本身（例如需要 `id*S + slice` 的换算，而 `append_buffer_mappings` 里看不到这个换算），
+要么 INDEX 在 MLA 实例里其实走的是**另一个 group**（`DeepSeekV4KVCacheImpl` 给 INDEX 的是 `compressed_block_type_`，与
+`KVCacheImpl` 把它放进 `BlockType::KV` 不同 —— 而实测实例走的是后者）。
+
+**结论 / 下一步**：
+
+- 这一条**不是**可以靠"两侧一致就自洽"糊过去的：它决定 `local_ids` 是不是规范块、以及 INDEX 到底要不要按 `id*S+slice`
+  展开。写错会静默搬错行，而 §1.3（GLM5.3flash 不支持 PD 分离）意味着没有实机可以兜底。
+- 因此 **canonical 不能接线**，直到查清：建议下一轮按 `qwen_dcp_attention.cpp` / DSA indexer kernel 的
+  index 写入寻址 + `kv_state().blocks()` 的 id 空间两条线取证（读码即可，不需要实例），并在文档里钉一条
+  "id → 规范块"的显式断言（类似第 6 轮把 `slice` 钉在 `dcp_rank` 上）。
+- 第 7~8 轮已落地的部分（入口、开关、声明、加固、对账）不受此影响：它们的输入都是**规范块**，与 id 语义无关。
