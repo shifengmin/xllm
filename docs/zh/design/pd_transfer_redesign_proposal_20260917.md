@@ -556,7 +556,7 @@ XTensor `explicit_offsets` 的端到端（适配器与 T4 golden 已覆盖）、
 实跑结果：`kv_redundancy_test` 11/11、`pd_route_test` 12/12、`cache_directory_test` 19/19、
 `pd_route_integration_test` 4/4。
 
-### S3-5 的前置修正（2026-09-18，定位完成、代码待改）
+### S3-5 的切片契约修正（2026-09-18，已落地）
 
 第 5 轮把 S3-5 的阻塞项钉死了：**`slice` 必须等于运行时的 `ContextParallelTopology::dcp_rank`**，
 S2 原先的 `slice_of` 公式是另一套分组。证据、正确的两分支公式、以及要改的测试清单见
@@ -572,6 +572,13 @@ S2 原先的 `slice_of` 公式是另一套分组。证据、正确的两分支�
   ⇒ DCP 组 = 固定 tp、变动 cp），因此 `slice = cp_rank`、写者 `(cp=s, tp=0)`，`S_eff=4` 来自 `S | cp_size`。
 - S2 的 rank golden 需要重算；`cp=1` 配 `S=4` 之类形状在 C3 下非法，相关夹具要改成 `cp_size=4`。
 - **顺序**：先做这一步（③ 规范逻辑地址层），再做 ② 数据面切换。否则会把错块搬到对端。
+
+> **2026-09-18 第 6 轮：已落地并全绿。** `KvRedundancy::derive` 加了 C3（配置的 split 必须是 DCP 形状：
+> `S | cp_size` 或 `S == cp_size*tp_size`），`KvLayoutIndex` 的 `slice_of`/`replica_of`/`writer_of`/`replicas_of`
+> 按 (a)/(b) 两分支重写；pilot 的 prefill 现在是 `cp=4 + tp=8 + kv_split=4`（写者 `local_rank = 8*cp`，
+> `slice == cp`），decode 是 `dp4/cp1/tp2/kv2`（`slice == tp`）。S2 的 golden 与全部夹具已按新契约重算，
+> 容器内 47 个用例全绿。**仍未做**：把 `ContextParallelTopology` 本体链进单测做运行时 oracle（需给手编
+> harness 加 glog），以及数据面的"请求 block id ↔ 规范块"换算（与 S3-4 一起）。
 
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 

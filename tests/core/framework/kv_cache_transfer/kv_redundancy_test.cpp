@@ -28,9 +28,12 @@ namespace xllm {
 
 namespace {
 
-// GLM 5.3 flash (glm5_next) target scenario:
-//   prefill: 8 ranks, dp1 tp8 cp1 kv_split4
-//   decode : 8 ranks, dp4 tp2 cp1 kv_split2
+// GLM 5.3 flash (glm5_next) target scenario. The split is placed by the DCP
+// process group, which ContextParallelTopology only allows to either partition
+// the PCP group or cover the whole DP-local domain, so the prefill side is
+// dp1 cp4 tp8 kv_split4 (world 32: world / kv_split == tp_size, i.e. the DCP
+// group is the PCP group at a fixed tp rank) and the decode side is
+// dp4 cp1 tp2 kv_split2 (kv_split == cp * tp, each rank its own slice).
 // MLA latent and the shared-head indexer have exactly one global head, so they
 // are the only groups whose redundancy can absorb a split; the KDA
 // conv/recurrent states expose kda_num_heads (64) global heads and therefore
@@ -79,31 +82,59 @@ void expect_rejected(const KvTopology& topology, const GroupTopology& group) {
 }  // namespace
 
 TEST(KvRedundancyTest, DerivesTheGlm53FlashPilotScenario) {
-  // Prefill MLA latent / indexer: G=1, TP=8 => D_tp=8, D=8, split=4, N_rep=2.
-  const KvRedundancy prefill =
-      derive_ok(make_topology(/*dp_size=*/1,
-                              /*cp_size=*/1,
-                              /*tp_size=*/8,
-                              /*kv_split_size=*/4),
-                make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
+  // Prefill MLA latent / indexer: G=1, CP=4, TP=8 => D_tp=8, D=32, split=4,
+  // N_rep=8. The DCP group is the PCP group at a fixed tp rank, so the
+  // sequence slice of a rank is its cp rank and the writers sit at tp 0.
+  const KvTopology prefill_topology = make_topology(/*dp_size=*/1,
+                                                    /*cp_size=*/4,
+                                                    /*tp_size=*/8,
+                                                    /*kv_split_size=*/4);
+  const KvRedundancy prefill = derive_ok(
+      prefill_topology, make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
   EXPECT_EQ(prefill.local_head_count(), 1);
   EXPECT_EQ(prefill.tp_redundancy(), 8);
   EXPECT_EQ(prefill.head_class_count(), 1);
-  EXPECT_EQ(prefill.redundancy(), 8);
+  EXPECT_EQ(prefill.redundancy(), 32);
   EXPECT_EQ(prefill.split(), 4);
-  EXPECT_EQ(prefill.replica_count(), 2);
+  EXPECT_EQ(prefill.replica_count(), 8);
 
-  // Decode MLA latent: G=1, TP=2 => D=2, split=2, N_rep=1.
-  const KvRedundancy decode =
-      derive_ok(make_topology(/*dp_size=*/4,
-                              /*cp_size=*/1,
-                              /*tp_size=*/2,
-                              /*kv_split_size=*/2),
-                make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
+  const KvLayoutIndex prefill_index(prefill_topology, prefill);
+  for (int32_t cp = 0; cp < 4; ++cp) {
+    for (int32_t tp = 0; tp < 8; ++tp) {
+      // slice == dcp_rank == cp, replica == tp (all TP ranks are copies).
+      EXPECT_EQ(prefill_index.slice_of(cp, tp), cp);
+      EXPECT_EQ(prefill_index.replica_of(cp, tp), tp);
+    }
+    int32_t writer = -1;
+    ASSERT_TRUE(prefill_index.writer_of(/*dp_rank=*/0, 0, cp, &writer));
+    EXPECT_EQ(writer, cp * 8);
+    std::vector<int32_t> replicas;
+    ASSERT_TRUE(prefill_index.replicas_of(/*dp_rank=*/0, 0, cp, &replicas));
+    ASSERT_EQ(replicas.size(), 8U);
+    EXPECT_EQ(replicas.front(), writer);
+  }
+
+  // Decode MLA latent: G=1, CP=1, TP=2, split=2 == cp * tp, so the DCP group
+  // covers the whole DP-local domain and every rank holds its own slice.
+  const KvTopology decode_topology = make_topology(/*dp_size=*/4,
+                                                   /*cp_size=*/1,
+                                                   /*tp_size=*/2,
+                                                   /*kv_split_size=*/2);
+  const KvRedundancy decode = derive_ok(
+      decode_topology, make_group(kMlaGlobalHeads, /*sequence_scoped=*/false));
   EXPECT_EQ(decode.tp_redundancy(), 2);
   EXPECT_EQ(decode.redundancy(), 2);
   EXPECT_EQ(decode.split(), 2);
   EXPECT_EQ(decode.replica_count(), 1);
+
+  const KvLayoutIndex decode_index(decode_topology, decode);
+  for (int32_t tp = 0; tp < 2; ++tp) {
+    EXPECT_EQ(decode_index.slice_of(/*cp_rank=*/0, tp), tp);
+    EXPECT_EQ(decode_index.replica_of(/*cp_rank=*/0, tp), 0);
+  }
+  int32_t writer = -1;
+  ASSERT_TRUE(decode_index.writer_of(/*dp_rank=*/3, 0, /*slice=*/1, &writer));
+  EXPECT_EQ(writer, 3 * 2 + 1);
 }
 
 TEST(KvRedundancyTest, SequenceScopedGroupsAreNeverSplit) {
@@ -111,13 +142,13 @@ TEST(KvRedundancyTest, SequenceScopedGroupsAreNeverSplit) {
   // dimension to split, so the whole sequence stays on every rank even though
   // the instance is configured with kv_split > 1.
   const KvRedundancy prefill =
-      derive_ok(make_topology(1, 1, 8, 4), make_group(kKdaGlobalHeads, true));
+      derive_ok(make_topology(1, 2, 8, 2), make_group(kKdaGlobalHeads, true));
   EXPECT_EQ(prefill.local_head_count(), 8);
   EXPECT_EQ(prefill.head_class_count(), 8);
   EXPECT_EQ(prefill.tp_redundancy(), 1);
-  EXPECT_EQ(prefill.redundancy(), 1);
+  EXPECT_EQ(prefill.redundancy(), 2);
   EXPECT_EQ(prefill.split(), 1);
-  EXPECT_EQ(prefill.replica_count(), 1);
+  EXPECT_EQ(prefill.replica_count(), 2);
   EXPECT_TRUE(prefill.sequence_scoped());
 
   const KvRedundancy decode =
@@ -136,12 +167,12 @@ TEST(KvRedundancyTest, FullSequenceReplicasKeepSplitOne) {
   indexer.full_sequence_replica = true;
 
   const KvRedundancy prefill = derive_ok(make_topology(/*dp_size=*/1,
-                                                       1,
+                                                       /*cp_size=*/4,
                                                        /*tp_size=*/8,
                                                        /*kv_split_size=*/4),
                                          indexer);
   EXPECT_EQ(prefill.split(), 1);
-  EXPECT_EQ(prefill.replica_count(), 8);
+  EXPECT_EQ(prefill.replica_count(), 32);
   EXPECT_FALSE(prefill.sequence_scoped());
   EXPECT_TRUE(prefill.full_sequence_replica());
 
@@ -151,10 +182,12 @@ TEST(KvRedundancyTest, FullSequenceReplicasKeepSplitOne) {
 }
 
 TEST(KvRedundancyTest, GroupsWithoutRedundancyKeepSplitOne) {
-  // G >= TP shards the heads; there is nothing to remove, so a configured
-  // split larger than 1 degrades to 1 instead of failing.
+  // G >= TP shards the heads; there is nothing to remove, so the split stays 1.
+  // Once C3 restricts the instance split to a DCP shape, D == 1 also forces the
+  // configured split to 1 (a case-(b) split would need G == 1 to divide D), so
+  // this is the only reachable shape for such a group.
   const KvRedundancy sharded =
-      derive_ok(make_topology(1, 1, 8, 4), make_group(/*G=*/8, false));
+      derive_ok(make_topology(1, 1, 8, 1), make_group(/*G=*/8, false));
   EXPECT_EQ(sharded.tp_redundancy(), 1);
   EXPECT_EQ(sharded.redundancy(), 1);
   EXPECT_EQ(sharded.split(), 1);
@@ -176,21 +209,44 @@ TEST(KvRedundancyTest, RejectsHeadCountThatIsNeitherDivisibleNorDividing) {
   expect_rejected(make_topology(1, 1, 8, 1), make_group(/*G=*/0, false));
 }
 
+TEST(KvRedundancyTest, RejectsSplitThatIsNotADcpShape) {
+  // The runtime builds its DCP process group from the instance split, and
+  // ContextParallelTopology only accepts "divides cp_size" or "covers the
+  // whole DP-local domain". A split outside those shapes aborts when the group
+  // is built, so the derivation has to reject it first.
+  const KvTopology invalid = make_topology(/*dp_size=*/1,
+                                           /*cp_size=*/1,
+                                           /*tp_size=*/8,
+                                           /*kv_split_size=*/4);
+  KvRedundancy redundancy;
+  std::string error;
+  EXPECT_FALSE(KvRedundancy::derive(
+      invalid, make_group(/*G=*/1, false), &redundancy, &error));
+  EXPECT_NE(error.find("DCP shape"), std::string::npos) << error;
+
+  // 4 divides CP=4, so the same split is fine one PCP width up.
+  EXPECT_TRUE(KvRedundancy::derive(make_topology(1, 4, 8, 4),
+                                   make_group(/*G=*/1, false),
+                                   &redundancy,
+                                   &error))
+      << error;
+}
+
 TEST(KvRedundancyTest, RejectsSplitThatExceedsOrDoesNotDivideRedundancy) {
-  // G=4, TP=8 => D=2, so a split of 4 cannot be absorbed. This is the
-  // discriminating negative case for the pilot scenario: it is exactly why the
-  // pilot requires a single global KV head.
-  expect_rejected(make_topology(1, 1, 8, 4), make_group(/*G=*/4, false));
-  // G=2, TP=8 => D=4, and 3 does not divide 4.
-  expect_rejected(make_topology(1, 1, 8, 3), make_group(/*G=*/2, false));
-  // CP=2, G=TP=8 => D=2 < 4.
+  // CP=1, TP=8, S=8 covers the whole DP-local domain: a DCP shape, but D=2 for
+  // G=4, so the split exceeds the group redundancy.
+  expect_rejected(make_topology(1, 1, 8, 8), make_group(/*G=*/4, false));
+  // Same shape, G=2 => D=4, and 8 does not divide 4.
+  expect_rejected(make_topology(1, 1, 8, 8), make_group(/*G=*/2, false));
+  // CP=2, TP=8, S=2 is a DCP shape, but D=2 for G=8 means it cannot absorb the
+  // split... it can here, so use CP=2 with S=2 and G=32 (D_tp=1, D=2).
   expect_rejected(make_topology(1, 2, 8, 4), make_group(8, false));
 }
 
 TEST(KvRedundancyTest, HeadClassesTileTheGlobalHeadRange) {
   const std::vector<int32_t> head_counts = {1, 2, 4, 8, 16, 32, 64};
   const std::vector<int32_t> tp_sizes = {1, 2, 4, 8};
-  const std::vector<int32_t> cp_sizes = {1, 2};
+  const std::vector<int32_t> cp_sizes = {1, 2, 4};
   int32_t accepted = 0;
   for (int32_t global_heads : head_counts) {
     for (int32_t tp_size : tp_sizes) {
@@ -224,7 +280,8 @@ TEST(KvRedundancyTest, HeadClassesTileTheGlobalHeadRange) {
 TEST(KvLayoutIndexTest, EverySliceHasOneWriterAndNrepReplicas) {
   const std::vector<int32_t> head_counts = {1, 2, 4, 8, 16, 32, 64};
   const std::vector<int32_t> tp_sizes = {1, 2, 4, 8};
-  const std::vector<int32_t> cp_sizes = {1, 2};
+  const std::vector<int32_t> cp_sizes = {1, 2, 4};
+  int32_t accepted = 0;
   for (int32_t global_heads : head_counts) {
     for (int32_t tp_size : tp_sizes) {
       for (int32_t cp_size : cp_sizes) {
@@ -239,6 +296,7 @@ TEST(KvLayoutIndexTest, EverySliceHasOneWriterAndNrepReplicas) {
           if (!KvRedundancy::derive(topology, group, &redundancy, &error)) {
             continue;
           }
+          ++accepted;
           const KvLayoutIndex index(topology, redundancy);
           const std::string tag = "G=" + std::to_string(global_heads) +
                                   " TP=" + std::to_string(tp_size) +
@@ -316,7 +374,7 @@ TEST(KvLayoutIndexTest, EverySliceHasOneWriterAndNrepReplicas) {
 }
 
 TEST(KvLayoutIndexTest, RejectsOutOfRangeQueries) {
-  const KvTopology topology = make_topology(1, 1, 8, 4);
+  const KvTopology topology = make_topology(1, 4, 8, 4);
   const KvRedundancy redundancy =
       derive_ok(topology, make_group(kMlaGlobalHeads, false));
   const KvLayoutIndex index(topology, redundancy);

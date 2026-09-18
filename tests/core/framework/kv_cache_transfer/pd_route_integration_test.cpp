@@ -657,9 +657,9 @@ void run_scenario(const Scenario& scenario) {
 TEST(PdRouteIntegrationTest, AnchoredEqualSplitReproducesTheSourceLayout) {
   Scenario scenario;
   scenario.source =
-      SideSpec{/*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/4, "source"};
+      SideSpec{/*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/4, "source"};
   scenario.destination = SideSpec{
-      /*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/4, "destination"};
+      /*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/4, "destination"};
   scenario.enable_mla = true;
   run_scenario(scenario);
 }
@@ -670,9 +670,9 @@ TEST(PdRouteIntegrationTest, AnchoredEqualSplitReproducesTheSourceLayout) {
 TEST(PdRouteIntegrationTest, TargetSplitMismatchFoldsFourSlicesIntoTwo) {
   Scenario scenario;
   scenario.source =
-      SideSpec{/*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/4, "source"};
+      SideSpec{/*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/4, "source"};
   scenario.destination = SideSpec{
-      /*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/2, "destination"};
+      /*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/2, "destination"};
   scenario.enable_mla = true;
   run_scenario(scenario);
 }
@@ -683,9 +683,9 @@ TEST(PdRouteIntegrationTest, TargetSplitMismatchFoldsFourSlicesIntoTwo) {
 TEST(PdRouteIntegrationTest, ReverseSplitMismatchExpandsTwoSlicesIntoFour) {
   Scenario scenario;
   scenario.source =
-      SideSpec{/*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/2, "source"};
+      SideSpec{/*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/2, "source"};
   scenario.destination = SideSpec{
-      /*cp_size=*/1, /*tp_size=*/8, /*kv_split_size=*/4, "destination"};
+      /*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/4, "destination"};
   scenario.enable_mla = true;
   run_scenario(scenario);
 }

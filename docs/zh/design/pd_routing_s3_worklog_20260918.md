@@ -16,7 +16,7 @@
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
 | S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ☐ |
-| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ 前置阻塞已定位（第 5 轮）：**物理切片 = `ContextParallelTopology::dcp_rank`**，S2 的 `slice_of` 必须改；修法已定案，代码待改 |
+| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **切片契约已修正**（第 6 轮：C3 + `KvLayoutIndex` = `dcp_rank`，47 用例全绿）；地址层与请求 block id 换算未接线（与 S3-4 一起） |
 
 ## 1. 硬约束（每轮先读，别再试错）
 
@@ -318,4 +318,43 @@ MLA 组（`G=1`）：`D_tp = 8`、`D = cp*D_tp = 32`、`N_rep = 8`。S2 模型�
 `ContextParallelTopology` / `KVShardLayout` 这个运行时契约上。补 C3 与上述夹具时，应把"`slice` 必须等于
 `ContextParallelTopology::dcp_rank`"写成一条**显式断言**（在集成测试里用 `ContextParallelTopology` 算出期望切片，
 而不是用 `KvLayoutIndex` 反推），这样下次不一致会立刻暴露。
+
+### 2026-09-18（第 6 轮）——S3-5 切片契约修正落地（C3 + `KvLayoutIndex`），全绿
+
+**改了什么**（`kv_redundancy.{h,cpp}`）：
+
+- `KvRedundancy::derive` 增加 **C3**：配置的 `kv_split` 必须是运行时可放置的 DCP 形状
+  （`S | cp_size`，或 `S == cp_size * tp_size`），否则报错并点名 DCP。
+  注意 C3 校验的是**实例配置值**（`kv_split_size_effective`）而不是每组的 `S_eff` —— DCP 组是按实例建的。
+  副作用：C3 + C2 合起来让"配置 `S>1` 但本组 `D==1` 退化为 1"这条分支几乎不可达（`cp=1` 时配置 S 只能是 1 或 `tp`，
+  而后者要求 `G==1`），文档里保留该分支但注明。
+- `KvLayoutIndex` 的 `slice_of` / `replica_of` / `writer_of` / `replicas_of` 改成两分支：
+  - (a) `S | cp_size`：`w = cp/S`，`slice = cp/w`，`replica = (cp%w)*D_tp + tp%D_tp`，
+    副本集 = `{(cp = slice*w + j, tp = h*D_tp + k) : j∈[0,w), k∈[0,D_tp)}`；
+  - (b) `S == cp*tp`：`slice = cp*tp_size + tp`，`replica = 0`，副本集只有 `dp_local == slice` 的那个 rank。
+- `KvRedundancyTest.DerivesTheGlm53FlashPilotScenario` 现在显式钉住契约：prefill（cp4/tp8/kv4）
+  `slice == cp`、`replica == tp`、写者 `local_rank == 8*cp`；decode（dp4/cp1/tp2/kv2）`slice == tp`、写者即本 rank。
+  另新增 `RejectsSplitThatIsNotADcpShape`（并断言 `cp=4` 下同一 split 合法）。
+
+**测试夹具同步改完**（都要按 DCP 合法形状重算）：
+
+| 文件 | 改动 |
+|---|---|
+| `pd_route_test.cpp` | pilot prefill `cp1/tp8/kv4` → `cp4/tp8/kv4`；MLA golden 的 4 条边 → src `0/8/16/24`、dst `0/1/0/1`；KDA 与 indexer golden **不变**（边数 8/2、rank 与 head 区间一致）；fan-out 边数 `8 → 32`（目的侧 8 个副本）；mock 的写者 rank 改为 `(block%4)*8`、源缓冲 32 个 rank；拓扑矩阵扩到 `cp ∈ {1,2,4}` |
+| `cache_directory_test.cpp` | MLA 夹具与该 mini e2e 用例改成 `cp4/tp8`（源 32 个 rank，写者 `(cp=slice, tp=class*D_tp)`）；`replica_count` 断言 2 → 8 |
+| `pd_route_integration_test.cpp` | 三个 MLA 场景的 `cp_size` 1 → 4 |
+| `kv_redundancy_test.cpp` | sequence-scoped / full-sequence-replica / no-redundancy 三个夹具改成 DCP 合法形状；C2 负例改用例 (b) 的形状（`cp1/tp8/S8`，`G=4/2`）；穷举矩阵扩到 `cp ∈ {1,2,4}` |
+
+**验证**（容器内，`~/pdroute_tools/s2_host_test.py`）：`kv_redundancy_test` **12/12**、`pd_route_test` **12/12**、
+`cache_directory_test` **19/19**、`pd_route_integration_test` **4/4** —— 47 个用例全绿。
+搬运量：MLA kv4→kv4 6.6 MB、kv4→kv2 35 MB、kv2→kv4 26 MB、非 MLA 12.6 MB（目的侧副本变多）。
+
+**未做 / 下一步**：
+
+- **还没把运行时当真 oracle**：`context_parallel_topology.cpp` 需要 glog，手编 harness 要多带一个库，
+  本轮用"显式断言 pilot 的 `slice == cp` / `== tp`"代替。下一轮建议给它加 glog 链接，
+  在单测里直接用真实 `ContextParallelTopology` 反推期望切片（`cp ∈ {1,2,4}` × `S ∈ {1,2,4,8}` 全枚举比对）。
+- **S3-5 的"规范逻辑地址层"其余部分未接线**：`logical_offset` 走规范块坐标、请求 block id ↔ 规范块的换算
+  （`KVShardLayout::globalize/localize`）还没有进入数据面 —— 与 S3-4 一起做。
+- S3-4 的开关（`--pd_route=legacy|canonical`，默认 legacy）与统一 `transfer(opcode)` 入口未开始。
 
