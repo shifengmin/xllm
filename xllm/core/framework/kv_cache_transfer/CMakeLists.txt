@@ -144,6 +144,7 @@ cc_library(
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_kv_cache_transfer.cpp>
     $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.cpp>
   DEPS
+    :pd_route_transfer
     :cache_layout
     :common
     :kv_cache
