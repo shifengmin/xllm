@@ -492,6 +492,23 @@ void MooncakeKVCacheTransferBase::publish_cache_layout(
       declarations_.clear();
       break;
     }
+    // A declaration describes a cache *family*, and `declaration_matches`
+    // deliberately ignores the layer, so a multi-layer model publishes the same
+    // family once per layer. Declaring it once per layer makes the peer
+    // directory reject the rank as duplicated, so collapse to one declaration
+    // per (namespace, role, group).
+    bool already_declared = false;
+    for (const CacheTensorDeclaration& existing : declarations_) {
+      if (existing.cache_namespace == tensor.cache_namespace &&
+          existing.role == tensor.role &&
+          existing.group_id == tensor.group_id) {
+        already_declared = true;
+        break;
+      }
+    }
+    if (already_declared) {
+      continue;
+    }
     CacheTensorDeclaration declaration;
     declaration.cache_namespace = tensor.cache_namespace;
     declaration.role = tensor.role;
@@ -869,7 +886,8 @@ bool MooncakeKVCacheTransferDefault::push_kv_blocks_canonical(
     std::vector<CacheGroupRequest> groups;
     groups.reserve(info.mappings.size());
     for (const KVTransferMapping& mapping : info.mappings) {
-      groups.push_back(CacheGroupRequest{mapping.group_id, mapping.local_ids});
+      groups.push_back(CacheGroupRequest{
+          mapping.group_id, mapping.local_ids, mapping.local_positions});
     }
     std::vector<int64_t> canonical_blocks;
     std::string error;

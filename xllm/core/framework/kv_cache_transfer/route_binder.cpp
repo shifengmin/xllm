@@ -141,6 +141,42 @@ void compact_regions(std::vector<RouteRegion>* regions) {
   regions->swap(merged);
 }
 
+// The physical row one canonical block occupies in one peer's cache buffer.
+//
+// A canonical block is a *position* (the request's `p`-th block through slice
+// `j`), and no pool lays its rows out one per canonical block, so the row has
+// to come from the family's own storage layout:
+//
+//   - A split family keeps one canonical block per row, and its rows are the
+//     logical blocks: row `p + 1` of the pool, because the pool reserves row 0
+//     for the padding block. A canonical block whose position is `p * split +
+//     j` therefore lands on row `canonical / split + 1` -- the same one-based
+//     row space the request's ids live in, which is why the source side of a
+//     homogeneous pair got this right by accident.
+//   - A family that keeps the whole sequence on every rank packs each slice of
+//   a
+//     logical block as its own row, exactly as the runtime expands the indexer
+//     block table (`row = id * dcp_size + slice`). Its rows are scaled by the
+//     instance's *configured* kv-split -- its own effective split is 1, since
+//     every rank keeps everything -- and sit one reserved block further along,
+//     so the row is `canonical + kv_split_size`.
+//   - A sequence-scoped family has no block dimension at all: its canonical id
+//     is a sequence slot, which is already a row.
+//
+// `split` is the family's effective split (KvRedundancy::split()). Getting this
+// wrong is invisible within one instance and shifts every block on the peer as
+// soon as the two splits differ, so it is spelled out once, here.
+uint64_t peer_row(const PeerCacheView& view, int32_t split, int64_t block) {
+  if (view.group.sequence_scoped) {
+    return static_cast<uint64_t>(block);
+  }
+  if (view.group.full_sequence_replica) {
+    const int32_t width = std::max(view.topology.kv_split_size, 1);
+    return static_cast<uint64_t>(block) + static_cast<uint64_t>(width);
+  }
+  return static_cast<uint64_t>(block) / static_cast<uint64_t>(split) + 1;
+}
+
 }  // namespace
 
 void BufferDirectory::add(BufferDirectoryEntry entry) {
@@ -369,10 +405,8 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
                       std::to_string(dst_local_rank));
         return false;
       }
-      const uint64_t local_row =
-          static_cast<uint64_t>(block) / static_cast<uint64_t>(local_split);
-      const uint64_t remote_row =
-          static_cast<uint64_t>(block) / static_cast<uint64_t>(remote_split);
+      const uint64_t local_row = peer_row(local, local_split, block);
+      const uint64_t remote_row = peer_row(remote, remote_split, block);
       if (local_row >= local.entry.resource_count ||
           remote_row >= remote.entry.resource_count) {
         set_error(error,

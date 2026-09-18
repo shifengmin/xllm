@@ -99,6 +99,40 @@ struct Scenario {
   bool enable_mla = true;
 };
 
+// How one family's pool addresses the canonical positions it holds. The runtime
+// has three layouts, and the route has to reproduce each of them exactly:
+//
+//   * a sequence-scoped slot is a row: `row = slot id`;
+//   * a full-sequence replica packs every slice of a block as its own row,
+//     `row = block_id * dcp_size + slice`, scaled by the instance's
+//     *configured* kv-split (its own effective split is 1, since every rank
+//     keeps everything);
+//   * a split family keeps one row per block, `row = block_id`, and the pool
+//     reserves row 0 for the padding block, so the request's first block is
+//     row 1.
+struct RowLayout {
+  bool sequence_scoped = false;
+  bool full_sequence_replica = false;
+  int32_t split = 1;          // the family's effective split
+  int32_t runtime_split = 1;  // the instance's configured kv-split
+  int32_t slice = 0;          // the sequence slice this rank holds
+};
+
+// The canonical position pool row `row` holds, or -1 when the row holds none
+// (the padding row of a split family, or the reserved block of a replica).
+int64_t position_of_row(const RowLayout& layout, uint64_t row) {
+  if (layout.sequence_scoped) {
+    return static_cast<int64_t>(row);
+  }
+  if (layout.full_sequence_replica) {
+    return static_cast<int64_t>(row) - layout.runtime_split;
+  }
+  if (row == 0) {
+    return -1;
+  }
+  return (static_cast<int64_t>(row) - 1) * layout.split + layout.slice;
+}
+
 std::vector<RoleSpec> role_specs(bool enable_mla) {
   RoleSpec key;
   key.role = static_cast<int32_t>(KVCacheTensorRole::KEY);
@@ -119,7 +153,12 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
   RoleSpec ssm;
   ssm.role = static_cast<int32_t>(KVCacheTensorRole::SSM);
   ssm.group_id = kLinearGroup;
-  ssm.global_heads = kSsmHeads;
+  // The linear-state group follows the attention group: an MLA instance packs
+  // it into one whole resource, which holds a single head, so `local_heads` has
+  // to stay 1 on every topology -- including one where TP is narrower than the
+  // head count. A plain attention instance shards its `kSsmHeads` heads
+  // instead.
+  ssm.global_heads = enable_mla ? 1 : kSsmHeads;
   ssm.sequence_scoped = true;
   ssm.canonical = kSlots;
 
@@ -133,7 +172,7 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
   RoleSpec conv;
   conv.role = static_cast<int32_t>(KVCacheTensorRole::CONV);
   conv.group_id = kLinearGroup;
-  conv.global_heads = kSsmHeads;
+  conv.global_heads = 1;
   conv.sequence_scoped = true;
   conv.canonical = kSlots;
   return {key, index, ssm, conv};
@@ -175,8 +214,10 @@ CacheTensorLayoutContext model_context_of(bool enable_mla) {
   CacheTensorLayoutContext context;
   context.kv_head_count = kKvHeads;
   context.index_head_count = kIndexValues / 2;
-  context.linear_key_head_count = kSsmHeads;
-  context.linear_value_head_count = kSsmHeads;
+  // Same rule as the attention group: MLA declares one packed head for the
+  // linear-state families, a plain attention instance declares `kSsmHeads`.
+  context.linear_key_head_count = enable_mla ? 1 : kSsmHeads;
+  context.linear_value_head_count = enable_mla ? 1 : kSsmHeads;
   context.linear_key_head_dim = kSsmKeyDim;
   context.linear_ssm_checkpoint_stride = 1;
   context.enable_mla = enable_mla;
@@ -320,8 +361,7 @@ uint8_t content_byte(int32_t group_id,
 std::vector<uint8_t> canonical_content(const CacheTensorManifest& tensor,
                                        int32_t first_head,
                                        int32_t local_heads,
-                                       int32_t split,
-                                       int32_t slice) {
+                                       const RowLayout& layout) {
   const uint64_t units = resource_units(tensor);
   const uint64_t head_bytes = head_bytes_of(tensor, units, local_heads);
   const uint64_t stride = tensor.resource_stride_bytes;
@@ -331,11 +371,14 @@ std::vector<uint8_t> canonical_content(const CacheTensorManifest& tensor,
     return buffer;
   }
   const uint64_t unit_bytes = static_cast<uint64_t>(local_heads) * head_bytes;
-  const CanonicalBlock canonical(static_cast<int32_t>(units), split);
 
   for (uint64_t row = 0; row < tensor.resource_count; ++row) {
-    const int64_t resource =
-        canonical.canonical_of_row(static_cast<int64_t>(row), slice);
+    // A row that holds no canonical position keeps the poison the buffer was
+    // created with: no route may write it.
+    const int64_t resource = position_of_row(layout, row);
+    if (resource < 0) {
+      continue;
+    }
     const uint64_t base = row * stride;
     for (const LogicalSpan& span : tensor.shard.spans) {
       const bool whole_resource = tensor.shard.spans.size() == 1 &&
@@ -396,9 +439,28 @@ void make_rank(const SideSpec& side,
     const KvLayoutIndex index(declaration.topology, redundancy);
     const int32_t local_heads = redundancy.local_head_count();
     const int32_t split = redundancy.split();
-    const int64_t rows = role.canonical / split;
-    ASSERT_GT(rows, 0);
+    const int32_t runtime_split =
+        std::max(declaration.topology.kv_split_size, 1);
     ASSERT_EQ(role.canonical % split, 0);
+    ASSERT_EQ(role.canonical % runtime_split, 0);
+    // The pool's row count per family layout: one row per slot; one row per
+    // (block, slice) plus the reserved block for a full-sequence replica; one
+    // row per block plus the reserved padding row otherwise.
+    int64_t rows = 0;
+    if (role.sequence_scoped) {
+      rows = role.canonical;
+    } else if (declaration.group.full_sequence_replica) {
+      rows = (role.canonical / runtime_split + 1) * runtime_split;
+    } else {
+      rows = role.canonical / split + 1;
+    }
+    ASSERT_GT(rows, 0);
+    RowLayout layout;
+    layout.sequence_scoped = role.sequence_scoped;
+    layout.full_sequence_replica = declaration.group.full_sequence_replica;
+    layout.split = split;
+    layout.runtime_split = runtime_split;
+    layout.slice = index.slice_of(cp_rank, tp_rank);
 
     CacheTensorLayoutContext context;
     context.tp_rank = tp_rank;
@@ -434,8 +496,7 @@ void make_rank(const SideSpec& side,
         canonical_content(manifest_tensor,
                           index.head_begin(index.head_class_of(tp_rank)),
                           local_heads,
-                          split,
-                          index.slice_of(cp_rank, tp_rank));
+                          layout);
   }
 
   ASSERT_TRUE(PeerDirectory::describe(rank->manifest,
@@ -609,12 +670,14 @@ void verify_role(const std::vector<RankCache>& destinations,
               head_bytes_of(*tensor, resource_units(*tensor), local_heads));
 
     const int32_t head_class = index.head_class_of(rank.tp_rank);
-    const std::vector<uint8_t> expected =
-        canonical_content(*tensor,
-                          index.head_begin(head_class),
-                          local_heads,
-                          split,
-                          index.slice_of(rank.cp_rank, rank.tp_rank));
+    RowLayout layout;
+    layout.sequence_scoped = role.sequence_scoped;
+    layout.full_sequence_replica = declaration.group.full_sequence_replica;
+    layout.split = split;
+    layout.runtime_split = std::max(declaration.topology.kv_split_size, 1);
+    layout.slice = index.slice_of(rank.cp_rank, rank.tp_rank);
+    const std::vector<uint8_t> expected = canonical_content(
+        *tensor, index.head_begin(head_class), local_heads, layout);
     const std::vector<uint8_t>& actual = rank.buffers.at(view->entry.buffer_id);
     ASSERT_EQ(actual.size(), expected.size());
 
@@ -733,6 +796,35 @@ TEST(PdRouteIntegrationTest, ReverseSplitMismatchExpandsTwoSlicesIntoFour) {
       SideSpec{/*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/2, "source"};
   scenario.destination = SideSpec{
       /*cp_size=*/4, /*tp_size=*/8, /*kv_split_size=*/4, "destination"};
+  scenario.enable_mla = true;
+  run_scenario(scenario);
+}
+
+// The geometry the byte-level PD verification runs on: four prefill ranks that
+// each own one sequence slice (cp4 x tp1) feeding two decode ranks that split
+// the sequence over TP (cp1 x tp2).  The two sides disagree about how a slice
+// maps to a rank, not only about how many slices there are, so a rank-local
+// stride cannot express the destination row.  The decode side has to be cp1
+// here: the runtime rejects `cp_size > 1` for any role other than
+// DEFAULT/PREFILL, so a decode instance splits its sequence over TP.
+TEST(PdRouteIntegrationTest, RuntimePrefillFourDecodeTwoSlicesReshard) {
+  Scenario scenario;
+  scenario.source =
+      SideSpec{/*cp_size=*/4, /*tp_size=*/1, /*kv_split_size=*/4, "prefill"};
+  scenario.destination =
+      SideSpec{/*cp_size=*/1, /*tp_size=*/2, /*kv_split_size=*/2, "decode"};
+  scenario.enable_mla = true;
+  run_scenario(scenario);
+}
+
+// The same runtime pair the other way round: two prefill slices, four decode
+// slices, and again the slice-to-rank maps differ (cp2 x tp2 -> cp1 x tp4).
+TEST(PdRouteIntegrationTest, RuntimePrefillTwoDecodeFourSlicesReshard) {
+  Scenario scenario;
+  scenario.source =
+      SideSpec{/*cp_size=*/2, /*tp_size=*/2, /*kv_split_size=*/2, "prefill"};
+  scenario.destination =
+      SideSpec{/*cp_size=*/1, /*tp_size=*/4, /*kv_split_size=*/4, "decode"};
   scenario.enable_mla = true;
   run_scenario(scenario);
 }

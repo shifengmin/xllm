@@ -108,30 +108,54 @@ struct CacheRowBases {
 // One cache group of a request, as the scheduler addressed it.
 struct CacheGroupRequest {
   int32_t group_id = 0;
+  // The rows the scheduler addressed, in sequence order.
   std::vector<uint64_t> ids;
+  // The *position* of each id in the sequence's block table, aligned one-to-one
+  // with it. A request's ids are pool rows: a prefix-cache hit hands out rows
+  // from wherever the shared prefix already sits, and a later chunk of a
+  // chunked prefill starts mid-sequence, so nothing about an id says which
+  // position it covers. Position is what the route places blocks by, so a
+  // block-scoped group has to carry it; a sequence-scoped group's id already is
+  // the position (its slot), so it may leave this empty.
+  std::vector<uint64_t> positions;
 };
 
 // The canonical blocks one request covers, derived from the groups the
 // scheduler addressed.
 //
+// A canonical block is the coordinate both peers agree on: the request's
+// `p`-th block seen through sequence slice `j`, that is `p * split + j`, where
+// `p` counts from the request's first block and `j` is the DCP rank that holds
+// the slice. It is a *position*, not an address: the two instances allocate
+// their own pool rows, so their block ids differ while the position does not,
+// and only the position survives the crossing.
+//
 // A block-scoped group's id names one *logical* block, which spans
-// `topology.kv_split_size` canonical blocks -- one per DCP rank. That is the
-// identity KVShardLayout::globalize() inverts for the KV cache, and it is also
-// what the indexer pool expands to: its block table entry for logical block `b`
-// becomes the rows `b * dcp_size + j` for every `j`
-// (expand_kv_shard_indexer_block_table). The two views only coincide after that
-// expansion, so the expanded set is the canonical one and each family selects
-// from it with its own split and slice: the KV cache keeps the single canonical
-// block matching its sequence slice, while the indexer pool -- which keeps the
-// whole sequence -- keeps all of them.
+// `topology.kv_split_size` canonical blocks -- one per DCP rank, and the group
+// supplies the *position* of each id so the canonical id can be that position
+// through slice `j`. Positions are the identity the runtime itself uses:
+// KVShardLayout::globalize() turns a rank's local row into the global slot of
+// position `p` through slice `j`, and the indexer pool expands the request's
+// `p`-th block into the rows `(p + 1) * dcp_size + j` for every `j`
+// (expand_kv_shard_indexer_block_table) -- both count from the sequence's first
+// block in a row space whose row 0 the block manager reserves for its padding
+// block. Each family turns the canonical id into its own row with its own
+// layout (see RouteBinder::bind).
+//
+// Deriving the position from the id instead is what the first version did, and
+// it holds only while the ids happen to be `position + 1`: a prefix-cache hit
+// or a mid-sequence chunk makes them arbitrary, and the route would then place
+// the whole request at the wrong offset without any check firing. Positions are
+// therefore required, and their absence is an error rather than a fallback.
 //
 // A sequence-scoped group has no block dimension: its slot id is already the
-// canonical unit, which is why the expansion applies to block-scoped groups
-// only.
+// canonical unit, so it needs no positions and neither the rebase nor the
+// expansion applies to it.
 //
 // `local` are the declarations of this rank's families; they say which groups
 // exist and whether each is sequence scoped. Returns false, filling `error`,
-// for a group the model does not declare or whose families disagree on scope.
+// for a group the model does not declare, whose families disagree on scope, or
+// whose block-scoped ids carry no usable positions.
 bool canonical_blocks_of_request(
     const std::vector<CacheGroupRequest>& groups,
     const std::vector<CacheTensorDeclaration>& local,

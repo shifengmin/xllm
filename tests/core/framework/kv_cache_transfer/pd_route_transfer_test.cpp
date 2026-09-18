@@ -130,8 +130,12 @@ void build_side(const SideSpec& spec,
       view.entry.group_id = family.group_id;
       view.entry.buffer_id = *next_buffer_id;
       ++*next_buffer_id;
+      // One row per canonical block, plus the pool row the block manager
+      // reserves for its padding block: the request's `p`-th block is pool row
+      // `p + 1`, so a fixture whose canonical positions start at 0 needs one
+      // row of room in front of them.
       view.entry.resource_count =
-          static_cast<uint64_t>(family.resources / split);
+          static_cast<uint64_t>(family.resources / split) + 1;
       view.entry.units_per_resource = units_of(family);
       view.entry.resource_stride_bytes =
           units_of(family) *
@@ -302,9 +306,18 @@ void fill_expected(const Side& source,
         if (block % destination_split != destination_slice) {
           continue;
         }
+        // The runtime's addressing, restated here so the expectation never
+        // reuses a route-side helper: a block-scoped canonical block is a
+        // position, and the pool row holding it is that position's logical
+        // block one row further along, because row 0 is the reserved padding
+        // block. A sequence-scoped canonical id is a slot, and a slot *is* the
+        // row.
         const uint64_t destination_row =
-            static_cast<uint64_t>(block) /
-            static_cast<uint64_t>(destination_split);
+            family.sequence_scoped
+                ? static_cast<uint64_t>(block)
+                : static_cast<uint64_t>(block) /
+                          static_cast<uint64_t>(destination_split) +
+                      1;
         for (int32_t head_offset = 0; head_offset < local_head_count;
              ++head_offset) {
           const int32_t head = head_begin + head_offset;
@@ -326,8 +339,12 @@ void fill_expected(const Side& source,
           if (writer_view == nullptr) {
             continue;
           }
-          const uint64_t source_row = static_cast<uint64_t>(block) /
-                                      static_cast<uint64_t>(source_split);
+          const uint64_t source_row =
+              family.sequence_scoped
+                  ? static_cast<uint64_t>(block)
+                  : static_cast<uint64_t>(block) /
+                            static_cast<uint64_t>(source_split) +
+                        1;
           const uint64_t writer_head_offset =
               static_cast<uint64_t>(
                   head - source_index.head_begin(

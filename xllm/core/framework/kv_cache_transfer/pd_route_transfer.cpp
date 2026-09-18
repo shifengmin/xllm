@@ -172,6 +172,37 @@ void orient_for_pull(std::vector<RouteRegion>* regions) {
   }
 }
 
+// Rewrites the model-side declarations so they describe the peer instead of us.
+//
+// The parallel coordinates of a published layout are a property of the instance
+// that published it, not of the model: the pilot pushes PREFILL cp=2/kv_split=2
+// slices into a DECODE instance that is cp=1/kv_split=1, which is the whole
+// point of the canonical route. Requiring the two to be equal -- which is what
+// passing our own declarations does -- rejects exactly the pair the route
+// exists to connect ("the declared topology differs from the coordinates the
+// peer published"). Only the coordinates are adopted: the group geometry and
+// the token capacity per block stay ours, because both instances run the same
+// model and PeerDirectory::describe still reconciles them against the
+// descriptor the peer published, so a real disagreement is still refused.
+//
+// SPEC_DRAFT families keep their own topology: the manifest coordinates always
+// describe MAIN (see CacheTensorDeclaration).
+std::vector<CacheTensorDeclaration> declarations_for_peer(
+    const std::vector<CacheTensorDeclaration>& declarations,
+    const ParallelCoordinates& coordinates) {
+  std::vector<CacheTensorDeclaration> adjusted = declarations;
+  for (CacheTensorDeclaration& declaration : adjusted) {
+    if (declaration.cache_namespace != CacheNamespace::MAIN) {
+      continue;
+    }
+    declaration.topology.dp_size = coordinates.dp_size;
+    declaration.topology.cp_size = coordinates.cp_size;
+    declaration.topology.tp_size = coordinates.tp_size;
+    declaration.topology.kv_split_size = coordinates.kv_split_size;
+  }
+  return adjusted;
+}
+
 }  // namespace
 
 bool flatten_route_for_layers(
@@ -286,8 +317,13 @@ bool build_route_peer(
     }
     PeerDirectory directory;
     std::string reason;
+    // The peer's own coordinates decide how its buffers are laid out, so
+    // reconcile its manifest against declarations that describe it rather than
+    // against ours.
+    const std::vector<CacheTensorDeclaration> peer_declarations =
+        declarations_for_peer(declarations, manifest->coordinates);
     if (!PeerDirectory::describe(
-            *manifest, declarations, row_bases, &directory, &reason)) {
+            *manifest, peer_declarations, row_bases, &directory, &reason)) {
       set_error(error,
                 "the cache layout of peer rank " + std::to_string(local_rank) +
                     " does not match the model: " + reason);

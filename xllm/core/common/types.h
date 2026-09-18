@@ -303,6 +303,15 @@ struct KVTransferMapping {
   int32_t group_id = 0;
   std::vector<uint64_t> local_ids;
   std::vector<uint64_t> remote_ids;
+  // Position of each `local_ids` entry in the sequence's block table, aligned
+  // one-to-one with it. The canonical route places a block by its *position*,
+  // and the id does not encode it: a prefix-cache hit hands out rows from
+  // wherever the shared prefix already sits, and a later chunk of a chunked
+  // prefill starts mid-sequence, so `local_ids[i]` is only ever the pool row --
+  // never `position + 1`. Producers that know the position fill this; a
+  // consumer that needs positions refuses a mapping without them rather than
+  // guessing a base that happens to hold for one request.
+  std::vector<uint64_t> local_positions;
   // Number of leading blocks D already has from its own device-side prefix
   // cache under this group. P uses this to compress its per-group transfer
   // cursor to the first block D actually needs (no shared -> zero, no-op).
