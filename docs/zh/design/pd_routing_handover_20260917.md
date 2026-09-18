@@ -360,12 +360,13 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 - **S3-3 已完成**：链路 `真实张量 → describe_cache_tensor → manifest → PeerDirectory → PdRouteTable → bind → memcpy`
   在 4 个场景（MLA kv4→kv4/kv4→kv2/kv2→kv4、非 MLA 头分片 cp4/tp8/kv4→cp4/tp4/kv2）逐字节正确。
 - 探针全部关闭（§6.1/6.2/6.3 见 §6），S3-0（torch_npu include shim）也已完成，生产 TU 可编译验证。
-- **S3-5 前置阻塞已定位（第 5 轮，必须先修）**：物理切片 = `ContextParallelTopology::dcp_rank`（NPU 侧
-  `qwen_dcp_attention.cpp` 用 `dcp_group.rank()` 构造 `KVShardLayout`），而 S2 的
-  `KvLayoutIndex::slice_of = (cp*D_tp + tp%D_tp) % S_eff` 是另一套分组。pilot 下正确值是 `slice = cp_rank`
-  （`cp_size=4`），写者是 `(cp=s, tp=0)`。**不修就会静默搬错块**，因此 S3-4 接线前必须完成：给
-  `KvRedundancy::derive` 加 C3（DCP 形状）校验 + 重写 `slice_of`/`replica_of`/`writers_of` + 重算 S2 的
-  rank golden（不变量与边表规模不变）。修法与测试清单见工作日志第 5 轮。
+- **S3-5 切片契约已修正（第 6 轮，全绿）**：物理切片确定为 `ContextParallelTopology::dcp_rank`
+  （NPU 侧 `qwen_dcp_attention.cpp` 用 `dcp_group.rank()` 构造 `KVShardLayout`）。已加 C3（配置 split 必须是
+  DCP 形状：`S | cp_size` 或 `S == cp_size*tp_size`）、按 (a)/(b) 两分支重写 `KvLayoutIndex` 的
+  `slice_of`/`replica_of`/`writer_of`/`replicas_of`，并把 S2 的 golden 与夹具全部重算到 pilot 的真实拓扑
+  ——prefill `cp=4 + tp=8 + kv_split=4`（`slice == cp`，写者 `local_rank = 8*cp`），decode `dp4/cp1/tp2/kv2`
+  （`slice == tp`）。容器内 `kv_redundancy_test` 12/12、`pd_route_test` 12/12、`cache_directory_test` 19/19、
+  `pd_route_integration_test` 4/4。**因此 ② 数据面切换现在可以开始**（先 PULL 后 PUSH）。
 - 未决：`coordinates.kv_split_rank`（= `dcp_rank`）与 `slice_of` 的对账即上述修正；`bind` 的 `local_rank` 校验
   只覆盖 MAIN 命名空间。
 - ② 数据面切换与 ③ 规范逻辑地址层**未开始**（③ 的阻塞项已定案，先做 ③ 再做 ②）。

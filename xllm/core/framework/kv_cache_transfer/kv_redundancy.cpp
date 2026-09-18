@@ -27,6 +27,20 @@ void set_error(std::string* error, const std::string& message) {
   }
 }
 
+// The runtime places the sequence split with the DCP process group, and
+// ContextParallelTopology accepts exactly two shapes for it (see
+// ContextParallelTopology::ContextParallelTopology):
+//   (a) the DCP group partitions the PCP group: split divides cp_size;
+//   (b) the DCP group covers the whole DP-local domain: split is cp_size *
+//       tp_size.
+bool dcp_partitions_pcp(const KvTopology& topology, int32_t split) {
+  return split <= topology.cp_size && topology.cp_size % split == 0;
+}
+
+bool dcp_spans_domain(const KvTopology& topology, int32_t split) {
+  return split == topology.cp_size * topology.tp_size;
+}
+
 }  // namespace
 
 bool KvRedundancy::derive(const KvTopology& topology,
@@ -97,6 +111,19 @@ bool KvRedundancy::derive(const KvTopology& topology,
   }
   derived.replica_count_ = derived.redundancy_ / derived.split_;
 
+  // C3: the runtime has to be able to place this split in its DCP topology.
+  if (!dcp_partitions_pcp(topology, derived.split_) &&
+      !dcp_spans_domain(topology, derived.split_)) {
+    set_error(error,
+              "kv_split_size (" + std::to_string(derived.split_) +
+                  ") is not a DCP shape the runtime supports: it must divide "
+                  "cp_size (" +
+                  std::to_string(topology.cp_size) +
+                  ") or equal cp_size * tp_size (" +
+                  std::to_string(topology.cp_size * topology.tp_size) + ")");
+    return false;
+  }
+
   // Post-condition: head classes tile the global head range exactly.
   if (derived.head_class_count_ * derived.local_head_count_ != global_heads) {
     set_error(error,
@@ -125,6 +152,8 @@ KvLayoutIndex::KvLayoutIndex(const KvTopology& topology,
   local_head_count_ = redundancy.local_head_count();
   split_ = redundancy.split();
   replica_count_ = redundancy.replica_count();
+  partitions_pcp_ = dcp_partitions_pcp(topology, split_);
+  sequence_groups_ = partitions_pcp_ ? cp_size_ / split_ : 1;
 }
 
 int32_t KvLayoutIndex::rank(int32_t dp_rank,
@@ -146,15 +175,23 @@ int32_t KvLayoutIndex::head_class_of(int32_t tp_rank) const {
 }
 
 int32_t KvLayoutIndex::slice_of(int32_t cp_rank, int32_t tp_rank) const {
-  const int32_t group_slot =
-      cp_rank * tp_redundancy_ + tp_rank % tp_redundancy_;
-  return group_slot % split_;
+  // The slice of a rank is its DCP rank, the identity KVShardLayout::globalize
+  // inverts.
+  if (partitions_pcp_) {
+    return cp_rank / sequence_groups_;
+  }
+  return cp_rank * tp_size_ + tp_rank;
 }
 
 int32_t KvLayoutIndex::replica_of(int32_t cp_rank, int32_t tp_rank) const {
-  const int32_t group_slot =
-      cp_rank * tp_redundancy_ + tp_rank % tp_redundancy_;
-  return group_slot / split_;
+  if (!partitions_pcp_) {
+    // Every rank holds its own slice of the single head class, so there is no
+    // redundant copy and every rank is a writer.
+    return 0;
+  }
+  const int32_t sequence_replica = cp_rank % sequence_groups_;
+  const int32_t tp_replica = tp_rank % tp_redundancy_;
+  return sequence_replica * tp_redundancy_ + tp_replica;
 }
 
 bool KvLayoutIndex::writer_of(int32_t dp_rank,
@@ -166,12 +203,20 @@ bool KvLayoutIndex::writer_of(int32_t dp_rank,
       slice >= split_) {
     return false;
   }
-  // The replica-0 ranks are exactly those whose group slot equals the slice,
-  // because replica == group_slot / split and slice == group_slot % split.
-  const int32_t cp_rank = slice / tp_redundancy_;
-  const int32_t offset_in_replica = slice % tp_redundancy_;
-  const int32_t tp_rank = head_class * tp_redundancy_ + offset_in_replica;
-  *rank_out = rank(dp_rank, cp_rank, tp_rank);
+  // Replica 0 is the first sequence-replica group and the first TP replica.
+  const int32_t tp_rank = head_class * tp_redundancy_;
+  if (partitions_pcp_) {
+    *rank_out = rank(dp_rank, slice * sequence_groups_, tp_rank);
+    return true;
+  }
+  // The whole DP-local domain is one DCP group, so the rank whose DCP rank is
+  // the slice is its only holder.
+  const int32_t cp_rank = slice / tp_size_;
+  const int32_t holder_tp = slice % tp_size_;
+  if (holder_tp / tp_redundancy_ != head_class) {
+    return false;
+  }
+  *rank_out = rank(dp_rank, cp_rank, holder_tp);
   return true;
 }
 
@@ -185,13 +230,23 @@ bool KvLayoutIndex::replicas_of(int32_t dp_rank,
     return false;
   }
   ranks->clear();
+  if (!partitions_pcp_) {
+    const int32_t cp_rank = slice / tp_size_;
+    const int32_t holder_tp = slice % tp_size_;
+    if (holder_tp / tp_redundancy_ != head_class) {
+      return false;
+    }
+    ranks->emplace_back(rank(dp_rank, cp_rank, holder_tp));
+    return true;
+  }
   ranks->reserve(static_cast<size_t>(replica_count_));
-  for (int32_t replica = 0; replica < replica_count_; ++replica) {
-    const int32_t group_slot = replica * split_ + slice;
-    const int32_t cp_rank = group_slot / tp_redundancy_;
-    const int32_t offset_in_replica = group_slot % tp_redundancy_;
-    const int32_t tp_rank = head_class * tp_redundancy_ + offset_in_replica;
-    ranks->emplace_back(rank(dp_rank, cp_rank, tp_rank));
+  for (int32_t sequence_replica = 0; sequence_replica < sequence_groups_;
+       ++sequence_replica) {
+    const int32_t cp_rank = slice * sequence_groups_ + sequence_replica;
+    for (int32_t tp_replica = 0; tp_replica < tp_redundancy_; ++tp_replica) {
+      ranks->emplace_back(
+          rank(dp_rank, cp_rank, head_class * tp_redundancy_ + tp_replica));
+    }
   }
   return true;
 }

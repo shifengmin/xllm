@@ -245,8 +245,8 @@ TEST(PeerDirectoryTest, DescribesMlaLatentAcrossTheKvSplit) {
   const WorkerCacheLayoutManifest manifest = make_replicated_manifest(
       /*tp_rank=*/3,
       /*tp_size=*/8,
-      /*cp_rank=*/0,
-      /*cp_size=*/1,
+      /*cp_rank=*/2,
+      /*cp_size=*/4,
       /*kv_split_size=*/4,
       kKeyRole,
       /*group_id=*/0,
@@ -256,7 +256,7 @@ TEST(PeerDirectoryTest, DescribesMlaLatentAcrossTheKvSplit) {
   const std::vector<CacheTensorDeclaration> declarations = {
       make_declaration(kKeyRole,
                        /*group_id=*/0,
-                       /*cp_size=*/1,
+                       /*cp_size=*/4,
                        /*tp_size=*/8,
                        /*kv_split_size=*/4,
                        /*tokens_per_block=*/128,
@@ -288,7 +288,7 @@ TEST(PeerDirectoryTest, DescribesMlaLatentAcrossTheKvSplit) {
       KvRedundancy::derive(view->topology, view->group, &redundancy, &error))
       << error;
   EXPECT_EQ(redundancy.split(), 4);
-  EXPECT_EQ(redundancy.replica_count(), 2);
+  EXPECT_EQ(redundancy.replica_count(), 8);
   EXPECT_EQ(redundancy.local_head_count(), 1);
 }
 
@@ -958,11 +958,12 @@ TEST(PeerDirectoryTest, RejectsBasesForAStridedTensor) {
 }
 
 // The adapter is the seam to the binder, so one case walks a whole route:
-// eight source ranks over 2 heads (4-way split, one local head each) filling
-// one destination rank that holds both heads and the whole sequence. Every
-// canonical block has to arrive exactly once, and the regions of one block have
-// to tile its destination row.
+// 32 source ranks (CP4 x TP8) over 2 heads filling one destination rank that
+// holds both heads and the whole sequence. The source slice is the cp rank and
+// the writers sit at tp 0 of each cp rank. Every canonical block has to arrive
+// exactly once, and the regions of one block have to tile its destination row.
 TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
+  constexpr int32_t kSourceCp = 4;
   constexpr int32_t kSourceTp = 8;
   constexpr int32_t kSourceSplit = 4;
   constexpr int32_t kGlobalHeads = 2;
@@ -971,7 +972,7 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
   const CacheTensorDeclaration source_declaration =
       make_declaration(kKeyRole,
                        /*group_id=*/0,
-                       /*cp_size=*/1,
+                       /*cp_size=*/kSourceCp,
                        /*tp_size=*/kSourceTp,
                        /*kv_split_size=*/kSourceSplit,
                        /*tokens_per_block=*/kTokensPerBlock,
@@ -992,26 +993,28 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
                        /*full_sequence_replica=*/false);
 
   std::vector<PeerCacheView> sources;
-  sources.reserve(static_cast<size_t>(kSourceTp));
-  for (int32_t tp_rank = 0; tp_rank < kSourceTp; ++tp_rank) {
-    // One source row per rank: four canonical blocks over a 4-way split.
-    const WorkerCacheLayoutManifest manifest =
-        make_attention_manifest(tp_rank,
-                                kSourceTp,
-                                /*cp_rank=*/0,
-                                /*cp_size=*/1,
-                                kSourceSplit,
-                                kGlobalHeads,
-                                kTokensPerBlock,
-                                /*rows=*/1);
-    PeerDirectory directory;
-    std::string error;
-    ASSERT_TRUE(describe(manifest, {source_declaration}, &directory, &error))
-        << error;
-    const PeerCacheView* view =
-        directory.find(CacheNamespace::MAIN, 0, kKeyRole, 0);
-    ASSERT_NE(view, nullptr);
-    sources.emplace_back(*view);
+  sources.reserve(static_cast<size_t>(kSourceCp * kSourceTp));
+  for (int32_t cp_rank = 0; cp_rank < kSourceCp; ++cp_rank) {
+    for (int32_t tp_rank = 0; tp_rank < kSourceTp; ++tp_rank) {
+      // One source row per rank: four canonical blocks over a 4-way split.
+      const WorkerCacheLayoutManifest manifest =
+          make_attention_manifest(tp_rank,
+                                  kSourceTp,
+                                  cp_rank,
+                                  kSourceCp,
+                                  kSourceSplit,
+                                  kGlobalHeads,
+                                  kTokensPerBlock,
+                                  /*rows=*/1);
+      PeerDirectory directory;
+      std::string error;
+      ASSERT_TRUE(describe(manifest, {source_declaration}, &directory, &error))
+          << error;
+      const PeerCacheView* view =
+          directory.find(CacheNamespace::MAIN, 0, kKeyRole, 0);
+      ASSERT_NE(view, nullptr);
+      sources.emplace_back(*view);
+    }
   }
 
   const WorkerCacheLayoutManifest destination_manifest =
@@ -1056,34 +1059,42 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
   const KvLayoutIndex source_index(sources[0].topology, source_redundancy);
   const std::vector<int64_t> canonical_blocks = {0, 1, 2, 3};
   uint64_t written_bytes = 0;
-  for (int32_t src_rank = 0; src_rank < kSourceTp; ++src_rank) {
-    // The view knows the rank it was published by, so a mixed edge table is
-    // safe to pass.
-    ASSERT_EQ(sources[src_rank].local_rank, src_rank);
-    const int32_t slice =
-        source_index.slice_of(/*cp_rank=*/0, /*tp_rank=*/src_rank);
-    std::vector<int64_t> owned;
-    for (int64_t block : canonical_blocks) {
-      if (block % kSourceSplit == slice) {
-        owned.emplace_back(block);
+  for (int32_t cp_rank = 0; cp_rank < kSourceCp; ++cp_rank) {
+    for (int32_t tp_rank = 0; tp_rank < kSourceTp; ++tp_rank) {
+      const size_t src_rank =
+          static_cast<size_t>(cp_rank * kSourceTp + tp_rank);
+      // The view knows the rank it was published by, so a mixed edge table is
+      // safe to pass.
+      ASSERT_EQ(sources[src_rank].local_rank, static_cast<int32_t>(src_rank));
+      const int32_t slice = source_index.slice_of(cp_rank, tp_rank);
+      const int32_t head_class = source_index.head_class_of(tp_rank);
+      int32_t writer = -1;
+      ASSERT_TRUE(
+          source_index.writer_of(/*dp_rank=*/0, head_class, slice, &writer));
+      if (writer != static_cast<int32_t>(src_rank)) {
+        continue;  // only the replica-0 rank of a (head class, slice) writes
       }
-    }
-    if (owned.empty()) {
-      continue;
-    }
-    std::vector<RouteRegion> regions;
-    ASSERT_TRUE(RouteBinder::bind(edges,
-                                  /*dst_local_rank=*/0,
-                                  owned,
-                                  sources[src_rank],
-                                  *remote,
-                                  &regions,
-                                  &error))
-        << error;
-    for (const RouteRegion& region : regions) {
-      EXPECT_EQ(region.local_buffer_id, sources[src_rank].entry.buffer_id);
-      EXPECT_EQ(region.remote_buffer_id, remote->entry.buffer_id);
-      written_bytes += region.length;
+      std::vector<int64_t> owned;
+      for (int64_t block : canonical_blocks) {
+        if (block % kSourceSplit == slice) {
+          owned.emplace_back(block);
+        }
+      }
+      ASSERT_FALSE(owned.empty());
+      std::vector<RouteRegion> regions;
+      ASSERT_TRUE(RouteBinder::bind(edges,
+                                    /*dst_local_rank=*/0,
+                                    owned,
+                                    sources[src_rank],
+                                    *remote,
+                                    &regions,
+                                    &error))
+          << error;
+      for (const RouteRegion& region : regions) {
+        EXPECT_EQ(region.local_buffer_id, sources[src_rank].entry.buffer_id);
+        EXPECT_EQ(region.remote_buffer_id, remote->entry.buffer_id);
+        written_bytes += region.length;
+      }
     }
   }
   // Each of the four destination rows is covered exactly once: 2 head classes
@@ -1094,7 +1105,7 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
   // Edges of another source rank are skipped, so a pair handed the wrong source
   // view fails coverage instead of writing the wrong bytes.
   RouteEdge foreign;
-  foreign.src_local_rank = 1;
+  foreign.src_local_rank = 8;  // cp 1, tp 0: another writer of slice 1
   foreign.dst_local_rank = 0;
   foreign.head_begin = 0;
   foreign.head_end = 1;

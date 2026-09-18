@@ -61,10 +61,12 @@ GroupTopology make_group(int32_t global_head_count,
   return group;
 }
 
-// prefill: TP8 + DCP4, decode: DP4 + TP2 + DCP2.
+// prefill: CP4 + TP8 + DCP4 (world 32, the DCP group is the PCP group at a
+// fixed tp rank, so slice == cp_rank); decode: DP4 + CP1 + TP2 + DCP2 (the DCP
+// group covers the whole DP-local domain, so slice == tp).
 KvTopology prefill_topology(int32_t tokens_per_block) {
   return make_topology(/*dp_size=*/1,
-                       /*cp_size=*/1,
+                       /*cp_size=*/4,
                        /*tp_size=*/8,
                        /*kv_split_size=*/4,
                        tokens_per_block);
@@ -135,10 +137,11 @@ TEST(PdRouteTest, MlaLatentEdgeTableMatchesThePilotScenario) {
   const std::vector<RouteEdge> edges = build_edges(prefill, mla, decode, mla);
   ASSERT_EQ(edges.size(), 4u);
 
-  // Only the replica-0 ranks of the source write: slices 0..3 live on the
-  // local ranks 0..3, and slice tP lands on destination slice tP % 2.
+  // Only the replica-0 ranks of the source write: slice tP lives on cp rank tP
+  // at tp 0 (local rank 8 * tP), and slice tP lands on destination slice
+  // tP % 2, which on the decode side is tp rank tP % 2.
   const std::array<std::array<int32_t, 4>, 4> golden = {
-      {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 0, 2, 0}, {3, 1, 3, 1}}};
+      {{0, 0, 0, 0}, {8, 1, 1, 1}, {16, 0, 2, 0}, {24, 1, 3, 1}}};
   for (size_t index = 0; index < edges.size(); ++index) {
     const RouteEdge& edge = edges[index];
     EXPECT_EQ(edge.src_local_rank, golden[index][0]);
@@ -244,82 +247,89 @@ TEST(PdRouteTest, IndexerPoolStaysAFullSequenceReplica) {
 TEST(PdRouteTest, RouteInvariantsHoldOverTheTopologyMatrix) {
   const std::array<int32_t, 7> head_counts = {1, 2, 4, 8, 16, 32, 64};
   const std::array<int32_t, 4> tp_widths = {1, 2, 4, 8};
+  const std::array<int32_t, 3> pcp_widths = {1, 2, 4};
   const std::array<int32_t, 4> splits = {1, 2, 4, 8};
   int32_t buildable = 0;
 
   for (int32_t global_heads : head_counts) {
     for (int32_t tp_src : tp_widths) {
       for (int32_t tp_dst : tp_widths) {
-        for (bool sequence_scoped : {false, true}) {
-          const GroupTopology group =
-              make_group(global_heads, kHeadBytes, sequence_scoped, false);
-          for (int32_t split_src : splits) {
-            for (int32_t split_dst : splits) {
-              const KvTopology src =
-                  make_topology(1, 1, tp_src, split_src, kTokensPerBlock);
-              const KvTopology dst =
-                  make_topology(1, 1, tp_dst, split_dst, kTokensPerBlock);
+        for (int32_t cp_src : pcp_widths) {
+          for (int32_t cp_dst : pcp_widths) {
+            for (bool sequence_scoped : {false, true}) {
+              const GroupTopology group =
+                  make_group(global_heads, kHeadBytes, sequence_scoped, false);
+              for (int32_t split_src : splits) {
+                for (int32_t split_dst : splits) {
+                  const KvTopology src = make_topology(
+                      1, cp_src, tp_src, split_src, kTokensPerBlock);
+                  const KvTopology dst = make_topology(
+                      1, cp_dst, tp_dst, split_dst, kTokensPerBlock);
 
-              KvRedundancy src_redundancy;
-              KvRedundancy dst_redundancy;
-              std::string error;
-              if (!KvRedundancy::derive(src, group, &src_redundancy, &error) ||
-                  !KvRedundancy::derive(dst, group, &dst_redundancy, &error)) {
-                continue;
-              }
-              const int32_t src_split = src_redundancy.split();
-              const int32_t dst_split = dst_redundancy.split();
-              const bool nested =
-                  src_split % dst_split == 0 || dst_split % src_split == 0;
+                  KvRedundancy src_redundancy;
+                  KvRedundancy dst_redundancy;
+                  std::string error;
+                  if (!KvRedundancy::derive(
+                          src, group, &src_redundancy, &error) ||
+                      !KvRedundancy::derive(
+                          dst, group, &dst_redundancy, &error)) {
+                    continue;
+                  }
+                  const int32_t src_split = src_redundancy.split();
+                  const int32_t dst_split = dst_redundancy.split();
+                  const bool nested =
+                      src_split % dst_split == 0 || dst_split % src_split == 0;
 
-              std::vector<RouteEdge> edges;
-              const bool built =
-                  PdRouteTable::build(src, group, dst, group, &edges, &error);
-              if (!nested) {
-                EXPECT_FALSE(built) << "splits " << src_split << "/"
-                                    << dst_split << " are not nested";
-                continue;
-              }
-              ASSERT_TRUE(built) << error;
-              ++buildable;
-              EXPECT_TRUE(
-                  PdRouteTable::validate(edges, src, group, dst, group, &error))
-                  << error;
+                  std::vector<RouteEdge> edges;
+                  const bool built = PdRouteTable::build(
+                      src, group, dst, group, &edges, &error);
+                  if (!nested) {
+                    EXPECT_FALSE(built) << "splits " << src_split << "/"
+                                        << dst_split << " are not nested";
+                    continue;
+                  }
+                  ASSERT_TRUE(built) << error;
+                  ++buildable;
+                  EXPECT_TRUE(PdRouteTable::validate(
+                      edges, src, group, dst, group, &error))
+                      << error;
 
-              // Every head of every source replica-0 rank is sent exactly once
-              // per destination replica.
-              const int32_t src_ranks = src.cp_size * src.tp_size;
-              std::vector<int32_t> per_source(
-                  static_cast<size_t>(src_ranks) *
-                      static_cast<size_t>(src_split) *
-                      static_cast<size_t>(global_heads),
-                  0);
-              for (const RouteEdge& edge : edges) {
-                for (int32_t head = edge.head_begin; head < edge.head_end;
-                     ++head) {
-                  const size_t index =
-                      (static_cast<size_t>(edge.src_local_rank) *
-                           static_cast<size_t>(src_split) +
-                       static_cast<size_t>(edge.src_slice)) *
-                          static_cast<size_t>(global_heads) +
-                      static_cast<size_t>(head);
-                  ++per_source[index];
+                  // Every head of every source replica-0 rank is sent exactly
+                  // once per destination replica.
+                  const int32_t src_ranks = src.cp_size * src.tp_size;
+                  std::vector<int32_t> per_source(
+                      static_cast<size_t>(src_ranks) *
+                          static_cast<size_t>(src_split) *
+                          static_cast<size_t>(global_heads),
+                      0);
+                  for (const RouteEdge& edge : edges) {
+                    for (int32_t head = edge.head_begin; head < edge.head_end;
+                         ++head) {
+                      const size_t index =
+                          (static_cast<size_t>(edge.src_local_rank) *
+                               static_cast<size_t>(src_split) +
+                           static_cast<size_t>(edge.src_slice)) *
+                              static_cast<size_t>(global_heads) +
+                          static_cast<size_t>(head);
+                      ++per_source[index];
+                    }
+                  }
+                  const int32_t period =
+                      dst_split / greatest_common_divisor(src_split, dst_split);
+                  size_t non_zero = 0;
+                  for (int32_t count : per_source) {
+                    if (count == 0) {
+                      continue;
+                    }
+                    ++non_zero;
+                    EXPECT_EQ(count, period * dst_redundancy.replica_count());
+                  }
+                  // Only the replica-0 rank of each (head class, slice) writes.
+                  EXPECT_EQ(non_zero,
+                            static_cast<size_t>(global_heads) *
+                                static_cast<size_t>(src_split));
                 }
               }
-              const int32_t period =
-                  dst_split / greatest_common_divisor(src_split, dst_split);
-              size_t non_zero = 0;
-              for (int32_t count : per_source) {
-                if (count == 0) {
-                  continue;
-                }
-                ++non_zero;
-                EXPECT_EQ(count, period * dst_redundancy.replica_count());
-              }
-              // Only the replica-0 rank of each (head class, slice) writes.
-              EXPECT_EQ(non_zero,
-                        static_cast<size_t>(global_heads) *
-                            static_cast<size_t>(src_split));
             }
           }
         }
@@ -382,8 +392,9 @@ TEST(PdRouteTest, BinderFansOutWhenTheSourceIsNarrower) {
                                        /*sequence_scoped=*/false,
                                        /*full_sequence_replica=*/false);
   const std::vector<RouteEdge> edges = build_edges(narrow, mla, wide, mla);
-  // Two source slices, two destination slices each, two destination replicas.
-  ASSERT_EQ(edges.size(), 8u);
+  // Two source slices, two destination slices each, and eight destination
+  // replicas (every TP rank of the wide side holds the single MLA head).
+  ASSERT_EQ(edges.size(), 32u);
 
   const uint64_t row_bytes =
       static_cast<uint64_t>(kTokensPerBlock) * kHeadBytes;
@@ -575,8 +586,8 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
   }
 
   std::vector<std::vector<uint8_t>> source(
-      8, std::vector<uint8_t>(kMockBufferBytes, 0));
-  for (int32_t rank = 0; rank < 8; ++rank) {
+      32, std::vector<uint8_t>(kMockBufferBytes, 0));
+  for (int32_t rank = 0; rank < 32; ++rank) {
     for (uint64_t row = 0; row < kMockRows; ++row) {
       for (uint64_t offset = 0; offset < kMockRowBytes; ++offset) {
         source[rank][row * kMockRowBytes + offset] =
@@ -587,14 +598,16 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
   std::vector<std::vector<uint8_t>> destination(
       8, std::vector<uint8_t>(kMockBufferBytes, 0));
 
-  // One (source rank, destination rank) pair at a time, carrying the blocks
-  // that the source rank holds and the destination rank needs.
-  const std::vector<std::pair<int32_t, int32_t>> pairs = {
-      {0, 0}, {2, 0}, {1, 1}, {3, 1}};
-  for (const auto& [src_local, dst_local] : pairs) {
+  // One source slice at a time, carrying the blocks that its writer holds and
+  // the destination rank that owns the matching destination slice needs. The
+  // writer of source slice t is cp rank t at tp 0, i.e. local rank 8 * t, and
+  // the destination slice is t % 2 = tp rank t % 2.
+  for (int32_t src_slice = 0; src_slice < 4; ++src_slice) {
+    const int32_t src_local = src_slice * 8;
+    const int32_t dst_local = src_slice % 2;
     std::vector<int64_t> blocks;
     for (int64_t block = 0; block < 8; ++block) {
-      if (block % 4 == src_local && block % 2 == dst_local) {
+      if (block % 4 == src_slice && block % 2 == dst_local) {
         blocks.emplace_back(block);
       }
     }
@@ -635,10 +648,10 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
                            [static_cast<size_t>(row) * kMockRowBytes +
                             offset_in_row];
             // The expectation is derived independently of the route table: the
-            // block's writer is the rank whose slice is block % src_split, and
-            // its row is block / src_split.
+            // block's writer is cp rank (block % src_split) at tp 0, i.e. local
+            // rank 8 * (block % src_split), and its row is block / src_split.
             const uint8_t expected =
-                carries_data ? mock_pattern(static_cast<int32_t>(block % 4),
+                carries_data ? mock_pattern(static_cast<int32_t>(block % 4) * 8,
                                             block / 4,
                                             offset_in_row)
                              : 0;
