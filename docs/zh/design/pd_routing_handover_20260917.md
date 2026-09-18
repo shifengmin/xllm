@@ -235,8 +235,10 @@ INDEX 用 `row = canonical`）。
 统一公式 `row = canonical / S_eff`（退化为 `row = canonical`，正好对上 index 行数 `= n_blocks × S`）。
 目标场景下 indexer 的边表因此是 1 个源 rank 扇出到 `N_rep` 个目的 rank（P 侧 8、D 侧 2）。
 
-**定音探针（仍待做，但不再阻塞）**：目标配置（TP8 + DCP4）下单次启动，打印 `index_cache_shape()` 与 `k_cache_shape()` 的行数比、
-`kv_cache_cap.n_blocks()`、`num_indexer_layers()`；它现在只需确认"这组是否真的该声明"。
+**✅ 2026-09-18 已实测确认（无需再跑探针）**：生产 DCP4 日志
+`kv_cache_shape.cpp:195 Initializing indexer cache with shape: [26052 128 1 257]`，同实例 `blocks: 6513`、`kv_split=4`，
+`26052 = 6513 × 4` = 全部规范块 ⇒ **index cache 是复制**，`S_eff=1` 成立。
+来源：`~/work/glm5-next-dcp-session/DCP4容量实测-中断存档.md`。
 
 ### 6.2 kPool packed 宽度
 
@@ -244,6 +246,8 @@ INDEX 用 `row = canonical`）。
 `glm5_next` 代码默认 `false`（宽度 128），但紧邻注释与 `deepseek_v2_attention.cpp:56` 的
 `use_kpool_indexer_ = has_indexer_ && args.index_kpool_compress()` 表明**真实 checkpoint 预期为 true**（宽度 257）。
 mock 应对两种各出一例。
+
+**✅ 2026-09-18 已实测：生产实例用的是 257**（上文 `[26052 128 1 257]` 的最后一维）。mock/测试以 257 为主用例。
 
 ### 6.3 kv_split 的划分发生在哪一层
 
@@ -255,6 +259,26 @@ mock 应对两种各出一例。
 **S2 期间的旁证（读码，非探针）**：MLA 的描述符来自 `describe_replicated_tensor`（`enable_mla` 分支），内容是
 "整行一个 span + `owner_tp_rank=0`"，**描述符里根本没有块身份**。既然 manifest 无法表达"哪些规范块归哪个 rank"，
 该划分只可能来自调度侧分配的 block id ⇒ 倾向"canonical block 应引入在**契约层/分配层**"。
+
+**✅ 2026-09-18 已确认**（`_resume/DCP×PD兼容性与linear-cache静态审查-20260915.md`）：
+`rank_local_mapping = kv_split_size > 1 && has_rank_preserving_kv_groups(resp)`，对 GLM5-next 的普通 KV 组恒真
+⇒ `filter_kv_split_infos` 的 remap 整体跳过 ⇒ **划分确实在 D 侧分配 block id 时完成**。S3 按"契约层"设计。
+
+### 6.5 旧 PD 路径支持哪些 kv_split 形状（S3 的范围约束）
+
+同一份兼容性审查（只读代码 + 实测）给出：
+
+| 组合 | 旧路径 | 失败模式 |
+|---|---|---|
+| P 开(k>1) / D 不开(1) | ❌ | planner 放行，但块映射层 `kv_cache_transfer.cpp` 的 size mismatch ⇒ `CHECK(kv_transfers.wait())` **abort** |
+| P 不开(1) / D 开(k>1) | ❌ | 建链期 `supports_partition_layout` 皆假 ⇒ `invalid` |
+| 两端都开、**k 相同** | ✅ **唯一可用** | 强制 `same_partition`（cp_rank + kv_split_rank 全等），D 只把 rank 对齐的 P 设为 ACTIVE |
+| 两端都开、k 不同 | ❌ | `supports_partition_pair` 假 ⇒ 建链期报错 |
+
+**前置条件：`kv_split == cp_size × tp_size == world / dp`。** 目标场景 `P: TP8 + kv_split4`（`S=4 ≠ cp*tp=8`）
+正好在此范围之外 —— 这正是重构要打开的新形状。⇒ **S3-4 不能只"换一条算路"**，必须同时替换
+`filter_kv_split_infos` / `rotate_dst_rank` 那套 "`S == TP` 且两侧 rank 1:1 对齐" 的隐含前提；
+另外 `fingerprint` 不含 `kv_split`，跨实例的 `kv_split` / `B_token` 一致性必须由新校验兜住（S5）。
 
 ### 6.4 其他（详见 review 文档）
 
