@@ -1577,3 +1577,41 @@ payload 已在容器里用 3.11 校验：两个文件 `ast.parse` 都 OK。
 2. 容器内 `bash npu_init.sh 0,1,2,3,4,5` → `bash run_all.sh`（**先不开 trace**，先确认能起来）
 3. `bash smoke.sh` 通了之后 → `bash run_trace.sh` → 把 trace 目录取回来 → `compare_kv.py --list` 再正式比对
 4. 比对通过后：`trace_remove.sh` 还原，清 `PDROUTE_BUILD_ONLY_BYPASS` 等残留，再对齐 98 的树到 GitHub 版本。
+
+---
+
+## 第 21 轮：给比对器补"作用域"，消掉一类误报（2026-09-18 15:2x）
+
+第 20 轮的比对器有一个**会误报 FAIL** 的漏洞：它把"decode 侧某行的字节在 prefill 里查不到"一律记成
+`absent` 并判失败。但 decode 的 `block_table` 里可能有**padding lane**（ACL graph 补位、分配器复用、
+或某 lane 指向根本没被 prefill 处理的块），这种"查不到"**不是传输 bug**。
+
+### 修法：把"批次声明了哪些逻辑块"也打进 trace，用它判作用域
+
+`_pd_trace.py` 每次 dump 多写一条 `slot="__meta__"` 的记录，带上该 step 的**逻辑块列表**
+（`block_table` ∪ 由 `slot_mapping // (block_size*S)` 反推的块，两者取并集做冗余）。
+比对器据此分两类计数：
+
+* `absent_in`（**在作用域内**却查不到字节）→ 真丢数据 → **判 FAIL**
+* `abs_oos`（**不在作用域内**）→ padding/复用 lane → **只报告，不判失败**
+
+作用域判据：canonical `c` 对应 prefill 逻辑块 `c // S`，只要 `c // S` 在**任一** P source 的
+`__meta__.blocks` 里就算在作用域内；同时要求 `c` 落在 D 自己的 canonical 集合里。
+两类 slot 用的是同一个条件（因为都回落到 `c // S`）。
+
+### 自测扩到 4 个用例（`make_synthetic.py` 现在一次生成 4 个目录）
+
+| 用例 | 构造 | 期望 | 实测 |
+|---|---|---|---|
+| `ok` | 正确的分片 + 复制 | PASS | PASS（36/36） |
+| `padded` | 在 `ok` 基础上让 decode 多声明一个 P 从没碰过的块 `99` | **仍 PASS** | **PASS**，`abs_oos=2` |
+| `bad` | D rank1 的 key 块 2 写成 dcp=0 的片 | FAIL | FAIL，`mismatch=2`，映射打印 `(1,1)->(0,0)` |
+| `absent` | 在 `ok` 上把 D rank0 一个**真在作用域内**的 key 行改成查不到 | FAIL | FAIL，`absent_in=1` |
+
+`padded` 是关键回归：改动前它会误判 FAIL。现在 4/4 都符合预期。
+
+### 其它
+
+* 两个 payload 已重新上传到 83，容器内 Python 3.11 `ast.parse` 通过
+  （`_pd_trace.py` 8694B md5前缀 `c90ed6cc73f4`，`executor_hook_tail.py` 1578B `f4a8d3d1c58d`）。
+* 构建 `[988/1380]`、undefined=0、无 error。
