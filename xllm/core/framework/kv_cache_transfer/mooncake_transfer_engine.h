@@ -184,8 +184,18 @@ class MooncakeTransferEngine {
                                    const std::vector<ByteRegion>& regions,
                                    MoveOpcode move_opcode);
 
+  // Negotiates one session per published peer and records every peer's layout.
+  //
+  // `canonical_route` chooses which peers are opened as ACTIVE writers. The
+  // legacy planner derives them from the destination's own bytes, and that
+  // derivation only accepts a destination whose KV-split is 1 or equal to the
+  // source's, so it refuses the heterogeneous reshard the canonical route
+  // exists to serve. The canonical route binds every block to a writer itself,
+  // so it asks for every published peer instead and lets the binder skip the
+  // ones it does not need.
   bool link_sessions(const std::vector<uint64_t>& cluster_ids,
-                     const std::vector<std::string>& remote_addrs);
+                     const std::vector<std::string>& remote_addrs,
+                     bool canonical_route = false);
 
   Status set_local_cache_layout(const WorkerCacheLayoutManifest& manifest);
 

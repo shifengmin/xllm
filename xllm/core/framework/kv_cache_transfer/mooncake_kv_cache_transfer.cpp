@@ -255,7 +255,8 @@ bool MooncakeKVCacheTransferBase::link_clusters(
     LOG(ERROR) << "MoonCake link endpoint and port counts differ.";
     return false;
   }
-  if (!mooncake_te_->link_sessions(cluster_ids, remote_addrs)) {
+  if (!mooncake_te_->link_sessions(
+          cluster_ids, remote_addrs, canonical_route_)) {
     return false;
   }
   linked_source_addrs_ = remote_addrs;

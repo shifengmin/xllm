@@ -112,6 +112,20 @@ bool supports_partition_layout(const ParallelCoordinates& source,
            source.kv_split_size == destination.kv_split_size));
 }
 
+// The identity of the cache both peers hold: they may disagree about how the
+// sequence and the heads are partitioned, never about what is being
+// partitioned.
+Status validate_layout_family(const WorkerCacheLayoutManifest& source,
+                              const WorkerCacheLayoutManifest& destination) {
+  if (source.schema_version != destination.schema_version ||
+      source.fingerprint != destination.fingerprint ||
+      source.backend != destination.backend ||
+      source.layout_family != destination.layout_family) {
+    return invalid("source and destination instance layouts are incompatible");
+  }
+  return Status();
+}
+
 bool supports_partition_pair(const ParallelCoordinates& source,
                              const ParallelCoordinates& destination) {
   if (same_partition_sizes(source, destination)) {
@@ -345,11 +359,9 @@ Status validate_source_instance(
   if (!reference_status.ok()) {
     return invalid("invalid source layout: " + reference_status.message());
   }
-  if (reference.schema_version != destination.schema_version ||
-      reference.fingerprint != destination.fingerprint ||
-      reference.backend != destination.backend ||
-      reference.layout_family != destination.layout_family) {
-    return invalid("source and destination instance layouts are incompatible");
+  const Status family_status = validate_layout_family(reference, destination);
+  if (!family_status.ok()) {
+    return family_status;
   }
   if (!supports_partition_layout(reference.coordinates,
                                  destination.coordinates)) {
@@ -880,6 +892,49 @@ Status ReshardPlanner::select_sources(
     return coverage;
   }
   selected_indices->swap(writers);
+  return Status();
+}
+
+Status ReshardPlanner::select_canonical_sources(
+    const std::vector<WorkerCacheLayoutManifest>& sources,
+    const WorkerCacheLayoutManifest& destination,
+    std::vector<size_t>* selected_indices) const {
+  if (selected_indices == nullptr) {
+    return invalid("selected source index output must not be null");
+  }
+  selected_indices->clear();
+  const Status destination_status = validate_worker_cache_layout(destination);
+  if (!destination_status.ok()) {
+    return invalid("invalid destination layout: " +
+                   destination_status.message());
+  }
+  if (sources.empty()) {
+    return invalid("source layout set is empty");
+  }
+  if (!supports_kv_split_topology(destination.coordinates)) {
+    return invalid(
+        "destination cp_size must be divisible by kv_split_size, or "
+        "kv_split_size must equal cp_size * tp_size");
+  }
+  for (const WorkerCacheLayoutManifest& source : sources) {
+    const Status source_status = validate_worker_cache_layout(source);
+    if (!source_status.ok()) {
+      return invalid("invalid source layout: " + source_status.message());
+    }
+    if (!supports_kv_split_topology(source.coordinates)) {
+      return invalid(
+          "source cp_size must be divisible by kv_split_size, or "
+          "kv_split_size must equal cp_size * tp_size");
+    }
+    const Status family_status = validate_layout_family(source, destination);
+    if (!family_status.ok()) {
+      return family_status;
+    }
+  }
+  selected_indices->reserve(sources.size());
+  for (size_t index = 0; index < sources.size(); ++index) {
+    selected_indices->emplace_back(index);
+  }
   return Status();
 }
 

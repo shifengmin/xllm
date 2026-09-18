@@ -766,7 +766,8 @@ bool MooncakeTransferEngine::close_session(const uint64_t cluster_id,
 
 bool MooncakeTransferEngine::link_sessions(
     const std::vector<uint64_t>& cluster_ids,
-    const std::vector<std::string>& remote_addrs) {
+    const std::vector<std::string>& remote_addrs,
+    bool canonical_route) {
   if (cluster_ids.size() != remote_addrs.size() || cluster_ids.empty()) {
     LOG(ERROR) << "MoonCake link session endpoint sizes are invalid.";
     return false;
@@ -792,8 +793,12 @@ bool MooncakeTransferEngine::link_sessions(
 
   ReshardPlanner planner;
   std::vector<size_t> selected_indices;
-  const Status selection = planner.select_sources(
-      remote_manifests, *local_manifest, &selected_indices);
+  const Status selection =
+      canonical_route
+          ? planner.select_canonical_sources(
+                remote_manifests, *local_manifest, &selected_indices)
+          : planner.select_sources(
+                remote_manifests, *local_manifest, &selected_indices);
   if (!selection.ok()) {
     LOG(ERROR) << "Remote cache layouts cannot cover local destination: "
                << selection.message();
