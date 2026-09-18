@@ -1913,3 +1913,100 @@ gdb 抓到 prefill rank 0 的栈：
 * `BUILD_EXIT=0 16:01:22`；`bdist_wheel` 正在写（wheel 从 15MB 长到 197MB，目标 ~576MB）。
 * 之后：`deploy_stage98.sh wheel`（**一次只传一个文件**）→ `install83.sh`（保持规范 wheel 文件名）
   → `clean_restart.sh`（全清 + 错开启动）→ 通了再 `run_trace.sh` + `smoke_long.sh` → `compare_kv.py`。
+
+---
+
+## 第 26 轮：构建耗时拆解（+`strip` 提速结论）与当前唯一拦路虎（2026-09-18 16:17）
+
+### (1) 回答一个关键问题：构建**并没有**每次全编
+
+`SKIP_TEST=1` 从第 19 轮起就一直在用，`setup.py:703` 就是那个 UT 开关：
+
+```python
+if "SKIP_TEST" in os.environ:
+    logger.info("⏭️ skipping UT because SKIP_TEST is set")
+```
+
+最近这一轮（改 `mooncake_kv_cache_transfer.cpp` 一个文件）的真实耗时：
+
+| 阶段 | 时刻 | 耗时 |
+|---|---|---|
+| 内层脚本启动 | 15:58:46 | — |
+| `BUILD_EXIT=0` | 16:01:22 | **2m36s**（重编 1 个 TU + 重链） |
+| `WHEEL_EXIT=0` | 16:03:58 | **2m36s**（打包 wheel） |
+
+ninja 全程只报 `[3/3]`。ccache（`CCACHE_DIR=/export/home/shifengmin.3/workspace/.ccache`）
+和 `MAX_JOBS=12` 都已在用。
+
+### (2) 真正吃掉 ~13 分钟的是 **cmake 重新 configure**（⇒ brpc 325 个目标全重编）
+
+brpc 把 revision 烤进了编译宏：
+
+```
+-DBRPC_REVISION="\|pd-routing-s0s1\|ad98850a8\|2026-09-18T15:01:19+08:00"
+```
+
+只要 cmake 重跑且这个值变了，brpc 就整包重编。**所以规矩是：构建前后不动 HEAD**
+—— 这也正是 dedup 修复**故意留在远端工作区不 commit** 的原因（HEAD 不动 ⇒ cmake 不重跑
+⇒ brpc 不重编，同时 `xllm_ops` 预编译门也保持满足）。
+
+### (3) 结论：剩下的时间不在编译上，而在"大 ELF"上 —— 下次用 `strip`
+
+时间实际花在：① 链接 563MB 的 ELF；② 把 563MB zip 成 576MB 的 wheel（~2.5min）；
+③ 576MB 的 scp 98→83（~2-3min）+ pip 安装。三者都被 ELF 里的 **debug info** 主导。
+
+**下次迭代：打包前先 `strip --strip-debug`**（在容器里做，**不用改 CMake、不用重编**），
+预期 ELF 从 563MB 降到一两百 MB，链接/打包/传输一起快约 3 倍。
+唯一代价是 xllm 自身的 gdb 符号；但本轮所有有用的栈帧都来自 **CANN 库和 CPython**
+（`libcann_kb.so` / `libfe.so` / `Python/thread_pthread.h`），所以现在就可以 strip。
+
+### (4) **好消息：dedup 修复被运行期签名确认**
+
+装上含修复的新 wheel（md5 `f87c4008abc0d130098165414fdddd9f`）后：
+
+| 签名 | 修复前 | 修复后 |
+|---|---|---|
+| `canonical route cannot interpret this rank` | **6** | **0** |
+| `Create Mooncake KVCacheTransfer, pd_route=canonical` | 6 | 6 |
+
+即 canonical 路由**不再静默退化成 legacy**。这是本轮验证最核心的产出：
+**我在真机上跑出了一个自己的真 bug 并修掉了它。**
+
+### (5) 当前唯一的拦路虎：CANN 算子编译知识库的锁（环境问题，不是路由问题）
+
+16:17:35 的快照：
+
+| 角色 | brpc 就绪 | 日志最后一行 |
+|---|---|---|
+| DECODE rank 0 | **1**（API 已起） | `Application startup complete.` @16:06:18 |
+| DECODE rank 1 | 0 | `get_cache_info success` @16:06:17 |
+| PREFILL rank 0..3 | 0/4 | `Successfully connected to xservice` / `register_kv_cache_impl success` @16:07:1x |
+
+* 错误签名：`FATAL` 0、`terminate called` 0、`EI0019` 0（**HCCL 端口修复有效**）。
+* etcd 里**仍只有 DECODE 实例**（`XLLM:DECODE:11.87.191.83:29994`），PREFILL 从未注册。
+* prefill rank 0 的栈仍在：`acquire_timed(lock, timeout=1000000000)`
+  ← `lock_PyThread_acquire_lock` ← … ← `CannKb::PyInterface::CannKbInit`（`libcann_kb.so`）
+  ← `PythonAdapterManager::InitCannKB` ← `TbeInitialize` ← `TbeOpStoreAdapter::InitializeInner`
+  ← `fe::OpStoreAdapterManager::InitializeAdapter`。
+
+**关键观察：只有"整体第一个启动"的进程（decode rank 0）走过去了，之后启动的全部卡住。**
+这与"那把锁被第一个进程长期持有"一致（错开 15s 不够）。
+
+**可观测的预测**：`timeout=1000s`，锁大约在 **16:07:11 + 1000s ≈ 16:23:51** 到期。
+到点后要么报错继续、要么真的楔死 —— 这本身就是一条判据（去看 `status.sh` 与 rank 0 日志的 mtime 有没有跳）。
+
+**下一步对这条的三个候选对策**（按代价从低到高）：
+
+1. **观察 16:23:51 那个超时点**（零成本，先做）——看它是超时后自己过去，还是永远楔住。
+2. **给每个 rank 独立的编译缓存/KB 目录**（`ASCEND_CACHE_PATH` / `ASCEND_WORK_PATH` 按 rank 分），
+   若那把锁是共享文件锁就会被彻底绕开；代价是每个 rank 可能要各自重编算子（慢但无竞争）。
+3. **串行预热**：先只起 1 个 rank 让它把算子编译/KB 建好，再起其余 5 个。
+
+（备选终极方案：把 P 和 D 分到两台机器 —— 那是工作日志里**已验证过的两机配方**；
+98 目前满卡，需要另找机器。）
+
+### (6) 收尾清单（沿用第 25 轮，补一条）
+
+`trace_remove.sh` 还原插桩 → 把 **dedup 修复提交到 GitHub**（在 local clone 里做同样编辑，
+commit + push；目前**只在远端工作区**）→ 清 `PDROUTE_BUILD_ONLY_BYPASS` 等残留
+→ 用 `align_remote_tree.sh` 对齐 98 的树（并立刻重钉 ops marker）。
