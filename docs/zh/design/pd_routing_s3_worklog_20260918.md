@@ -1386,6 +1386,9 @@ GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ControlPath=none -o IPQoS=0 -o TCPKe
 
 ### (5) 字节级验证的落地设计（代码已写好，等跑通就插桩）
 
+> **⚠️ 第 20 轮已纠正本条**：下面的判据只对 **key/value** 成立；**index/indexer_scale 的行号是 canonical 块号**
+> 且**每个 P rank 都复制一份**。以第 20 轮 (1) 的裁定表为准。
+
 判据**不依赖我自己的路由代码**，而是用 **token 语义**：
 
 > `DECODE.physical_block[r]  ==  PREFILL(dcp_rank = r % S).physical_block[r // S]`
@@ -1463,3 +1466,114 @@ python 路径期望的 `glm_next_transformer` 缺失是**安全 no-op**）；
 - `xllm/core/framework/kv_cache_transfer/CMakeLists.txt.bak-r18`（我本轮建的备份）。
 - 未跟踪残留：`third_party/dependencies.sh`、`push_route.{h,cpp}`（CMake 不引用、不参与编译）。
 - `~/work/pdtrace/` 三个文件是**验证专用**，不要直接合进主线（或明确标注）。
+
+---
+
+## 第 20 轮：cache 行索引语义的最终裁定 + 字节比对器重写并自测（2026-09-18 15:0x）
+
+等构建期间（`[897/1380]`，undefined=0）做的**纯本机**工作，没有碰正在构建的树。
+
+### (1) 纠正第 18 轮的判据：行索引语义**按 slot 分两类**，不能只写一条
+
+第 18 轮记的 `DECODE.physical_block[r] == PREFILL(dcp=r%S).physical_block[r//S]` 只对 **key/value 成立**，
+对 **index/indexer_scale 是错的**。最终裁定如下（两条独立证据互相印证）：
+
+**证据 A：paged-slot 契约。** `build_kv_shard_batch_metadata()`（`kv_shard_batch_metadata.cpp:145`）用
+`KVShardLayout(options_.block_size(), S, dcp_rank)`，而 `localize_kv_shard_slots` 的算法是
+
+```
+logical_offsets  = global_slot % (block_size * S)
+owner_rank       = logical_offsets / block_size          ← 谁拥有这一片
+local_offset     = logical_offsets % block_size
+logical_block_id = global_slot / (block_size * S)
+local_slot       = logical_block_id * block_size + local_offset
+```
+
+⇒ 分配器的"块"就是**逻辑块**（`block_size * S` 个 token），`slot_mapping` 的块号是逻辑块号，
+某个 rank 的 cache **行号 = 逻辑块号**，行内只有它自己那 `block_size=128` 个 token。
+
+**证据 B：shape + 我自己的 canonical 定义。**
+`init_key_cache_shape`（MLA）= `[n_blocks, block_size, 1, kv_lora_rank]` ⇒ shape[0] = 逻辑块数；
+`init_index_cache_shape` = `[n_blocks * S, block_size, 1, head_dim]`（`Platform::supports_dsa_indexer_cache_sharding()`
+在 NPU 返回 true，`platform.h:66`）⇒ **index cache 的 shape[0] 是 canonical 块数**。
+而 `cache_directory.cpp:573` 我自己写的注释是 "One logical block spans one canonical block per DCP rank"，
+`canonical = id * S + offset`；python 侧 `expand_indexer_block_table()` 对**每个逻辑块展开出全部 S 列**
+（`logical * S + slice`，slice 遍历 0..S-1），也就是**每个 P rank 的 indexer block table 都覆盖全部 S 片**。
+
+**裁定表**：
+
+| slot | cache 行号语义 | decode(行) | prefill 哪个 rank / 哪一行 |
+|---|---|---|---|
+| `key`, `value` | **逻辑块号**，行内是本 rank 的 128 token 切片 | `c` | rank `(c%S)*tp + tp(D)`，行 `c // S` |
+| `index`, `indexer_scale` | **canonical 块号**，且**每个 P rank 都有一份（复制的全序列）** | `c` | 任意 rank，行 `c` |
+
+这正是用户要验的"**prefill/decode DCP 异构 + indexer full sequence**"：MLA 的 KV 是真分片，
+indexer cache 是 **S 倍分配但全序列复制**，所以任何 rank 都能不靠集合通信跑完整序列的 indexer。
+验证时**必须额外断言** index 行在 4 个 P rank 上互相一致——这条现在写进断言里了。
+
+### (2) 追踪器重写：按 metadata 选行，不再盲扫前 64 行
+
+原版 `_pd_trace.py` 只 hash `tensor[:64]`。KV pool 有上千块，请求实际用的块几乎不可能落在 0..63，
+**盲扫必然采不到数据**。新版改为从 batch metadata 取该 step 真正用到的块：
+
+* `metadata.block_table` = 逻辑块号 → 取 `{b}`（给 key/value）
+* 再取 `{b*S + s | s < S}`（`S = metadata.kv_split_size`，给 index）
+* 两边 hash 的都是这两个索引空间的**并集**，比对脚本按 slot 语义各取所需
+* 没有可用 metadata 时才回退到前 `XLLM_PD_TRACE_BLOCKS`（默认 512）行
+* 记录里带上 `kv_split` / `is_prefill` / `call`，便于判断 chunked prefill 的第几 chunk
+
+hook 点：`ModelExecutor.execute`。C++ 是 `py_executor_.attr("execute")(tokens, positions, metadata,
+embedding, sync)`（`py_executor_impl.cpp:353`），**实例属性查找** ⇒ 在类上打补丁生效。
+hook **自包含**（函数内 `import os`，`try/except ImportError` 退化为 no-op），因为 `executor.py` 里
+**没有** `import os`，不能在文件头加 import 之外的东西。
+
+### (3) 比对器重写：先"从字节反推映射"再对照理论，且**每个 D rank 都必须过**
+
+两个关键设计：
+
+1. **不预设 P↔D 的块号约定**。先建 `(layer, slot, sha256) -> [(rank, block)]` 反查表，再对每个 decode 行
+   报出"预测的 (rank,row)"与"实际命中的 (rank,row)"。若不一致，把发现的映射按计数打印——失败自带诊断。
+2. **判定取最差 rank，不是最好 rank**。第一版按"最佳 dump"打分，结果 decode rank1 的错片被 rank0 的
+   100% 掩盖，**坏用例误判为 PASS**。改成：同一 (tag, call) 下**所有 rank 都通过**才算通过。
+
+### (4) 自测（用合成 trace 验比对器，避免浪费一次真跑）
+
+`~/work/pdtrace/make_synthetic.py` 造 S=2/tp=2/4 个 P rank/2 个 D rank 的 dump，三个用例：
+
+| 用例 | 结果 |
+|---|---|
+| 正确（key/value 分片 + index 复制） | **PASS**，36/36 |
+| 故意把 D rank1 的 key 块 2 写成 dcp=0 的片 | **FAIL**，定位到 rank1/key/mismatch=2，映射打印 `(1,1)->(0,0)` |
+| 把 D rank0 的一个 key 行改成查不到的值（KV 没到） | **FAIL**，报 `absent=1` |
+
+三种路径都对。注意合成里 `ambig` 非 0 是**正常的**：MLA 只有 1 个 kv head，两个 TP rank 的
+latent 完全相同 ⇒ 同一 digest 有 2 个候选 (rank,row)，`(rank,row)` 命中即可，不算失败。
+
+### (5) 把插桩接进 83 的脚手架（已上传，未执行）
+
+新增/改动（本机 `~/work/pdroute83/`，已同步到 83 的 `/export/home/shifengmin.3/workspace/pdroute83/`）：
+
+* `env.sh`：加 `PD_TRACE`（默认 0）/`PD_TRACE_DIR`/`XLLM_PD_TRACE_BLOCKS`，`PD_TRACE=1` 时导出
+  `XLLM_PD_TRACE_DIR` 并建目录。**`/export/home` 是 bind-mount 进容器的**，所以 trace 目录 host 和
+  容器都能看见，不需要 docker cp。
+* `trace_install.sh`：把 `_pd_trace.py` 装进 `$SP/xllm/python/`，把 hook 追加到
+  `$SP/xllm/python/model_executor/executor.py`（**先备份 `executor.py.pre_pdtrace`**，marker 幂等），
+  装完用 `ast.parse` 校验两个文件都能解析。
+* `trace_remove.sh`：从备份还原 + 删 `_pd_trace.py` + 断言 marker 清干净。
+* `run_trace.sh`：清 trace 目录 → 装 hook → `PD_TRACE=1 run_all.sh` → `smoke.sh` → 列出行数。
+* `mk_stage83.sh`（本机）：把 `pdroute83/*.sh` + 两个 trace payload 用 **base64 内联**生成
+  `stage83.sh`，一次 `rrun` 写进 83。**这样上传不会留下 `._*` 的 AppleDouble 垃圾**
+  （之前 10 个脚本每个都配了一个 `._xxx.sh`）。
+
+payload 已在容器里用 3.11 校验：两个文件 `ast.parse` 都 OK。
+
+### (6) 构建与下一步
+
+构建仍是 `[897/1380]`、undefined=0、无 error，等在跑的 `wait_build2.sh`。
+
+构建成功后的顺序（**中途绝不动 HEAD**）：
+
+1. `rrun jd-node-98 < deploy_stage98.sh` → `rrun jd-node-83 < deploy_install83.sh`
+2. 容器内 `bash npu_init.sh 0,1,2,3,4,5` → `bash run_all.sh`（**先不开 trace**，先确认能起来）
+3. `bash smoke.sh` 通了之后 → `bash run_trace.sh` → 把 trace 目录取回来 → `compare_kv.py --list` 再正式比对
+4. 比对通过后：`trace_remove.sh` 还原，清 `PDROUTE_BUILD_ONLY_BYPASS` 等残留，再对齐 98 的树到 GitHub 版本。
