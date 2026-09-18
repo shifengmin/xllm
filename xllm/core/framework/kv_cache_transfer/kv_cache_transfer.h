@@ -86,7 +86,9 @@ class KVCacheTransfer {
   // Which data plane this instance uses, resolved once when the transfer object
   // is created. The two never fall back into each other: a route that cannot be
   // built has to fail, not quietly remap blocks the legacy way.
-  void set_canonical_route(bool canonical) { canonical_route_ = canonical; }
+  virtual void set_canonical_route(bool canonical) {
+    canonical_route_ = canonical;
+  }
   bool canonical_route() const { return canonical_route_; }
 
   virtual void configure_cache_layout(const ParallelArgs& parallel_args,

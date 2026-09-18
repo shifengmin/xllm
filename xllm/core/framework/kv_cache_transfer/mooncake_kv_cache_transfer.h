@@ -47,6 +47,12 @@ class MooncakeKVCacheTransferBase : public KVCacheTransfer {
                      const std::vector<std::string>& remote_addrs,
                      const std::vector<uint16_t>& ports) override;
 
+  // The canonical route decides which bytes move where, so the transfer engine
+  // must know it before any peer registers: an ACTIVE peer on the canonical
+  // route carries no legacy plan (see
+  // MooncakeTransferEngineCore::set_canonical_route).
+  void set_canonical_route(bool canonical) override;
+
   bool unlink_cluster(const uint64_t& cluster_id,
                       const std::string& remote_addr,
                       const uint16_t port,

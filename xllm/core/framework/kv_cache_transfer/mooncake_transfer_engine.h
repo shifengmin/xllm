@@ -69,6 +69,17 @@ class MooncakeTransferEngineCore {
 
   Status set_local_cache_layout(const WorkerCacheLayoutManifest& manifest);
   std::optional<WorkerCacheLayoutManifest> local_cache_layout() const;
+
+  // Whether the unified binder, rather than the legacy reshard planner, decides
+  // which bytes move where. It is a property of the instance's `--pd_route`, so
+  // it is set once while the transfer planes are created. Under the canonical
+  // route an ACTIVE peer deliberately carries no legacy plan: the binder places
+  // every block itself, and the rank that writes a block is not the one the
+  // legacy partition model would have picked -- it may hold none of the
+  // destination's bytes under that model at all.
+  void set_canonical_route(bool canonical) { canonical_route_ = canonical; }
+  bool canonical_route() const { return canonical_route_; }
+
   Status set_cache_peer(const WorkerCacheLayoutManifest& peer_manifest,
                         CachePeerMode mode);
   bool has_outgoing_plan(const std::string& remote_addr,
@@ -142,6 +153,7 @@ class MooncakeTransferEngineCore {
     bool holds_session = false;
   };
   std::unordered_map<std::string, SessionInfo> handles_;
+  bool canonical_route_ = false;
   std::optional<WorkerCacheLayoutManifest> local_cache_layout_;
   std::unordered_map<std::string, CachePeerLink> cache_peer_links_;
   std::unordered_map<std::string, WorkerCacheLayoutManifest> peer_layouts_;
@@ -198,6 +210,12 @@ class MooncakeTransferEngine {
                      bool canonical_route = false);
 
   Status set_local_cache_layout(const WorkerCacheLayoutManifest& manifest);
+
+  // Propagates the instance's route mode to the shared core; see
+  // MooncakeTransferEngineCore::set_canonical_route.
+  void set_canonical_route(bool canonical) {
+    core_.set_canonical_route(canonical);
+  }
 
   bool has_outgoing_plan(const std::string& remote_addr,
                          CacheNamespace cache_namespace) const;

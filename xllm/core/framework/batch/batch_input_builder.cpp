@@ -31,10 +31,12 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/block/block.h"
 #include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/multimodal/mm_visitor.h"
+#include "framework/kv_cache_transfer/pd_route_transfer.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
@@ -52,6 +54,20 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+// Whether the KV transfer binds blocks by canonical coordinate instead of
+// by the destination's id list. The canonical route derives every
+// destination row from the peer's *published* layout, so the request's
+// remote ids are not part of its contract: they are stated in the
+// destination's own partition geometry, and striding them by this side's
+// kv-split produces a number that means nothing once the two splits differ.
+bool routes_kv_by_canonical_blocks() {
+  PdRouteMode mode = PdRouteMode::LEGACY;
+  if (!parse_pd_route_mode(DisaggPDConfig::get_instance().pd_route(), &mode)) {
+    return false;
+  }
+  return mode == PdRouteMode::CANONICAL;
+}
 
 // Minimum estimated total query tokens in a batch before process_sequences
 // takes the multithreaded path. Below this, the fixed thread-dispatch plus
@@ -267,6 +283,8 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     uint32_t kv_split_size) {
   CHECK(sequence != nullptr);
 
+  const bool canonical_route = routes_kv_by_canonical_blocks();
+
   TransferKVInfo info;
   info.request_id = full_info.request_id;
   info.rank_local_mapping = full_info.rank_local_mapping;
@@ -349,13 +367,16 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t remote_origin = is_flat_kv ? remote_shared_num : 0;
     const size_t remote_end =
         map_end > remote_origin ? (map_end - remote_origin) * remote_stride : 0;
-    CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
-             remote_end)
-        << "KV remote id coverage shortage, request_id=" << full_info.request_id
-        << ", group_id=" << full_mapping.group_id
-        << ", remote_size=" << full_mapping.remote_ids.size()
-        << ", remote_end=" << remote_end << ", remote_stride=" << remote_stride
-        << ", remote_shared_num=" << remote_shared_num;
+    if (!canonical_route) {
+      CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
+               remote_end)
+          << "KV remote id coverage shortage, request_id="
+          << full_info.request_id << ", group_id=" << full_mapping.group_id
+          << ", remote_size=" << full_mapping.remote_ids.size()
+          << ", remote_end=" << remote_end
+          << ", remote_stride=" << remote_stride
+          << ", remote_shared_num=" << remote_shared_num;
+    }
 
     const size_t stable_end = static_cast<size_t>(seq_len / block_size);
     const size_t advanced_transfer_idx =
@@ -382,29 +403,31 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       if (local_ids[local_idx] < 0) {
         continue;
       }
-      const size_t remote_ids_begin = step_mapping.remote_ids.size();
-      const size_t remote_idxs_begin = remote_idxs.size();
-      bool has_remote_sentinel = false;
-      for (size_t offset = 0; offset < remote_stride; ++offset) {
-        const size_t remote_idx =
-            (local_idx - remote_origin) * remote_stride + offset;
-        if (remote_idx >= full_mapping.remote_ids.size()) {
-          CHECK_GT(remote_stride, static_cast<size_t>(1));
-          break;
+      if (!canonical_route) {
+        const size_t remote_ids_begin = step_mapping.remote_ids.size();
+        const size_t remote_idxs_begin = remote_idxs.size();
+        bool has_remote_sentinel = false;
+        for (size_t offset = 0; offset < remote_stride; ++offset) {
+          const size_t remote_idx =
+              (local_idx - remote_origin) * remote_stride + offset;
+          if (remote_idx >= full_mapping.remote_ids.size()) {
+            CHECK_GT(remote_stride, static_cast<size_t>(1));
+            break;
+          }
+          if (full_mapping.remote_ids[remote_idx] ==
+              std::numeric_limits<uint64_t>::max()) {
+            has_remote_sentinel = true;
+            break;
+          }
+          step_mapping.remote_ids.emplace_back(
+              full_mapping.remote_ids[remote_idx]);
+          remote_idxs.emplace_back(remote_idx);
         }
-        if (full_mapping.remote_ids[remote_idx] ==
-            std::numeric_limits<uint64_t>::max()) {
-          has_remote_sentinel = true;
-          break;
+        if (has_remote_sentinel) {
+          step_mapping.remote_ids.resize(remote_ids_begin);
+          remote_idxs.resize(remote_idxs_begin);
+          continue;
         }
-        step_mapping.remote_ids.emplace_back(
-            full_mapping.remote_ids[remote_idx]);
-        remote_idxs.emplace_back(remote_idx);
-      }
-      if (has_remote_sentinel) {
-        step_mapping.remote_ids.resize(remote_ids_begin);
-        remote_idxs.resize(remote_idxs_begin);
-        continue;
       }
       // `local_idx` is the block's position in the sequence, which is the one
       // coordinate that survives the crossing: the id is a pool row (shared
@@ -420,7 +443,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
-    if (is_flat_kv) {
+    if (is_flat_kv && !canonical_route) {
       append_xtensor_offsets(
           &info, full_info, full_mapping.remote_ids.size(), remote_idxs);
     }
