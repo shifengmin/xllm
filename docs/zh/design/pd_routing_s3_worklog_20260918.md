@@ -3100,3 +3100,159 @@ ccache -s: Cacheable 54289/121659 (44.6%) · Hits 16599 (30.6%) · Misses 37690
   用 `--gtest_filter=-*Npu*` 排除，属环境性）。
 * 下一步顺序：①(37) 装 LSE → 复跑 `p2d4`；②修 `p4d2` 的 `kv_transfer_completion.cpp:44`；
   ③三场景矩阵全 PASS → 提交推送。
+
+## 第 33 轮（2026-09-18 23:33–）：LSE 算子装好、`p2d4` 端到端**字节级 PASS**；`p4d2` 的 `futures_.empty()` 被证明是**二次症状**
+
+### (39) LSE 算子落地：不改 `config.ini`，改用 `ASCEND_CUSTOM_OPP_PATH` 指向一份**旁挂** vendor 树
+
+(37) 里原本计划「装成新 vendor + 追加 `load_priority`」，实际做法换成了更安全的一种：
+
+* 98 构建容器里把 LSE-only 预编译包（`third_party/xllm_ops/xllm_ops/build_sfa_lse_nope/install/vendors/custom_xllm_math`，
+  整树 tar 出来 2.8 MB，含 `op_impl/ai_core/tbe/kernel/ascend910_93/sparse_flash_attention_lse/*.o` 与
+  `binary_info_config.json`）→ `scp` 到 83 → 解到 **`pdroute83/lse_vendor/`**（bind mount 内，容器内外同路径）；
+* `pdroute83/env.sh` 里 `export ASCEND_CUSTOM_OPP_PATH="$BASE/lse_vendor"`（只在目录存在时）；
+* **不动** `opp/vendors/`：覆盖已装的 `custom_xllm_math` 会连带丢掉 45 个 kernel（其中就有
+  `glm_next_transformer` 依赖的 23 参数 `aclnnSparseFlashAttention`），也不去改 `load_priority`。
+
+为什么这样就够（也是这次特意确认的两点）：
+
+| 事实 | 证据 |
+|---|---|
+| `ASCEND_CUSTOM_OPP_PATH` 的搜索顺序在 `load_priority` **之前** | `pytorch_npu_helper.hpp:140-215`：`get_custom_lib_path()` 读该变量、每项拼 `/op_api/lib/`，`get_op_api_func_addr()` 先遍历它再遍历 `g_default_custom_lib_path`，**按符号** `dlopen`+`dlsym`，命中即返回 |
+| 它不可能遮蔽别的算子 | `nm -D --defined-only lse_vendor/op_api/lib/libcust_opapi.so` 只有 4 个导出：`aclnnSparseFlashAttentionLse{,GetWorkspaceSize}`、`aclnnInnerSparseFlashAttentionLse{,GetWorkspaceSize}`（其余是 libstdc++ 弱符号）；而已装 `custom_xllm_math` 的 `aclnnSparseFlashAttention`（无 Lse）不受影响 |
+
+回滚 = 删掉那一行 export。生效证据：`p2d4` 请求 `http_code=200`，**4 个 decode rank 全部落 trace**
+（此前 4 个 rank 都是 `F sparse_flash_attention_lse.cpp:153 ... not found`）。
+
+### (40) `p2d4`（P cp2/tp2/kv2 → D cp1/tp4/kv4）：**K/V 四个 rank 全部字节级一致**
+
+判据取**最早那帧**（`tag=before call=0`，decode 自己还没走一步）：
+
+| 族 | 结果 |
+|---|---|
+| key / value（split） | 4 个 decode rank 各 **28/28 字节一致**，`mismatch=0 absent_in=0`（28 = 7 块 × 4 层） |
+| index（replicated） | 写进去的 **12/12 行**逐字节等于规则预测的源行；`mismatch=0` |
+
+源行分布正是异构重分片该有的样子：D rank3（slice3）的 7 块分别来自 P 的 `2/4/6/8/10/12/14`，
+D rank2（slice2）来自 `1/3/5/7/9/11/13`；`discovered split-slot mapping` 里 7 条预测全部命中，
+row 0 作为池子保留的 padding 块按约定不参与。
+
+### (41) 顺手修掉比较器的一个**假 mismatch**：目的端 padding 行被算作「搬错了」
+
+上一轮看到的 `index total=21 written=12 zero=9 match=12 mismatch=9` 是**比较器口径错**，不是路由错：
+
+* 目的端 kv_split 4 > 源端 2 时，目的端 index 池**最前面 `S_D` 行**对应 `canonical = -3,-2,-1`，
+  根本不是本请求的块，没人写（实测全零）；
+* 旧逻辑只问「目的端这一行的摘要在不在源端」，而这些零行的摘要在源端**零行**上找得到，
+  于是落进 `mismatch` —— 一个传输**无论怎么做都修不掉**的 mismatch（9 = 3 行 × 3 层）。
+
+改法（`pdtrace/compare_kv.py`，两份都更新：本机 master 与容器内 `pdroute83/tracefiles/compare_kv.py`）：
+两个族都先判 `half < 0`（canonical 块为负）→ 记 `abs_oos`（不属于请求），不再参与 match/mismatch。
+修完：
+
+* `p2d4` → `key/value 28/28`、`index 12/12`、`mismatch=0 absent_in=0` → **VERDICT: PASS**；
+* `base` 用同一版复评**数字不变**（`key/value 112/112`、`index 84/84`、`mismatch=0`）→ 说明判据没有被放松。
+
+> 仍然留给模型侧的问题（第 32 轮就记着，本轮数据更具体了）：index 族在源端**每个 slice 的副本内容不同**
+> （`byte-identical on all 4 prefill ranks=0`；P rank0 与 rank2 同一行的摘要不同）。路由是「目的端 canonical 块
+> ← 源端同 canonical 块」地各推一行，本次逐字节全对，但「只推一个 writer 的一份副本」是否覆盖 decode
+> indexer 需要的全部语义，需要模型侧确认。
+
+### (42) `p4d2` 的 `F kv_transfer_completion.cpp:44` 是**二次症状**，不是记账 bug
+
+新日志（`runs/p4d2-234654`）把因果链摆清楚了 —— prefill rank0（device 0）先在**模型 forward 里**炸：
+
+```
+[ASSERT] gather_v3_base.h:137 Assertion `(0 <= val && val < this->gxSize_)' Index 3480 out of range[0 3480)!
+[rank0] NPU function error: call aclnnIndexSelect failed, error code is 507035
+        Kernel task happen error, retCode=0x31, [vector core exception]
+```
+
+设备侧异常让 `forward()` 抛异常 → 栈回退到 `LLMWorkerImpl::step_internal` 时 `KVTransferCompletion`
+析构；而它只在 `wait()` **成功后**才 `futures_.clear()`（`folly::collectAll(...).get(60s)` 超时是抛异常），
+于是析构里那条 `CHECK(futures_.empty())` 先 abort，把真正的错误盖住。三个要点：
+
+* **不是 60 s 超时**、也不是登记缺失：`forward` 抛异常才是因；上一轮「canonical 推送完成记账没登记」的判断作废；
+* **与 LSE 无关**：装上 LSE 后**逐字复现**（同一 `3480 out of range[0 3480)`、同一 device 0）；
+* `3480 = 4 × 870`：形状就是「CP 分片边界」（`(cp_rank+1)*chunk` 这种闭区间端点被当索引用），
+  也就是**长 prompt × 4 路 CP 切片**才触发。
+
+归因实验（本轮给循环加了 `run <scenario> [route] [repeats]`）：
+
+* **legacy 路由跑不了这个几何** —— 旧门禁 `supports_partition_layout` 要求目的端 kv_split ∈ {1, 源 kv_split}，
+  `D kv2` 不在其中，连接期直接拒：表现是「P/D 引擎都 `Brpc Server started`、HTTP 58888 一直不监听、
+  请求 `http_code=000`、service 侧只打印 `Ignore heartbeat from unknown instance: 11.87.191.83:28994`」，
+  与第 31 轮 §(32) 记录的现象一致。**所以「同一几何跑 legacy」这条路无法用作归因对照**：
+  这个几何在本次改动之前**从未被跑过**。
+* 可用的对照是把 prompt 缩短：`p4d2` + `SMOKE_REPEATS=20`（≈580 token，仍跨 2 个以上逻辑块）。
+  若短 prompt 下逐字节 PASS，则 ① 该几何的**数据面**在 canonical 路由下是正确的；
+  ② `3480` 那个设备异常是**长序列 × CP4** 的独立问题（模型侧）。
+
+### (43) 循环的两个小改进
+
+* `remote_loop.sh run <scenario> [route] [repeats]`：`route` 经 `docker exec -e PD_ROUTE=` 注入
+  （`env.sh` 用 `${PD_ROUTE:-canonical}`，环境变量优先），`repeats` 经 `-e SMOKE_REPEATS=` 注入
+  （`run_trace.sh` 读 `${SMOKE_REPEATS:-120}` 传给 `smoke_long.sh`）；归档名带后缀
+  （`p4d2-legacy-…` / `p4d2-r20-…`），两个对照不会互相覆盖。
+* `run_one98.sh` + `handoff/remote/scenarios.txt`：一次 rrun 跑一整批（每行 `scenario[:route[:repeats]]`），
+  失败也继续跑后面的场景，最后打印 `MATRIX DONE: n failure(s) of m`。
+
+### (44) `p4d2` 的归因结论：**数据面正确**，长 prompt 的失败在模型侧
+
+短 prompt（592 token，`SMOKE_REPEATS=20`）下跑 canonical `p4d2`：
+
+| 族 | 结果（2 个 decode rank 各一份） |
+|---|---|
+| key / value（split） | **12/12 字节一致**（3 块 × 4 层），`mismatch=0 absent_in=0` |
+| index（replicated） | 写进去的 **6/6** 字节一致，另 3 行是目的端 padding 前缀（`abs_oos`） |
+
+→ `VERDICT: PASS`。所以：
+
+1. `P cp4/tp1/kv4 → D cp1/tp2/kv2` 这条几何的**数据面（canonical 路由）是正确的**；
+2. 3492-token prompt 下那个 `Index 3480 out of range[0 3480)` 是**长序列 × CP4** 的独立问题
+   （`3480 = 4 × 870`，正是 CP 分片边界的形状；同一个长 prompt 在 P cp2 的 `base` / `p2d4` 上都过）；
+3. legacy 路由**无法**作为对照（连接期旧门禁拒 `D kv2`，见 (42)），这个几何在本轮之前也从未跑过。
+
+### (45) 踩到的坑：被 kill 的调试轮会在容器里留下**孤儿 worker 树**
+
+现象（第一次跑短 prompt 时）：同一个几何下 `logs/prefill/rank_2.log` 里写的是 `pd_route=legacy`，
+其余 rank 都是 `canonical`；链接被 legacy 门禁拒
+（`SetCachePeer failed: source and destination CP/KV-split partitions are unsupported`）→ HTTP 58888 不开 →
+300 s 超时。机理：
+
+* 我 kill 掉的只是**本机**的 `rrun`/ssh，容器里的 worker 没死；
+* 下一轮 `clean_restart.sh reset` 的 `stop_workers.sh` 只匹配它自己那一代，孤儿进程仍占着 rank2 的
+  `28996/46102/15304`，于是新一轮的 rank2 起不来，**旧进程（legacy）应答了 RPC**；
+* 日志文件因此有两个写者：新进程 `truncate` 后从 0 写，旧进程按自己的 fd offset 继续写，
+  中间留下 NUL 空洞 —— `grep` 会报 `binary file matches`，这本身就是「同一路径两个写者」的指纹。
+
+修法：新增 `handoff/remote/hard_reset_inner.sh`（kill 所有 `site-packages/xllm/xllm` + `xllm_master_serving`
++ `etcd --name pdroute83`，清 `logs/*`、`trace/`、`/tmp/etcd_pdroute83`，最后逐端口复查），
+并让 `run_inner.sh` 在**每个场景之前**都先跑它。证据：hard reset 前容器里还有
+**14 个 xllm 进程 + 1 service + 1 etcd**，清干净后同一几何一次通过。
+
+> 教训：远端跑长任务时，取消必须落到**容器里的进程**上（或下一轮做 hard reset），
+> 否则「上一轮的进程」会伪装成「这一轮的 bug」。
+
+### (46) 三场景矩阵（本轮最终证据，00:13–00:22，全绿）
+
+| 场景 | 数字 | 判定 |
+|---|---|---|
+| `base`（P cp2/tp2/kv2 → D cp1/tp2/kv1，3492 token） | key/value **112/112**、index **84/84**（39 写、45 零） | PASS |
+| `p2d4`（P cp2/tp2/kv2 → D cp1/tp4/kv4，3492 token） | key/value **28/28**（4 rank）、index 写进去 **12/12**（9 零、9 abs_oos） | PASS |
+| `p4d2`（P cp4/tp1/kv4 → D cp1/tp2/kv2，592 token） | key/value **12/12**（2 rank）、index **6/6**（3 abs_oos） | PASS |
+
+`MATRIX DONE: 0 failure(s) of 3`，三个场景的 `mismatch` 与 `absent_in` 全为 0，
+归档在 `pdroute83/runs/{base-001306,p2d4-001552,p4d2-canonical-r20-001909}`。
+仍开着的一件事：`p4d2` 的**长 prompt**（3492 token）会撞 prefill forward 的设备异常（模型侧，(42)/(44)）。
+
+### (47) 恢复点
+
+* 代码：本轮**没有改产品代码**（LSE 是环境侧、比较器与循环是调试工具），
+  提交只有工作日志；分支 `pd-routing-s0s1`，前缀提交 `17dc81212`。
+* 运行环境：`pdroute83/lse_vendor`（LSE 算子）+ `env.sh` 的 `ASCEND_CUSTOM_OPP_PATH`；
+  `run_trace.sh` 支持 `SMOKE_REPEATS`；`hard_reset.sh` 已装进容器并接入 `run_inner.sh`。
+* 比较器：本机 `~/work/pdtrace/compare_kv.py` 与容器内 `pdroute83/tracefiles/compare_kv.py`
+  同 md5 `b8f18e66baeafc287eba93e2ba3f28ff`。
+* 下一步候选：`p4d2` 长 prompt 的 `3480` 交给模型侧（CP4 × 长序列的 index 越界）；
+  canonical 侧的遗留债见第 32 轮清单（`pull_kv_blocks_canonical` 桩、A1/A3/A4、C1/C2/C3）。
