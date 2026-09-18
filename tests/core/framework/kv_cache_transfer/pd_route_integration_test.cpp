@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/cache_directory.h"
+#include "framework/kv_cache_transfer/pd_route_transfer.h"
 
 namespace xllm {
 
@@ -343,18 +344,20 @@ std::vector<uint8_t> canonical_content(const CacheTensorManifest& tensor,
 
 // Builds one rank: real tensors, real descriptors, the manifest the rank would
 // publish, the directory it would derive, and the host buffer the transport
-// would read and write.
+// would read and write. Buffer ids come from a counter shared by every rank,
+// the way Mooncake assigns them in registration order across the process: the
+// transport addresses a buffer by its id alone.
 void make_rank(const SideSpec& side,
                int32_t cp_rank,
                int32_t tp_rank,
                bool enable_mla,
+               uint64_t* next_buffer_id,
                RankCache* rank) {
   rank->cp_rank = cp_rank;
   rank->tp_rank = tp_rank;
   rank->local_rank = cp_rank * side.tp_size + tp_rank;
   set_coordinates(&rank->manifest, side, cp_rank, tp_rank);
 
-  uint64_t buffer_id = 0;
   for (const RoleSpec& role : role_specs(enable_mla)) {
     const CacheTensorDeclaration declaration = make_declaration(side, role);
     KvRedundancy redundancy;
@@ -394,6 +397,7 @@ void make_rank(const SideSpec& side,
     ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
     ASSERT_TRUE(tensor.shard_descriptor.has_value());
 
+    const uint64_t buffer_id = (*next_buffer_id)++;
     rank->manifest.tensors.emplace_back(make_tensor_manifest(
         tensor, /*rows_per_resource=*/1, kTokensPerBlock, buffer_id));
     rank->declarations.emplace_back(declaration);
@@ -404,7 +408,6 @@ void make_rank(const SideSpec& side,
                           local_heads,
                           split,
                           index.slice_of(cp_rank, tp_rank));
-    ++buffer_id;
   }
 
   ASSERT_TRUE(PeerDirectory::describe(rank->manifest,
@@ -416,8 +419,10 @@ void make_rank(const SideSpec& side,
   rank->ok = true;
 }
 
-// Moves every canonical resource the two peers have to exchange for one role.
-// The byte ranges come from the binder; the bytes move with memcpy.
+// Moves every canonical resource the two peers have to exchange for one role
+// through the unified data-plane entry: the route tables decide which peer rank
+// holds a block and which one has to end up with it, the binder turns that into
+// byte ranges, and memcpy moves them.
 uint64_t transfer_role(std::vector<RankCache>& sources,
                        std::vector<RankCache>& destinations,
                        const SideSpec& source_side,
@@ -440,117 +445,110 @@ uint64_t transfer_role(std::vector<RankCache>& sources,
                                    &destination_redundancy,
                                    &error))
       << error;
-  const KvLayoutIndex source_index(source_declaration.topology,
-                                   source_redundancy);
-  const KvLayoutIndex destination_index(destination_declaration.topology,
-                                        destination_redundancy);
+  // The route needs the two peers' sequence slices to nest.
+  EXPECT_TRUE(source_redundancy.split() % destination_redundancy.split() == 0 ||
+              destination_redundancy.split() % source_redundancy.split() == 0);
 
-  std::vector<RouteEdge> edges;
-  EXPECT_TRUE(PdRouteTable::build(source_declaration.topology,
-                                  source_declaration.group,
-                                  destination_declaration.topology,
-                                  destination_declaration.group,
-                                  &edges,
-                                  &error))
-      << error;
-  EXPECT_TRUE(PdRouteTable::validate(edges,
-                                     source_declaration.topology,
-                                     source_declaration.group,
-                                     destination_declaration.topology,
-                                     destination_declaration.group,
-                                     &error))
-      << error;
+  // A request covers every canonical resource of the group; which ones belong
+  // to which rank is what the route decides.
+  std::vector<int64_t> canonical_blocks;
+  canonical_blocks.reserve(static_cast<size_t>(role.canonical));
+  for (int64_t resource = 0; resource < role.canonical; ++resource) {
+    canonical_blocks.emplace_back(resource);
+  }
 
-  // Only the replica-0 rank of each (head class, slice) writes, so the writers
-  // are exactly head classes times slices.
-  std::vector<int32_t> writers;
-  for (const RouteEdge& edge : edges) {
-    if (std::find(writers.begin(), writers.end(), edge.src_local_rank) ==
-        writers.end()) {
-      writers.emplace_back(edge.src_local_rank);
+  RoutePeer peer;
+  peer.addrs.reserve(destinations.size());
+  for (const RankCache& destination : destinations) {
+    peer.addrs.emplace_back("destination-rank-" +
+                            std::to_string(destination.local_rank));
+    for (size_t index = 0; index < destination.directory.size(); ++index) {
+      const PeerCacheView& view = destination.directory.at(index);
+      if (view.entry.role == role.role &&
+          view.entry.group_id == role.group_id) {
+        peer.views.emplace_back(view);
+      }
     }
   }
-  EXPECT_EQ(writers.size(),
-            static_cast<size_t>(source_redundancy.head_class_count() *
-                                source_redundancy.split()));
 
-  const int32_t source_split = source_redundancy.split();
-  const int32_t destination_split = destination_redundancy.split();
+  // Both peers' host memory, addressed by the buffer id the regions name.
+  std::map<uint64_t, std::vector<uint8_t>*> memory;
+  for (RankCache& side : sources) {
+    for (auto& pair : side.buffers) {
+      memory[pair.first] = &pair.second;
+    }
+  }
+  for (RankCache& side : destinations) {
+    for (auto& pair : side.buffers) {
+      memory[pair.first] = &pair.second;
+    }
+  }
+  const PdRouteTransfer::MoveFn move =
+      [&memory](const std::string& peer_addr,
+                const std::vector<RouteRegion>& regions,
+                RouteOpcode opcode) {
+        (void)peer_addr;
+        (void)opcode;
+        for (const RouteRegion& region : regions) {
+          std::vector<uint8_t>& source_memory =
+              *memory.at(region.local_buffer_id);
+          std::vector<uint8_t>& destination_memory =
+              *memory.at(region.remote_buffer_id);
+          EXPECT_LE(region.local_offset + region.length, source_memory.size());
+          EXPECT_LE(region.remote_offset + region.length,
+                    destination_memory.size());
+          if (region.local_offset + region.length > source_memory.size() ||
+              region.remote_offset + region.length >
+                  destination_memory.size()) {
+            continue;
+          }
+          std::memcpy(destination_memory.data() + region.remote_offset,
+                      source_memory.data() + region.local_offset,
+                      region.length);
+        }
+        return true;
+      };
+
+  PdRouteCache cache;
   uint64_t moved = 0;
+  std::vector<int32_t> writers;
   for (RankCache& source : sources) {
-    const int32_t head_class = source_index.head_class_of(source.tp_rank);
-    const int32_t slice = source_index.slice_of(source.cp_rank, source.tp_rank);
-    int32_t writer = 0;
-    if (!source_index.writer_of(/*dp_rank=*/0, head_class, slice, &writer)) {
-      continue;
+    std::vector<PeerCacheView> local;
+    for (size_t index = 0; index < source.directory.size(); ++index) {
+      const PeerCacheView& view = source.directory.at(index);
+      if (view.entry.role == role.role &&
+          view.entry.group_id == role.group_id) {
+        local.emplace_back(view);
+      }
     }
-    if (writer != source.local_rank) {
-      continue;
-    }
-    const PeerCacheView* local = source.directory.find(
-        CacheNamespace::MAIN, 0, role.role, role.group_id);
-    if (local == nullptr) {
-      ADD_FAILURE() << "the source rank has no view for role " << role.role;
-      continue;
-    }
-    for (RankCache& destination : destinations) {
-      const int32_t destination_slice =
-          destination_index.slice_of(destination.cp_rank, destination.tp_rank);
-      std::vector<int64_t> resources;
-      for (int64_t resource = 0; resource < role.canonical; ++resource) {
-        if (resource % source_split == slice &&
-            resource % destination_split == destination_slice) {
-          resources.emplace_back(resource);
-        }
+    std::vector<RouteLeg> legs;
+    EXPECT_TRUE(PdRouteTransfer::transfer(&cache,
+                                          RouteOpcode::PUSH,
+                                          source.local_rank,
+                                          canonical_blocks,
+                                          local,
+                                          peer,
+                                          move,
+                                          &legs,
+                                          &error))
+        << "role " << role.role << ", source rank " << source.local_rank << ": "
+        << error;
+    for (const RouteLeg& leg : legs) {
+      if (std::find(writers.begin(), writers.end(), leg.local_rank) ==
+          writers.end()) {
+        writers.emplace_back(leg.local_rank);
       }
-      if (resources.empty()) {
-        continue;
-      }
-      bool connected = false;
-      for (const RouteEdge& edge : edges) {
-        if (edge.src_local_rank == source.local_rank &&
-            edge.dst_local_rank == destination.local_rank) {
-          connected = true;
-          break;
-        }
-      }
-      if (!connected) {
-        continue;
-      }
-      const PeerCacheView* remote = destination.directory.find(
-          CacheNamespace::MAIN, 0, role.role, role.group_id);
-      if (remote == nullptr) {
-        ADD_FAILURE() << "the destination rank has no view for role "
-                      << role.role;
-        continue;
-      }
-      std::vector<RouteRegion> regions;
-      EXPECT_TRUE(RouteBinder::bind(edges,
-                                    destination.local_rank,
-                                    resources,
-                                    *local,
-                                    *remote,
-                                    &regions,
-                                    &error))
-          << error;
-      for (const RouteRegion& region : regions) {
-        const std::vector<uint8_t>& from =
-            source.buffers.at(region.local_buffer_id);
-        std::vector<uint8_t>& to =
-            destination.buffers.at(region.remote_buffer_id);
-        EXPECT_LE(region.local_offset + region.length, from.size());
-        EXPECT_LE(region.remote_offset + region.length, to.size());
-        if (region.local_offset + region.length > from.size() ||
-            region.remote_offset + region.length > to.size()) {
-          continue;
-        }
-        std::memcpy(to.data() + region.remote_offset,
-                    from.data() + region.local_offset,
-                    region.length);
+      for (const RouteRegion& region : leg.regions) {
         moved += region.length;
       }
     }
   }
+
+  // Only the replica-0 rank of each (head class, slice) writes, so the writers
+  // are exactly head classes times slices.
+  EXPECT_EQ(writers.size(),
+            static_cast<size_t>(source_redundancy.head_class_count() *
+                                source_redundancy.split()));
   return moved;
 }
 
@@ -616,10 +614,16 @@ void verify_role(const std::vector<RankCache>& destinations,
 void run_scenario(const Scenario& scenario) {
   std::vector<RankCache> sources;
   std::vector<RankCache> destinations;
+  uint64_t next_buffer_id = 0;
   for (int32_t cp_rank = 0; cp_rank < scenario.source.cp_size; ++cp_rank) {
     for (int32_t tp_rank = 0; tp_rank < scenario.source.tp_size; ++tp_rank) {
       RankCache rank;
-      make_rank(scenario.source, cp_rank, tp_rank, scenario.enable_mla, &rank);
+      make_rank(scenario.source,
+                cp_rank,
+                tp_rank,
+                scenario.enable_mla,
+                &next_buffer_id,
+                &rank);
       ASSERT_TRUE(rank.ok) << rank.error;
       sources.emplace_back(std::move(rank));
     }
@@ -628,8 +632,12 @@ void run_scenario(const Scenario& scenario) {
     for (int32_t tp_rank = 0; tp_rank < scenario.destination.tp_size;
          ++tp_rank) {
       RankCache rank;
-      make_rank(
-          scenario.destination, cp_rank, tp_rank, scenario.enable_mla, &rank);
+      make_rank(scenario.destination,
+                cp_rank,
+                tp_rank,
+                scenario.enable_mla,
+                &next_buffer_id,
+                &rank);
       ASSERT_TRUE(rank.ok) << rank.error;
       destinations.emplace_back(std::move(rank));
     }

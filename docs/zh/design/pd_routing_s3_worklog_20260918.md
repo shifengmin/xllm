@@ -409,11 +409,16 @@ PULL 的 region 就是同一对区间把两半**对调**，不是重新推导。
 ⇒ 因此本轮把开关接成"要么 legacy、要么**显式拒绝**"，而不是让它静默退化成 legacy（那种回落会让人以为
 canonical 已经生效）。下一轮把这些输入补齐后再打开 `canonical`。
 
+**本轮的第二个改动**：`pd_route_integration_test.cpp` 的数据面调用点从"直接调 `RouteBinder::bind`"改成
+**走统一入口** `PdRouteTransfer::transfer(PUSH, rank, canonical_blocks, local, peer, move, ...)`：
+每个源 rank 只调一次，由入口自己推导 `(writer rank, reader rank)` 腿、选出该腿的规范块、并把 region 按
+opcode 取向排好。顺带修了夹具的一个真实缺陷：**buffer id 之前是每 rank 从 0 开始编号的**，而传输层是按
+id 单独寻址缓冲（生产里 Mooncake 按注册顺序给全局唯一 id）；改成全局计数器后，四个角色的搬运量
+（`9437184 / 16842752 / 8192 / 6144`）与重构前**逐位相同**，即入口复现了原先逐字节验证过的行为。
+
 **其它可做的增强（未做）**：
 - 把 `ContextParallelTopology` 本体链进单测当运行时 oracle（harness 需要加 glog 链接），
   现在用的是"C3 + 显式断言 `slice == cp` / `== tp`"。
-- 集成测试改走 `PdRouteTransfer::transfer`（现在是直接调 `RouteBinder::bind`），
-  即把"真实张量 → manifest → 适配器 → **统一入口** → memcpy"整条链也覆盖一遍。
 - `bind` 的 `local_rank` 守卫仍只覆盖 MAIN（SPEC_DRAFT 视图 `local_rank == -1`）；
   `plan` 用"同族只有一个未命名视图才接受"来兜底，多于一个直接报错。
 
