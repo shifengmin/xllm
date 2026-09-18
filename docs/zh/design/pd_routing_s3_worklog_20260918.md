@@ -1737,3 +1737,69 @@ canonical push 的成功日志是 `VLOG(1) << "[Mooncake][PDTransfer] direction=
 等 `WHEEL_EXIT=0` → `deploy_stage98.sh` → `deploy_install83.sh` →（容器内）`npu_init.sh`
 → `run_all.sh` → `smoke.sh` → 通了再 `run_trace.sh` + `smoke_long.sh` → `compare_kv.py`。
 构建已完成，所以**现在可以安全地**用 `~/work/align_remote_tree.sh`（不带参数先只报告）对齐 98 的树。
+
+---
+
+## 第 24 轮：wheel 落地与两个"看起来像网络问题、其实是别的"的坑（2026-09-18 15:36）
+
+### (1) wheel 成功
+
+`dist/xllm_npu_torch2_9_0-0.11.0-cp311-cp311-linux_aarch64.whl`，**576,356,500 字节**，
+md5 `ec794733df99a2e01dc1cd59521143a9`。传到 83 后**自己校验**：
+
+* 83 上 md5 一致；
+* `zipfile.ZipFile(...).testzip()` 返回 `None`（无坏条目）；
+* 257 个条目，`xllm/xllm` 在、`xllm/python/model_executor/executor.py` 在（trace 的 hook 目标）、
+  并且 wheel **自带一份 `libasio.so`**。
+
+`libasio.so` md5 `d694863db9b16f3a0c7273b521e525cf`（1,832,160 字节）。
+
+### (2) 坑一：长传输会把脚本"截断"，但 rrun 仍然报 exit 0
+
+第一次跑 `deploy_stage98.sh`：输出在 **wheel 的 `md5 OK` 之后就直接结束**，
+`libasio.so` 根本没传（83 上 `ls: cannot access '/tmp/libasio.so'`），
+**但 rrun 报的是 `exit code: 0`**。
+
+结论：**绝不相信长远程命令自己的退出码**。脚本没有 bug，是 576MB 传输把会话耗到了尽头，
+后面的语句没执行。已改成：
+
+* `deploy_stage98.sh` 接受 `wheel|libasio|all`，**实践中一次只传一个文件**；
+* 新增 `send_libasio.sh`（单文件 + 3 次重试 + md5）；
+* 新增 `verify_stage83.sh`（在 83 上独立核对两个文件的 md5 + wheel zip 完整性）。
+* `libasio.so` 已用单文件方式补传并 VERIFIED。
+
+### (3) 坑二：**改 wheel 文件名会让 pip 直接拒绝**（之前的归因是错的）
+
+`pip install /tmp/xllm_pd.whl` 报：
+
+```
+ERROR: Invalid wheel filename (wrong number of parts): 'xllm_pd'
+```
+
+PEP 427 要求文件名是 `{name}-{version}-{python}-{abi}-{platform}.whl`，把 wheel 改名成
+`xllm_pd.whl` 就**破坏了这个结构**，pip 连解包都不会尝试。
+
+**这推翻了工作日志早先的一条归因**：以前记的是"scp 中断会得到 `Wheel is invalid`"，
+其实**只要改名就必然报错**，跟传输是否完整无关（这次 md5 和 zip 校验都是好的，照样报错）。
+
+修法：**永远保持 wheel 的规范文件名**。新增 `install83.sh`：
+先在 83 上把 `/tmp/xllm_pd.whl` **改回**规范名（没有重新传 576MB），
+再 `docker cp` 进容器（容器内也用规范名），再 `--force-reinstall --no-deps` 安装；
+装完逐项核对 `$SP/xllm/xllm`、`glm5_2.py`、`executor.py`、libasio，
+并直接在**装好的 ELF** 里 grep 那几条 canonical 路由字符串，最后确认 `--help` 里有 `--pd_route`。
+
+### (4) 附带发现：`bdist_wheel` 会**全量重编 brpc**
+
+`setup.py bdist_wheel` 重新 configure 了一次 cmake，brpc 的 325 个目标全部重编
+（实测约 13 分钟）。原因在编译命令行里能直接看到：
+
+```
+-DBRPC_REVISION="\|pd-routing-s0s1\|ad98850a8\|2026-09-18T15:01:19+08:00"
+```
+
+那个时间戳是 **cmake configure 的时刻**，不是 git 提交时间 —— 所以**每次重新 configure，
+BRPC_REVISION 都变，brpc 就整包重编**。
+
+推论：`align_remote_tree.sh` 必须在**打包完全结束之后**再跑，
+否则对齐动作会连带触发一次 ~13 分钟的 brpc 重编（外加 ops 门的风险）。
+本次因为一直等到 `WHEEL_EXIT=0` 才动，所以没有付出这个代价。
