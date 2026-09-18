@@ -3015,3 +3015,88 @@ pd_route_integration 6 · cache_directory 23 · reshard_planner 43 · mooncake_t
 
 > 注意：本改动**尚未编进 wheel**、尚未做端到端复测（`p4d2` / `p2d4` 的目标就是由它打开）。
 > 交接给开发机的清单见 `/export/home/shifengmin.3/workspace/handoff/HANDOFF.md`。
+
+## 第 32 轮（2026-09-18 22:50–23:45）：调试循环远端化（4×提速）、ccache 诊断、remote-id 断言修掉、LSE 算子缺口定位
+
+### (34) 循环远端化：改码/编译/部署/分析都在开发机完成
+
+脚本在 98 上：`/export/home/shifengmin.3/workspace/handoff/remote/`
+（`remote_loop.sh` 编排 + `env_inner.sh`/`build_inner.sh`/`install_inner.sh`/`run_inner.sh`/`compare_inner.sh`/`archive_inner.sh`
+逐段用 `bash -s` 喂进容器，避免嵌套引号）。
+
+```bash
+# 在 98 host 上（一次调用即整批）
+cd /export/home/shifengmin.3/workspace/handoff/remote
+bash remote_loop.sh all ./apply_remote_id_fix.py     # build → deploy → base/p4d2/p2d4
+bash remote_loop.sh run p2d4                          # 只重跑一个场景
+```
+
+| 环节 | 旧 | 新 | 实测 |
+|---|---|---|---|
+| 改码 | 本机改 + 同步 22 文件（1 min，曾静默漏文件） | **远端打补丁脚本**（6 处精确替换，逐处断言） | ~5 s |
+| 编译 | `setup.py build` | **`ninja xllm` 增量**（不 reconfigure、不拷 python） | **55 s** |
+| 出包 | `bdist_wheel` 2m33s | 不出 wheel，直接换 ELF | 0 |
+| 送机 | 576 MB scp | **strip 后 111 MB** | ~30 s |
+| 安装 | docker cp + `pip install` ~2 min | 覆盖 `$SP/xllm/xllm` + md5/标记串校验 | ~5 s |
+| 分析 | trace 取回本机再比 | **容器内跑 `compare_kv.py`** | ~5 s |
+| 保全 | 无（失败日志被下一轮截断，曾丢证据） | 每场景归档 `pdroute83/runs/<scenario>-<ts>/{logs,trace}` | ~1 s |
+
+实测：**patch+编译+strip+送机+安装 = 1m26s**；**三场景合计 ≈ 10 min**（旧 ≈ 39 min）。
+
+自坑两条（已修）：`do_run` 忘了加 `ssh 83` 前缀 → `Error: No such container: fengmin-pdroute91`，
+三个"1 秒跑完"的假结果；以及事后补的日志归档。
+
+### (35) ccache：装了也接上了，但缓存打满 + 每轮重做无关步骤
+
+```
+/usr/bin/ccache + CMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache   （确实在走）
+ccache -s: Cacheable 54289/121659 (44.6%) · Hits 16599 (30.6%) · Misses 37690
+           Cache size 5.0/5.0 GiB · Cleanups 986        ← 命中率低的真因
+```
+
+已把上限提到 60 GB。慢的其余原因是一次性做 `setup.py build`(4m39s) + `bdist_wheel`(2m33s) +
+576 MB stage + pip 重装，以及改了广被包含的 `kv_cache_transfer.h`（virtual 化 ⇒ 重编面放大）。
+
+### (36) 第三个拦路虎已修：canonical 不该按本侧 kv_split 跨步目的端 remote id
+
+`apply_remote_id_fix.py`（98 树内 6 处精确替换）：canonical 模式下**跳过** remote-id 的跨步、
+覆盖 `CHECK` 与填充循环（canonical 推送只读 `local_ids`+`local_positions`+对端已发布 layout，
+`remote_ids` 根本没人读），legacy 路径不变。效果：
+
+* `base` 仍 **字节级 PASS**；
+* `p4d2` 不再撞 `batch_input_builder.cpp:378 (7 vs 14)`；
+* 两个新场景各推进一层：`p4d2` → `F kv_transfer_completion.cpp:44 futures_.empty()`（待修，路由侧）；
+  `p2d4` → **LSE 算子缺失**（见 (37)，4 个 decode rank 都落了 trace，KV 确实推过去了）。
+
+### (37) LSE 算子缺口：确认**没带上**，且可以不重编 ops 修好
+
+| 检查点 | 结果 |
+|---|---|
+| `xllm_ops` submodule | **有**该算子（121 个匹配文件），并且已有一份 **LSE-only 预编译包**：`third_party/xllm_ops/xllm_ops/build_sfa_lse_nope/install/vendors/custom_xllm_math/`，其 `op_api/lib/libcust_opapi.so` 里 `aclnnSparseFlashAttentionLse` ×3，带 `sparse_flash_attention_lse` 内核目录 |
+| 0911 容器实际安装的 `custom_xllm_math` | 45 个 kernel 目录、**LSE 符号 0**、无 lse 内核目录 |
+| 四个 vendor | 全部 LSE=0 |
+
+机理（`xllm/core/kernels/npu/aclnn/pytorch_npu_helper.hpp`）：`EXEC_NPU_CMD` → `get_op_api_func_addr()`
+**按符号逐个目录搜**：先 `g_custom_lib_path`，再 `g_default_custom_lib_path`（= `opp/vendors/config.ini`
+的 `load_priority` 每项拼 `/op_api/lib/`），逐个 `dlopen(<dir>/libcust_opapi.so)` + `dlsym`，命中即返回。
+**所以 LSE-only 的库可以独立当一个 vendor 加进去，不影响其它算子。**
+
+修法（不需重编 ops）：
+
+1. 打包 `build_sfa_lse_nope/install/vendors/custom_xllm_math` → `docker cp` 进 0911 容器 `opp/vendors/xllm_sfa_lse/`；
+2. 在 `opp/vendors/config.ini` 的 `load_priority` 末尾追加 `xllm_sfa_lse`；
+3. 把这步固化进 `pdroute83/env.sh`（现有那段只按 `load_priority` 铺 `LD_LIBRARY_PATH`，没改 `load_priority` 本身）；
+4. `bash remote_loop.sh run p2d4` 复跑（~4 min）。
+
+### (38) 恢复点
+
+* 已推：`pd-routing-s0s1` @ `9436311ab`（位置修复 / 文档 / 连接期门禁放宽）。
+* 本机 clone 现有**未提交**：引擎 `set_canonical_route` 标志与传递（`mooncake_transfer_engine.{h,cpp}`、
+  `mooncake_kv_cache_transfer.{h,cpp}`、`kv_cache_transfer.h`）+ `batch_input_builder.cpp` 的 remote-id 修复
+  （从 98 树拉回，md5 `735a8543…` 一致）。
+* 容器内已装二进制：ELF `3b0e5411…`（含引擎标志那版）→ 之后 `remote_loop` 换成 strip 版 `d1aea2bc…`；
+  wheel `c915dd57…`。**注意：现在容器里是 strip 过的 ELF，功能等价。**
+* 单元测试：8 套件 **142 全绿**（含 `mooncake_transfer_engine_test` 26 条 canonical-link 用例；NPU 往返用例
+  用 `--gtest_filter=-*Npu*` 排除，属环境性）。
+* 下一步顺序：①(37) 装 LSE → 复跑 `p2d4`；②修 `p4d2` 的 `kv_transfer_completion.cpp:44`；
+  ③三场景矩阵全 PASS → 提交推送。

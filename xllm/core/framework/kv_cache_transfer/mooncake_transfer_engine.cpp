@@ -407,7 +407,7 @@ Status MooncakeTransferEngineCore::set_cache_peer(
   }
 
   std::optional<ReshardPlanTemplate> plan;
-  if (mode == CachePeerMode::ACTIVE) {
+  if (mode == CachePeerMode::ACTIVE && !canonical_route()) {
     ReshardPlanTemplate active_plan;
     const Status plan_status = ReshardPlanner().build_outgoing_plan(
         *local_manifest, peer_manifest, &active_plan);

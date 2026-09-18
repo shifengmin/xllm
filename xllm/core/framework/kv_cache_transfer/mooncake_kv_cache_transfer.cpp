@@ -242,6 +242,13 @@ void MooncakeKVCacheTransferBase::get_cache_info(uint64_t& cluster_id,
             << ", addr=" << addr_;
 }
 
+void MooncakeKVCacheTransferBase::set_canonical_route(bool canonical) {
+  KVCacheTransfer::set_canonical_route(canonical);
+  if (mooncake_te_ != nullptr) {
+    mooncake_te_->set_canonical_route(canonical);
+  }
+}
+
 bool MooncakeKVCacheTransferBase::link_clusters(
     const std::vector<uint64_t>& cluster_ids,
     const std::vector<std::string>& remote_addrs,
