@@ -21,6 +21,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/kv_cache_transfer/cache_directory.h"
 #include "framework/kv_cache_transfer/pd_route_table.h"
 #include "framework/kv_cache_transfer/route_binder.h"
 
@@ -75,6 +76,31 @@ struct RoutePeer {
   // may come from any of its ranks; PeerCacheView::local_rank says which.
   std::vector<PeerCacheView> views;
 };
+
+// Assembles the peer instance the canonical route moves against.
+//
+// `instance_addrs` is a peer instance's address list as the scheduler publishes
+// it, indexed by the instance's *global* rank (`dp_rank * cp_size * tp_size +
+// local_rank`). The route addresses ranks inside one DP group, so the entry for
+// a local rank is read at `dp_rank * local_rank_count + local_rank`; using the
+// local rank as the index would silently move bytes against another DP group's
+// worker, which is why this conversion lives in one place instead of at every
+// call site.
+//
+// `manifests` holds the cache layout each peer rank published, indexed by its
+// local rank. Every rank is reconciled with the same model-side declarations,
+// so a peer whose published layout disagrees with the model fails here rather
+// than at the first transfer, and every view is checked to come from the rank
+// it was filed under.
+bool build_route_peer(
+    const std::vector<std::string>& instance_addrs,
+    int32_t dp_rank,
+    int32_t local_rank_count,
+    const std::vector<const WorkerCacheLayoutManifest*>& manifests,
+    const std::vector<CacheTensorDeclaration>& declarations,
+    const std::vector<CacheRowBases>& row_bases,
+    RoutePeer* peer,
+    std::string* error);
 
 // One (writer rank, reader rank) leg of the route, in transport-ready bytes.
 struct RouteLeg {

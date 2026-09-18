@@ -81,6 +81,7 @@ cc_library(
   SRCS
     pd_route_transfer.cpp
   DEPS
+    :cache_directory
     :kv_redundancy
     :pd_route_table
     :route_binder

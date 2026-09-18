@@ -172,6 +172,85 @@ void orient_for_pull(std::vector<RouteRegion>* regions) {
 
 }  // namespace
 
+bool build_route_peer(
+    const std::vector<std::string>& instance_addrs,
+    int32_t dp_rank,
+    int32_t local_rank_count,
+    const std::vector<const WorkerCacheLayoutManifest*>& manifests,
+    const std::vector<CacheTensorDeclaration>& declarations,
+    const std::vector<CacheRowBases>& row_bases,
+    RoutePeer* peer,
+    std::string* error) {
+  if (peer == nullptr) {
+    set_error(error, "the route peer output must not be null");
+    return false;
+  }
+  peer->addrs.clear();
+  peer->views.clear();
+  if (local_rank_count <= 0) {
+    set_error(error, "the peer instance must own at least one rank");
+    return false;
+  }
+  if (dp_rank < 0) {
+    set_error(error, "the destination DP rank must not be negative");
+    return false;
+  }
+  if (manifests.size() != static_cast<size_t>(local_rank_count)) {
+    set_error(error,
+              "the peer instance has " + std::to_string(local_rank_count) +
+                  " ranks but " + std::to_string(manifests.size()) +
+                  " cache layouts were supplied");
+    return false;
+  }
+  const int64_t begin = static_cast<int64_t>(dp_rank) * local_rank_count;
+  if (begin + local_rank_count > static_cast<int64_t>(instance_addrs.size())) {
+    set_error(error,
+              "the peer instance publishes " +
+                  std::to_string(instance_addrs.size()) +
+                  " addresses, which do not cover DP group " +
+                  std::to_string(dp_rank));
+    return false;
+  }
+
+  peer->addrs.reserve(static_cast<size_t>(local_rank_count));
+  for (int32_t local_rank = 0; local_rank < local_rank_count; ++local_rank) {
+    const WorkerCacheLayoutManifest* manifest =
+        manifests[static_cast<size_t>(local_rank)];
+    if (manifest == nullptr) {
+      set_error(error,
+                "peer rank " + std::to_string(local_rank) +
+                    " published no cache layout");
+      return false;
+    }
+    PeerDirectory directory;
+    std::string reason;
+    if (!PeerDirectory::describe(
+            *manifest, declarations, row_bases, &directory, &reason)) {
+      set_error(error,
+                "the cache layout of peer rank " + std::to_string(local_rank) +
+                    " does not match the model: " + reason);
+      return false;
+    }
+    for (size_t index = 0; index < directory.size(); ++index) {
+      const PeerCacheView& view = directory.at(index);
+      // A view that names its rank has to be the rank whose layout produced it,
+      // otherwise the caller filed the manifests in the wrong order and the
+      // route would address another rank's buffer.
+      if (view.local_rank >= 0 && view.local_rank != local_rank) {
+        set_error(error,
+                  "the layout filed under peer rank " +
+                      std::to_string(local_rank) + " describes rank " +
+                      std::to_string(view.local_rank));
+        return false;
+      }
+      peer->views.emplace_back(view);
+    }
+    peer->addrs.emplace_back(
+        instance_addrs[static_cast<size_t>(begin + local_rank)]);
+  }
+  return true;
+}
+
 bool parse_pd_route_mode(const std::string& value, PdRouteMode* mode) {
   if (mode == nullptr) {
     return false;

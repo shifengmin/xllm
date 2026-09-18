@@ -15,7 +15,7 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~9 轮**：入口 + F8 表缓存 + 开关 + 生产声明映射 + **id↔规范块换算**已落地，67 用例全绿；**只剩生产调用点接线**（三项输入已齐，见第 9 轮 §5） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~10 轮**：入口 + F8 表缓存 + 开关 + 生产声明映射 + id↔规范块换算 + **对端实例装配**已落地，69 用例全绿；**只剩把三者接进 `push_kv_blocks_async`**（步骤见第 10 轮末尾，无未知项） |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
 
 ## 1. 硬约束（每轮先读，别再试错）
@@ -633,3 +633,55 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 3. 请求侧：用 `canonical_blocks_of_request`（本轮交付）把 `mapping.local_ids` 换算成规范块，
    交给 `PdRouteTransfer::transfer(opcode)`（第 7 轮交付）。
 4. 之后才允许把 `--pd_route=canonical` 的 `LOG(FATAL)` 换成真正的分支。
+
+### 2026-09-18（第 10 轮）——S3-4 接线第 2 步：`build_route_peer`（对端实例装配），69 用例全绿
+
+上一轮说"只剩生产调用点接线，三项输入已齐"。本轮把其中**最容易静默搬错字节的一环**做掉并验证：
+调度器给的对端实例地址表是**按实例全局 rank**（`dp*(cp*tp) + local`）排的，而路由寻址的是**DP 组内局部 rank**。
+
+**新增** `build_route_peer(instance_addrs, dp_rank, local_rank_count, manifests, declarations, row_bases, RoutePeer*, error)`
+（`pd_route_transfer.{h,cpp}`：入口属于路由层，视图装配复用 `PeerDirectory`）：
+
+1. `peer.addrs[local] = instance_addrs[dp_rank * local_rank_count + local]` —— 这一步错就是把字节搬到**另一个 DP 组**的
+   worker 上，且所有后续检查都发现不了（地址本身有效），所以转换只允许存在这一份；
+2. 对每个局部 rank 用 `PeerDirectory::describe(该 rank 的 manifest, 声明, 页基点, ...)` 造视图（== 第 3 轮适配器），
+   再把各 rank 的视图拼成一列 —— 每个视图自带 `local_rank`，正是 `PdRouteTransfer::plan` 需要的形态；
+3. 三重对账：地址表必须覆盖所请求的 DP 组；`manifests` 数必须 == `local_rank_count`；**每个视图自报的 rank 必须等于它被归到的那个 rank**
+   （防调用方把 manifest 顺序传错）。
+
+**验证**（host，`cache_directory_test` 新增 2 用例 → **23/23**）：
+
+- `AssemblesThePeerInstanceOfOneDpGroup`：`cp1/tp2` 的实例、4 个地址（2 个 DP 组），断言 `dp_rank=1` 取到
+  `worker-{0,1}.dp1`（**不是**局部 rank 0/1 的 `worker-*.dp0`），视图数 == 2、各自 `local_rank` 正确；
+  再取 `dp_rank=0` 验证另一对。
+- `RejectsAPeerInstanceThatDoesNotAddUp`：地址不足该 DP 组、manifest 顺序传错（视图自报 rank 不符）、某 rank 无 manifest，
+  三条都报错且错误信息可辨。
+
+**顺带**：写这个用例时先踩了一次自己的坑 —— 把 `&manifests.back()` 存进 `manifest_pointers` 的同时继续
+`emplace_back` 到同一个 vector，**扩容后指针全部悬空**，适配器报出
+`unsupported cache layout schema version 933675520`（读到了已释放内存）。已 `reserve` 并在测试里写明原因。
+这也说明 `build_route_peer` 的 `const WorkerCacheLayoutManifest*` 入参对调用方有同样的要求，已写进函数注释。
+
+**验证汇总**：容器内 `kv_redundancy_test` 12、`pd_route_test` 12、`cache_directory_test` **23**、
+`kv_shard_contract_test` 6、`pd_route_transfer_test` 12、`pd_route_integration_test` 4 = **69 用例全绿**。
+生产 TU 真实 flags 编译：`kv_cache_transfer.cpp`（已包含 `pd_route_transfer.h`，因此也验证了新头文件的依赖链
+`cache_directory.h → cache_layout.h → pb`）、`mooncake_kv_cache_transfer.cpp`、`cache_layout_builder.cpp` 全部 rc=0。
+
+**剩下的最后一步（下一轮，已无未知项）**：
+
+1. `MooncakeTransferEngineCore::CachePeerLink` 里**保留对端 manifest**（现在只留旧 `ReshardPlanTemplate`），
+   加 `peer_cache_layout(remote_addr)` 取值；`set_cache_peer()` 已经在收到 manifest 的那一刻，改动是纯增量的
+   （**注意**：哪个方向发 manifest 由既有协商决定，本轮只读码确认，运行时行为未验证）。
+2. `MooncakeKVCacheTransferBase` 在 `publish_cache_layout(tensor_manifests, context)` 时用
+   `declare_cache_group` 造 `declarations_`（`context.tensor_layout` 给 head 计数，
+   `context.coordinates` 给拓扑，`tensor.role/group_id` 给族身份；注意 `block_token_capacity` 在生产里传的是
+   `options_.block_size()` = **128** = 规范块大小，与第 9 轮的模型一致），并顺手造出本侧 `local_directory_`。
+3. `push_kv_blocks_async` 的 canonical 分支：用 `canonical_blocks_of_request`（第 9 轮）把 `mapping.local_ids`
+   换算成规范块 → `build_route_peer`（本轮）装配对端 → `PdRouteTransfer::transfer(PUSH, ...)`（第 7 轮），
+   `MoveFn` 里把 `RouteRegion` 逐字段拷成 `ByteRegion` 调 `move_memory_regions(..., WRITE)`。
+   **还需一处设计**：`RouteRegion` 不含 layer，而 push 侧要按 layer 调 `synchronize_layer`；
+   需要按 buffer 所属 layer（`BufLayout::layers[][]` 有 `buf_id`→layer 的映射）把腿的 region 分组后逐层发送。
+4. 全部就绪后才把 `--pd_route=canonical` 的 `LOG(FATAL)` 换成真正分支。
+
+**仍未验证（原因）**：真实运行时（RDMA/NPU/真实调度 block id/协商方向）——GLM5.3flash 尚不支持 PD 分离（§1.3）；
+本轮新增的 `build_route_peer` 只有 host 单测，没有装配进任何生产调用点。
