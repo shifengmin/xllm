@@ -2985,3 +2985,33 @@ rank 对齐推导；但**连接期这道门禁在 canonical 模式下也会跑**
 **结论**：要跑通 `p4d2`/`p2d4`，需要让 canonical 模式下的连接期选择不再套用旧分片门禁
 （`select_sources` 的产物只用来决定哪些远端 rank 开 ACTIVE session / 走 PLAN_ONLY；canonical 的
 writer 由 `RouteBinder` 决定）。这是链路校验语义的改动，需单独评审，不在本轮位置修复的范围内。
+
+### (33) 放宽 canonical 模式下的连接期分片门禁（本轮改动）
+
+`link_sessions` 里那次 `select_sources` 的门禁（(32)）挡住的正是 canonical 路由存在的理由，所以在
+**canonical 模式下换成一套新的选择**：
+
+| 位置 | 改动 |
+|---|---|
+| `ReshardPlanner` | 新增 `select_canonical_sources()`：保留「两侧描述同一种 cache」（schema/version、fingerprint、backend、layout_family）与**各自** `supports_kv_split_topology` 的校验，**不再要求** `supports_partition_layout()`（旧规则：目标必须 cp1 且 kv_split ∈ {1, 源的 kv_split}），返回**全部**远端 rank |
+| 同上 | 把结构比较抽成 `validate_layout_family()`，`validate_source_instance()`（legacy 路径）改用它 + 原来的分区规则，**行为不变** |
+| `MooncakeTransferEngine::link_sessions` | 增加 `bool canonical_route = false` 参数；为真时走新选择，默认值让既有调用与测试行为不变 |
+| `MooncakeKVCacheTransferBase::link_clusters` | 传 `canonical_route_` |
+| `mooncake_transfer_engine_test` | 新增 `CanonicalLinkAcceptsASplitTheLegacyRuleRefuses`（P cp4/tp1/kv4 → D cp1/tp2/kv2：legacy 拒、canonical 过且 4 个 peer 全 ACTIVE、session 全开）与 `CanonicalLinkStillRejectsADifferentCacheFamily`（fingerprint 不同仍然拒、不开 session） |
+
+为什么是「全部 rank」而不是精确子集：canonical 的 writer 由 `RouteBinder` 按 canonical block 现算，
+连接期无法预知某次请求需要哪些 rank；而 PUSH 方向要求**被选的 P rank 拿到 ACTIVE**（D 通过
+`set_remote_peer(..., ACTIVE)` 告诉 P「你可以推给我」），所以宁可全开。代价是每个 D rank 与全部
+P rank 建 session（本场景 4×2 / 4×4），可接受。
+
+测试与构建：`t98_build_tests.sh` 的目标里加上了 `mooncake_transfer_engine_test`（该套件里的
+`*Npu*` 往返用例会 fork 对端进程、需要两块空闲 NPU，在本容器**环境性失败**，已用
+`--gtest_filter=-*Npu*` 排除；与路由无关）。**8 个套件 142 全绿**：
+
+```
+kv_shard_contract 6 · kv_redundancy 12 · pd_route 12 · pd_route_transfer 14
+pd_route_integration 6 · cache_directory 23 · reshard_planner 43 · mooncake_transfer_engine 26
+```
+
+> 注意：本改动**尚未编进 wheel**、尚未做端到端复测（`p4d2` / `p2d4` 的目标就是由它打开）。
+> 交接给开发机的清单见 `/export/home/shifengmin.3/workspace/handoff/HANDOFF.md`。
