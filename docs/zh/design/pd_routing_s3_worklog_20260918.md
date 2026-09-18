@@ -2010,3 +2010,147 @@ brpc 把 revision 烤进了编译宏：
 `trace_remove.sh` 还原插桩 → 把 **dedup 修复提交到 GitHub**（在 local clone 里做同样编辑，
 commit + push；目前**只在远端工作区**）→ 清 `PDROUTE_BUILD_ONLY_BYPASS` 等残留
 → 用 `align_remote_tree.sh` 对齐 98 的树（并立刻重钉 ops marker）。
+
+---
+
+## 第 27 轮（16:20–16:55）：所谓「CANN 算子编译知识库锁」是误诊，真因是自定义算子包 ABI 不匹配
+
+### (1) 先推翻上一轮的判断：纳秒，不是微秒
+
+`_threadmodule.c` 的 `acquire_timed(PyThread_type_lock, PyTime_t timeout)` 里 `PyTime_t` 是
+**纳秒**。用已知 timeout 的锁做标定（attach 正在阻塞的进程看 frame #3）：
+
+| Python 代码 | gdb 打印的 `timeout` |
+|---|---|
+| `lock.acquire()` | `-1000000000`（即"无限"哨兵） |
+| `lock.acquire(timeout=7)` | `7000000000` |
+| `lock.acquire(True, 7)` | `7000000000` |
+
+所以上轮看到的 `+1000000000` = **1 秒**，`-1000000000` = **无限等待**。
+上一轮"1000 秒锁 + 16:23:51 到期"的整条推论是把纳秒当成了微秒，**是错的**。
+
+### (2) 更关键的推翻：我一直在调的不是引擎
+
+那 4 个 14 线程进程**不是 prefill 引擎**，是引擎 fork 出来的
+`multiprocessing.Manager` 服务进程（父进程已死，被 reparent 到 init，所以 ppid=1）。
+在容器里 pip 装 `py-spy 0.4.2` 后拿到 Python 栈才看清：
+
+```
+Thread (MainThread): wait (threading.py:331) <- wait (threading.py:629)
+  <- serve_forever (multiprocessing/managers.py:176)
+  <- _run_server (multiprocessing/managers.py:600)
+  <- Manager (multiprocessing/context.py:57)
+  <- __init__ (tbe/common/repository_manager/utils/multiprocess_util.py:48)
+  <- initialize (tbe/common/repository_manager/route.py:141)
+  <- cann_kb_init (tbe/common/repository_manager/interface.py:36)
+  <- __call__ (torch/_ops.py:1255)
+  <- prepare_quant_weight (xllm/python/kernels_npu/linear.py:62)
+  <- process_weights_after_loading (glm5_2.py:441) <- load_weights (glm5_2.py:906)
+```
+
+`serve_forever` 里的 `self.stop_event.wait(1)` 正是那个 `+1e9`；其余 9 个线程是
+`Condition.wait()`（无限、各自一把新 waiter 锁）= 空闲线程池，完全健康。
+gdb 里那串 `CannKbInit` C 栈是 **fork 继承下来的父进程栈**，不是阻塞点。
+CANN KB 初始化只是 `torch_npu.npu_format_cast` 的副作用（首次 NPU 格式转换 → TBE/op-store
+→ `cann_kb_init` → `multiprocessing.Manager`），**与路由毫无关系**。
+
+### (3) 真因：4 个 prefill 引擎全部 SIGSEGV
+
+僵尸进程的退出码（`/proc/<pid>/stat` 第 52 字段）直接给出死因：
+
+| pid | 启动 | 死因 |
+|---|---|---|
+| 28528 | 16:06:02 | SIG11 |
+| 30838 | 16:06:17 | SIG11 |
+| 30927 | 16:06:32 | SIG11 |
+| 31017 | 16:06:47 | SIG11 |
+
+间隔正好 15s = 启动错开，即**4 个 prefill 引擎全部段错误**，日志最后一行停在
+`xservice_client.cpp:691 Successfully connected to xservice`，没有 FATAL、没有 traceback。
+
+用 gcc 现场编了一个 `LD_PRELOAD` 段错误处理器（`crashwatch.so`，信号栈 + `backtrace_symbols_fd`）
+抓到 4 个 rank 完全一致的栈：
+
+```
+signal=11 si_addr=0x2
+libcust_opapi.so(aclnnSparseFlashAttentionGetWorkspaceSize+0x108)
+  <- libtorch_npu.so <- libtorch_python.so <- python 模型前向
+  <- PyExecutorImpl::run <- Executor::forward <- LLMWorkerImpl::step_internal
+  <- LLMWorkerImpl::step <- WorkerImpl::step_async <- ThreadPool::internal_loop
+```
+
+反汇编 +0x108：`str x0, [x24]`，而 x24 来自调用者栈（`ldr x24, [sp, #328]`），
+`si_addr=0x2` ⇒ **x24 = 2**，即整数 `attention_mode=2` 落在 `aclOpExecutor**` 出参槽里。
+前一条 `cbz x24` 只挡 0，挡不住 2。
+
+为什么只有 prefill 走到这里：`profile_manager.cpp:154-172`，decode 打
+`Skipping eager warmup for decode-only instance`，prefill 走 `warmup_for_eager()` →
+`run_request(256, 0, 1, ...)` —— 而 `warmup_for_eager()` **在崩溃前一行日志都不打**，
+所以日志在 `connected to xservice` 之后戛然而止。
+
+### (4) 根因：镜像自带的自定义算子包与调用方 ABI 不一致
+
+| | 参数个数 | 形态 |
+|---|---|---|
+| 0801 镜像 `custom_xllm_math`（8-21）的 aclnn 头 | **17** | `scaleValue` 在第 10 位，只有一个 `out` |
+| 调用方（torch_npu codegen + xllm python） | 18+ | `scaleValue` 在**第 5 位**，另有 `pre_tokens/next_tokens/attention_mode/return_softmax_lse` |
+| 0911 镜像 `glm_next_transformer` 的头 | **23** | 与调用方一致（多 `attentionOut/softmaxMax/softmaxSum`） |
+
+参数整体错位 → 整数落进指针槽 → `str x0,[x24]` 崩在地址 2。
+**这是自定义算子包过期，不是路由改动，也不是锁。**
+
+### (5) 换镜像（按你的指示用尾号 0911）
+
+* `quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（9-11，17.9GB）**只在 98 上有**；
+  已在 83 上 `docker pull` 成功。
+* 新容器 `fengmin-pdroute91`，配置照抄旧容器（privileged / `ipc=shareable` / host net /
+  shm 64m / 同样 9 个挂载）。旧容器 wheel 已 `docker cp` 救出并装进新容器：
+  `xllm_npu_torch2_9_0-0.11.0-cp311-cp311-linux_aarch64.whl`，576,354,918 B，
+  md5 `f87c4008abc0d130098165414fdddd9f`。
+* **新的环境坑（已修）**：`libcust_opapi.so` 是 xllm 自身的 `DT_NEEDED`；0911 镜像里
+  `custom_xllm_math` 整个不存在，三个 vendor 各自只有 `libcust_opapi.so` 且都不在默认
+  搜索路径上 → 一启动就是 `error while loading shared libraries: libcust_opapi.so`。
+  改法：`env.sh` 读 `opp/vendors/config.ini` 的 `load_priority`，把每个存在 vendor 的
+  `op_api/lib` 依次前置到 `LD_LIBRARY_PATH`（0911 下正确解析到 `glm_next_transformer`）。
+* 旧容器已 `docker kill`（释放 host 端口）；`in_ctr.sh` 默认容器名改为
+  `fengmin-pdroute91`；py-spy 已在新容器重装。
+
+### (6) 换镜像后的结果与**新的拦路虎**
+
+SFA 崩溃**消失**（ABI 对上了），prefill 走到更远处后在 16:47:00 **LOG(FATAL)**：
+
+```
+scatter_nd_update.cpp:27] Check failed: get_workspace_size_func_addr != nullptr &&
+op_api_func_addr != nullptr aclnnScatterNdUpdateV2 or
+aclnnScatterNdUpdateV2GetWorkspaceSize not in libopapi.so, or libopapi.so not found.
+```
+
+（同时 decode rank 0 已 `BRPC READY`，rank 1 停在 `get_cache_info success`。）
+
+查证（`xllm/core/kernels/npu/aclnn/pytorch_npu_helper.hpp:230-300, 713-735`）：
+查找顺序是 `g_custom_lib_path`（来自 `ASCEND_CUSTOM_OPP_PATH`）→
+`g_default_custom_lib_path`（来自 `config.ini` 的 `load_priority`）→ 兜底
+`dlopen("libopapi.so")`。而：
+
+* 两个镜像的 `libopapi.so` 都**只有** `aclnnScatterNdUpdate` / `…GetWorkspaceSize`，**没有 V2**；
+* 0911 镜像**没有 `custom_xllm_math`**，其 vendor 包不导出 V2；
+* 旧容器（0801）的 `custom_xllm_math` **导出 V2**（`nm` 命中 1 处），
+  但它的 SFA 是旧的 17 参数 —— **0801 的算子包一半新一半旧**。
+
+结论：`aclnnScatterNdUpdateV2` 和 23 参数 SFA 都必须来自**用当前源码编译出来的自定义算子包**
+（`third_party/xllm_ops` → `custom_xllm_math`）。这就是"用 0911 镜像做编译"的落点：
+**算子包要按镜像的 CANN 版本重编并安装，不能依赖镜像自带那份。**
+
+### (7) 恢复点（下一步，按顺序）
+
+1. 在 0911 镜像里编译自定义算子包（`third_party/xllm_ops` → `custom_xllm_math`），
+   安装到运行时容器的 CANN vendor 目录，并让 `ASCEND_CUSTOM_OPP_PATH` 指向它。
+2. 校验该 `libcust_opapi.so` 同时导出 `aclnnScatterNdUpdateV2` **和 23 参数**的
+   `aclnnSparseFlashAttentionGetWorkspaceSize`。
+3. `env.sh` 需把 `$ASCEND_CUSTOM_OPP_PATH` 下各目录的 `op_api/lib` 排到最前
+   （本轮只处理了 config.ini 的 vendor 列表）。
+4. `clean_restart.sh` 重新拉起，看 prefill 是否越过 eager warmup；`crashwatch.so`
+   （共享目录 `lib/`）与 py-spy 都还在新容器里可用。
+
+本轮最值得记住的一条：**`libcust_opapi.so` 解析到哪一份直接决定算子 ABI** ——
+同名库有 3 个 vendor 提供，谁先被 `dlopen` 到就用谁的 ABI，错了就静默地崩在算子内部。
