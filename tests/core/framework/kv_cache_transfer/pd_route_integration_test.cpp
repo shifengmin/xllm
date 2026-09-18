@@ -58,6 +58,7 @@ constexpr int64_t kSsmKeyDim = 4;
 constexpr int64_t kSsmValueDim = 4;
 constexpr int32_t kKvGroup = 0;
 constexpr int32_t kLinearGroup = 1;
+constexpr int32_t kKvHeads = 8;
 constexpr int32_t kIndexHeads = 1;  // the indexer cache is a single shared head
 constexpr int32_t kSsmHeads = 8;
 
@@ -76,7 +77,6 @@ struct RoleSpec {
   int32_t group_id = 0;
   int32_t global_heads = 1;
   bool sequence_scoped = false;
-  bool full_sequence_replica = false;
   int64_t canonical = 0;
 };
 
@@ -105,7 +105,7 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
   key.group_id = kKvGroup;
   // An MLA latent cache keeps one logical head; a plain attention cache keeps
   // one per KV head.
-  key.global_heads = enable_mla ? 1 : 8;
+  key.global_heads = enable_mla ? 1 : kKvHeads;
   key.canonical = kCanonicalBlocks;
 
   RoleSpec index;
@@ -114,7 +114,6 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
   index.global_heads = kIndexHeads;
   // The indexer pool has to see the whole sequence on every rank: its top-k
   // reads historical gate and valid values.
-  index.full_sequence_replica = true;
   index.canonical = kCanonicalBlocks;
 
   RoleSpec ssm;
@@ -140,8 +139,19 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
   return {key, index, ssm, conv};
 }
 
-CacheTensorDeclaration make_declaration(const SideSpec& side,
-                                        const RoleSpec& role) {
+// The model-side declaration of one family, from the production mapping: the
+// fixture supplies only the topology and the namespace, and the group geometry
+// comes from the same function production uses. That is what turns the adapter
+// below into a check on that mapping instead of on a hand-written table.
+//
+// `model_context` carries the counts a real instance configures. The per-role
+// descriptor context further down is narrower because the builder only reads
+// the fields its own branch needs; the declaration is a model property, so it
+// sees every field.
+CacheTensorDeclaration make_declaration(
+    const SideSpec& side,
+    const RoleSpec& role,
+    const CacheTensorLayoutContext& model_context) {
   CacheTensorDeclaration declaration;
   declaration.cache_namespace = CacheNamespace::MAIN;
   declaration.role = role.role;
@@ -151,11 +161,27 @@ CacheTensorDeclaration make_declaration(const SideSpec& side,
   declaration.topology.tp_size = side.tp_size;
   declaration.topology.kv_split_size = side.kv_split_size;
   declaration.topology.tokens_per_block = static_cast<int32_t>(kTokensPerBlock);
-  declaration.group.global_head_count = role.global_heads;
-  declaration.group.head_bytes = 0;
-  declaration.group.sequence_scoped = role.sequence_scoped;
-  declaration.group.full_sequence_replica = role.full_sequence_replica;
+  std::string error;
+  const bool declared = declare_cache_group(
+      model_context,
+      KVCacheTensorRole(static_cast<KVCacheTensorRole::Value>(role.role)),
+      &declaration.group,
+      &error);
+  EXPECT_TRUE(declared) << "role " << role.role << ": " << error;
   return declaration;
+}
+
+CacheTensorLayoutContext model_context_of(bool enable_mla) {
+  CacheTensorLayoutContext context;
+  context.kv_head_count = kKvHeads;
+  context.index_head_count = kIndexValues / 2;
+  context.linear_key_head_count = kSsmHeads;
+  context.linear_value_head_count = kSsmHeads;
+  context.linear_key_head_dim = kSsmKeyDim;
+  context.linear_ssm_checkpoint_stride = 1;
+  context.enable_mla = enable_mla;
+  context.head_major_layout = false;
+  return context;
 }
 
 void set_coordinates(WorkerCacheLayoutManifest* manifest,
@@ -358,8 +384,10 @@ void make_rank(const SideSpec& side,
   rank->local_rank = cp_rank * side.tp_size + tp_rank;
   set_coordinates(&rank->manifest, side, cp_rank, tp_rank);
 
+  const CacheTensorLayoutContext model_context = model_context_of(enable_mla);
   for (const RoleSpec& role : role_specs(enable_mla)) {
-    const CacheTensorDeclaration declaration = make_declaration(side, role);
+    const CacheTensorDeclaration declaration =
+        make_declaration(side, role, model_context);
     KvRedundancy redundancy;
     std::string error;
     ASSERT_TRUE(KvRedundancy::derive(
@@ -427,11 +455,12 @@ uint64_t transfer_role(std::vector<RankCache>& sources,
                        std::vector<RankCache>& destinations,
                        const SideSpec& source_side,
                        const SideSpec& destination_side,
-                       const RoleSpec& role) {
+                       const RoleSpec& role,
+                       const CacheTensorLayoutContext& model_context) {
   const CacheTensorDeclaration source_declaration =
-      make_declaration(source_side, role);
+      make_declaration(source_side, role, model_context);
   const CacheTensorDeclaration destination_declaration =
-      make_declaration(destination_side, role);
+      make_declaration(destination_side, role, model_context);
   KvRedundancy source_redundancy;
   KvRedundancy destination_redundancy;
   std::string error;
@@ -556,9 +585,10 @@ uint64_t transfer_role(std::vector<RankCache>& sources,
 // its row holds.
 void verify_role(const std::vector<RankCache>& destinations,
                  const SideSpec& destination_side,
-                 const RoleSpec& role) {
+                 const RoleSpec& role,
+                 const CacheTensorLayoutContext& model_context) {
   const CacheTensorDeclaration declaration =
-      make_declaration(destination_side, role);
+      make_declaration(destination_side, role, model_context);
   KvRedundancy redundancy;
   std::string error;
   ASSERT_TRUE(KvRedundancy::derive(
@@ -643,9 +673,15 @@ void run_scenario(const Scenario& scenario) {
     }
   }
 
+  const CacheTensorLayoutContext model_context =
+      model_context_of(scenario.enable_mla);
   for (const RoleSpec& role : role_specs(scenario.enable_mla)) {
-    const uint64_t moved = transfer_role(
-        sources, destinations, scenario.source, scenario.destination, role);
+    const uint64_t moved = transfer_role(sources,
+                                         destinations,
+                                         scenario.source,
+                                         scenario.destination,
+                                         role,
+                                         model_context);
     std::printf(
         "[%s cp%d tp%d kv%d -> %s cp%d tp%d kv%d] role %d moved %llu bytes\n",
         scenario.source.name,
@@ -659,7 +695,7 @@ void run_scenario(const Scenario& scenario) {
         role.role,
         static_cast<unsigned long long>(moved));
     EXPECT_GT(moved, 0U);
-    verify_role(destinations, scenario.destination, role);
+    verify_role(destinations, scenario.destination, role, model_context);
   }
 }
 

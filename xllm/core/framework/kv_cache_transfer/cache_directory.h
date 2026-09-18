@@ -20,11 +20,51 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/kv_cache/kv_cache_tensor_role.h"
+#include "framework/kv_cache/logical_cache_layout.h"
 #include "framework/kv_cache_transfer/cache_layout.h"
 #include "framework/kv_cache_transfer/kv_redundancy.h"
 #include "framework/kv_cache_transfer/route_binder.h"
 
 namespace xllm {
+
+// Model-side group geometry of one cache tensor family, derived from the same
+// inputs the descriptor builder uses.
+//
+// This is the declaration half of describe_cache_tensor(): the descriptor says
+// how the bytes of one rank are laid out, and this says how many logical heads
+// the group exposes, whether it has a block dimension at all, and whether the
+// whole sequence stays on every rank. The two are derived from the same role
+// and the same layout context, so a layout change that moves one has to move
+// the other.
+//
+// Only the families whose geometry the model actually pins are declared. A role
+// whose geometry is unknown is refused rather than guessed: a wrong head count
+// or a wrong sequence scope routes the wrong blocks, and neither the manifest
+// nor the route can detect it afterwards.
+//
+// `group->head_bytes` is left at 0: the descriptor owns the byte width of one
+// head, and PeerDirectory fills it from there.
+//
+// Two decisions are worth spelling out:
+//
+//   - An MLA instance publishes every cache tensor as one whole resource, so
+//   the
+//     attention group exposes a single latent head per rank no matter how many
+//     KV heads the model text declares. That is what keeps `local_heads == 1`,
+//     which is the admission rule for a whole-resource descriptor and also the
+//     pilot's `Hc = 1, D_tp = tp` contract.
+//   - The DSA indexer pool (INDEX and its scale, which the allocator sizes from
+//     the index block count) keeps every canonical block on every rank, because
+//     its top-k reads historical gate and valid values. Declaring it split
+//     would leave the destination's other rows uninitialised without any check
+//     firing. The reverse mistake is caught: the destination buffer of a
+//     genuinely split pool is too short for the rows the declaration implies,
+//     and the binder rejects the row.
+bool declare_cache_group(const CacheTensorLayoutContext& context,
+                         KVCacheTensorRole role,
+                         GroupTopology* group,
+                         std::string* error);
 
 // Model-side declaration of one cache tensor family: the instance topology its
 // tensors live in, plus the group geometry a published manifest cannot express.

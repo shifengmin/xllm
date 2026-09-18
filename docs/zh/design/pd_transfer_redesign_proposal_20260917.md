@@ -629,8 +629,22 @@ class  PdRouteTransfer {
 **统一入口** → memcpy 逐字节），四个角色的搬运量与改前**逐位相同**。顺带修了夹具缺陷：buffer id 原先
 每 rank 从 0 编号，而传输层按 id 单独寻址缓冲（生产中由 Mooncake 全局唯一），已改成全局计数器。
 
-**仍未做**：生产调用点接线（上面那两项输入）、`ContextParallelTopology` 本体 oracle、
-`MixedLayers` / `DpExpansion` / XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash 不支持 PD 分离）。
+**第 8 轮补上生产侧声明输入（a）**：新增 `declare_cache_group(context, role, GroupTopology*, error)`
+（`cache_directory.{h,cpp}`，不依赖 torch），是 `describe_cache_tensor` 的"声明半边"——同一个 role + 同一份
+layout context 推出"几个逻辑 head / 有没有块维度 / 是否全序列留在每个 rank"。映射表与三条查证依据见工作日志第 8 轮；
+要点：**MLA 下 KV 组的 `G` 必须是 1**（否则 `D_tp`/`Hc` 全变、写者从 `(cp=t,tp=0)` 变成 `(cp=t,tp=h)` 且不报错）、
+**INDEX_SCALE 的行数与 INDEX 相同**（`init_index_cache_scale_shape` 直接取 `index_cache_shape[0]`，而
+`init_index_cache_shape` 在 indexer 分片受支持时乘 `kv_split`）、**SSM/CONV 的 `G` 与 MLA 无关**。
+`is_kv_head_role` 已从 builder 的匿名命名空间提到 `kv_cache_tensor_role.h` 共用。
+无 head 轴的 role（WINDOW/SWA/KV_STATE/…）**显式拒绝**而不是猜。
+
+**声明的 oracle 是适配器本身**：`pd_route_integration_test` 改用生产函数造声明，于是
+"真实张量 → 真实 `describe_cache_tensor` → `PeerDirectory::describe` 接受 + 逐字节路由"就成为对生产声明映射的校验
+（4 个场景 × 4 个 role × MLA/非 MLA 全绿，搬运量与改前逐位相同）。
+
+**仍未做**：生产调用点接线（需对端 manifest getter + `InstanceInfo.addrs` 的全局→DP 局部下标换算，接法见工作日志第 8 轮）、
+`ContextParallelTopology` 本体 oracle、`MixedLayers` / `DpExpansion` / XTensor `explicit_offsets` 端到端。
+**运行时**仍未验证（GLM5.3flash 不支持 PD 分离）。
 
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 

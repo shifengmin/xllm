@@ -138,4 +138,15 @@ class KVCacheTensorRole {
   Value value_;
 };
 
+// Roles whose cache exposes the attention KV head axis: ordinary K/V and their
+// quantization scales. Every other role either carries its own head semantics
+// (SSM / CONV) or has no head axis at all. Shared with the cache layout builder
+// so that the descriptor and the routing declaration cannot drift apart.
+inline bool is_kv_head_role(KVCacheTensorRole role) {
+  return role == KVCacheTensorRole::KEY || role == KVCacheTensorRole::VALUE ||
+         role == KVCacheTensorRole::KEY_SCALE ||
+         role == KVCacheTensorRole::VALUE_SCALE ||
+         role == KVCacheTensorRole::CACHE_SCALE;
+}
+
 }  // namespace xllm
