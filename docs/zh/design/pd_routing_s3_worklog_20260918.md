@@ -2154,3 +2154,834 @@ aclnnScatterNdUpdateV2GetWorkspaceSize not in libopapi.so, or libopapi.so not fo
 
 本轮最值得记住的一条：**`libcust_opapi.so` 解析到哪一份直接决定算子 ABI** ——
 同名库有 3 个 vendor 提供，谁先被 `dlopen` 到就用谁的 ABI，错了就静默地崩在算子内部。
+
+---
+
+## 第 28 轮（17:00–17:35）：算子包缺失、tracer 的 BF16 崩溃、端口抢占，以及**首个真正的路由 bug**
+
+这一轮把「prefill 起不来」这条环境延长线走到了尽头，并且第一次让 canonical 路由**真正开始传字节**（然后立刻暴露出一个真 bug）。
+
+### (1) 0911 镜像根本没有 xllm 自定义算子包
+
+`nm -D` 清点 0911 镜像三个 vendor 的 `libcust_opapi.so`，再加 `libopapi.so`（CANN 内置），
+和 wheel 里引用到的 aclnn 名字做差集：
+
+| 来源 | 导出 aclnn 算子数 |
+|---|---|
+| `glm_next_transformer` | 2 |
+| `custom_transformer` | 12 |
+| `kpool_transformer` | 2 |
+| `libopapi.so`（CANN 内置） | 1130 |
+| wheel 引用（去掉 `GetWorkspaceSize`，干净的 103 个） | — |
+| **0911 三个 vendor 只覆盖其中 3 个** | |
+
+即 0911 镜像只带了「GLM next transformer」这条线的少量算子，**`custom_xllm_math`（xllm
+自己的算子包）整个不存在**（虽然 `vendors/config.ini` 的 `load_priority` 里还写着它）。
+所以 `aclnnScatterNdUpdateV2` 找不到、`aclnnSparseFlashAttentionLse` 也找不到。
+
+### (2) 装回算子包：取 98 构建容器里那份，并**让 `glm_next_transformer` 排第一**
+
+98 的 `dcpfp32-build` 容器里有一份 **2026-09-11 16:31 编译安装**的 `custom_xllm_math`
+（136 MB，52 个 aclnn 算子，含 `aclnnScatterNdUpdateV2`，kernel 目录是 `ascend910_93`）。
+它的 `.xllm_ops_git_head` 记着 `d4a441a60b8b2a42ae2e722e662b21d508d6781c`，
+而 wheel 的 `third_party/xllm_ops` pin 是 `b94b873`；两者不一致的原因是构建时把
+`XLLM_OPS_GIT_HEAD_CACHED` 钉住了（跳过 ops 预编译），所以 wheel 的 C++ 就是**按
+d4a441a6 的头文件**编的 —— 这份包正好匹配。
+
+**关键点：`load_priority` 里 `glm_next_transformer` 必须排在 `custom_xllm_math` 前面。**
+
+| 提供者 | `aclnnSparseFlashAttentionGetWorkspaceSize` 形参个数 |
+|---|---|
+| 0911 `glm_next_transformer`（8-11） | **23**（含 `preTokens/nextTokens/attentionMode/returnSoftmaxLse/attentionOut/softmaxMax/softmaxSum`） |
+| `custom_xllm_math`（d4a441a6，以及 0801 镜像、Aug-11 `.run`） | **17**（`scaleValue` 在第 10 位） |
+
+0911 镜像里的 `libtorch_npu.so`（Aug 7）调的是 **23 参数**那一版；而 `xllm/python/
+kernels_npu/sparse_attention.py:426` 已经改成走 `torch.ops.npu.npu_sparse_flash_attention`
+（旧的自定义 `xllm_ops::sparse_flash_attention` 那条 C++ 路径已被标为 deprecated），
+所以 SFA 的 ABI 由 `libtorch_npu` 决定 ⇒ **SFA 必须解析到 23 参数的那份**，
+其余算子（V2、LSE、Laser…）再从 `custom_xllm_math` 兜。
+
+`xllm/core/kernels/npu/aclnn/pytorch_npu_helper.hpp:257-300` 的查找顺序是
+`ASCEND_CUSTOM_OPP_PATH` 的每个 vendor → `config.ini` 的 `load_priority` 列表 →
+`dlopen("libopapi.so")`，**逐个 vendor 试到找到符号为止**，所以两份包可以共存、各供各的符号。
+
+安装（容器内）：
+
+```bash
+V=/usr/local/Ascend/cann-9.0.0/opp/vendors
+tar xzf .../lib/xllmops_p98.tgz -C "$V/custom_xllm_math"     # 136 MB, 52 ops, 45 个 kernel 目录
+printf 'load_priority=glm_next_transformer,custom_transformer,kpool_transformer,custom_xllm_math\n' > "$V/config.ini"
+```
+
+**并且 `env.sh` 里那段「有 `custom_xllm_math/bin/set_env.bash` 就 source 它」被删掉了**：
+那个脚本会把 `ASCEND_CUSTOM_OPP_PATH` 设成 `custom_xllm_math`，而 `ASCEND_CUSTOM_OPP_PATH`
+是**第一优先级**，等于把 17 参数的旧 SFA 顶到最前面 —— 正是第 27 轮那个段错误的复现路径。
+
+结果：`profile_manager.cpp:1247] Eager warmup completed: tokens=256, latency=71.9 ms`
+→ **prefill 第一次越过 eager warmup**，`Brpc Server started`，decode rank 0 报
+`Successfully linked instance ... prefill_kv_split_size: 2`（异构 DCP 已互认）。
+
+### (3) 仍然缺的算子：`aclnnSparseFlashAttentionLse`
+
+`xllm/python/layers/sfa_dcp.py:504` 的 DCP SFA 路径调的是
+`torch.ops.xllm_ops.sparse_flash_attention_lse(...)`（decode 阶段 `return_softmax_lse=True`），
+而这个算子**在 0801 镜像、P98、Aug-11 的 `.run` 里都没有**（三者导出集合几乎相同，都是 52 个）。
+全集群唯一一份带它的是 83 上 `xllmops-build` 容器里 **9-16 定向编译**的包
+（`nm` 有 `aclnnSparseFlashAttentionLse`，kernel 目录 `ascend910_93/sparse_flash_attention_lse`）。
+
+它是**按需 `dlsym`**（`EXEC_NPU_CMD` 里 `static const auto ...` 首次调用时才解析并 CHECK），
+所以 warmup 没触发就不报错。只要 DCP 的 decode 路径跑到就会 FATAL —— 这一条仍然悬着。
+
+### (4) tracer 自己的 bug：`numpy()` 不接受 bfloat16
+
+第一次带 trace 起 worker，prefill 4 个 rank 全部在 `register_kv_cache_impl success` 之后崩：
+
+```
+terminate called after throwing an instance of 'pybind11::error_already_set'
+  what():  TypeError: Got unsupported ScalarType BFloat16
+At: .../xllm/python/_pd_trace.py(168): _row_hashes
+```
+
+`_row_hashes` 里 `flat.numpy().tobytes()` 在 BF16 上直接抛 C++ 绑定异常 → 整个 worker
+abort（**不是路由问题，是验证工具的问题**）。改法：
+
+```python
+def _host_bytes(tensor) -> bytes:
+    try:
+        return tensor.numpy().tobytes()
+    except TypeError:
+        import torch
+        return tensor.contiguous().view(torch.uint8).numpy().tobytes()
+```
+
+刻意不做 `to(float32)`：那会改变我们正要逐字节比对的内容。
+
+### (5) 端口抢占：这个容器的临时端口范围是 **1024–65535**
+
+第二次拉起直接拒绝启动：
+
+```
+ERROR: these ports are already in use: P:46100 P:46101 P:46102 P:46103
+```
+
+`cat /proc/sys/net/ipv4/ip_local_port_range` = `1024 65535` —— 也就是说**我选的每一个固定端口
+都可能被宿主网络命名空间里别的容器的普通外连临时占掉**（`--network=host`）。
+这不是「上一个进程没死」（`stop_workers.sh` 已确认 12 个进程全清、端口表也空），
+而是**一次性的端口检查本身在有竞态的配置下不可靠**。
+
+`start_workers.sh` 改成**轮询等一个空闲窗口**（`PORT_WAIT` 默认 180s，每 5s 重查），
+把「偶发 500 / 起不来」变成「最多等两分钟」。
+
+### (6) 真正的路由 bug：把对端的 manifest 拿去和我们自己的 topology 对等比较
+
+修好 tracer 之后，请求终于走到推送，然后 prefill 4 个 rank 全部：
+
+```
+E mooncake_kv_cache_transfer.cpp:936] Cannot assemble the destination instance on the
+  canonical route, request_id=chatcmpl-...: the cache layout of peer rank 0 does not match
+  the model: layer 0, role 0, group 0: the declared topology differs from the coordinates
+  the peer published
+F llm_worker_impl.cpp:286] Check failed: kv_transfers.wait() KV cache push failed
+```
+
+定位：`cache_directory.cpp:660-676`，`PeerDirectory::describe()` 对 MAIN 命名空间的张量做
+
+```cpp
+if (declaration->topology.dp_size != manifest.coordinates.dp_size ||
+    declaration->topology.cp_size != manifest.coordinates.cp_size ||
+    declaration->topology.tp_size != manifest.coordinates.tp_size ||
+    declaration->topology.kv_split_size != manifest.coordinates.kv_split_size) { fail }
+```
+
+而 `mooncake_kv_cache_transfer.cpp:928` 传给 `build_route_peer` 的 `declarations_` 是
+**本实例**（prefill: cp=2, tp=2, kv_split=2）的声明，`manifest` 却是**对端**（decode:
+cp=1, tp=2, kv_split=1）发布出来的坐标 —— 两者按设计就不相等。
+
+**同构部署下它们恰好相等，所以这个检查一直是「零成本」的；异构 DCP 正是要打破它，
+于是这条检查把 canonical 路由唯一要服务的场景拒了。**
+
+而这个「相等」本身也不是无害的：`describe_tensor()` 后面所有依赖 `declaration.topology`
+的推导都会用错坐标系：
+
+- `KvRedundancy::derive(declaration.topology, ...)` → `redundancy.split()` 应为对端的
+  kv_split；用本地的 1 会让 332-354 行的 slice 一致性检查按错的 split 去比
+  （`max(kv_split_size,1)` 与 `split()` 一起决定要不要比）。
+- `view->local_rank = cp_rank * declaration.topology.tp_size + tp_rank`：tp 不同时直接算错。
+
+**修法（`pd_route_transfer.cpp`）**：新增文件内 helper，把交给 `PeerDirectory::describe`
+的声明**按对端坐标重写**；只改 MAIN 家族，只改并行坐标，**model 侧的 group 几何与
+`tokens_per_block` 保持我们自己的**——因为两边跑同一个模型，而 `describe_tensor` 仍会拿
+它们去和对端发布的 descriptor 对账，真不一致照样拒绝。SPEC_DRAFT 家族保留自己的
+topology（manifest 坐标永远描述 MAIN，见 `CacheTensorDeclaration` 的注释）。
+
+```cpp
+std::vector<CacheTensorDeclaration> declarations_for_peer(
+    const std::vector<CacheTensorDeclaration>& declarations,
+    const ParallelCoordinates& coordinates);
+```
+
+`build_route_peer` 里逐 rank 用该 rank 的 `manifest->coordinates` 生成，再交给 describe；
+`pd_route_transfer.h` 的 `build_route_peer` 文档补上这条规则。这个检查**故意保留**：
+它现在的作用变成「谁忘了做这个适配，就在组装点立刻报错」，正是我们踩到的那个坑。
+
+### (7) 重新构建（98 / `fengmin-cann9-20260801`）与验证口径
+
+- 改动同时打进本机 clone 和远端工作树 `/export/home/shifengmin.3/workspace/xllm-dcp-fp32`
+  （`ad98850a8` + 未提交改动），**不动 HEAD**，`XLLM_OPS_GIT_HEAD_CACHED` 钉住 ops 门，
+  只增量重编 `pd_route_transfer.cpp` + 重链。
+- **构建容器是 98 的 `fengmin-cann9-20260801`**，不是 `dcpfp32-build`：后者缺
+  `/usr/local/lib/cmake/yalantinglibs/config.cmake` 与 `/usr/local/go`，`setup.py` 会去跑
+  `dependencies.sh`，而该脚本在这个容器里因为 `boost1.78-devel`/`msgpack-devel` 找不到而失败
+  （还会 `dnf remove` 掉 54 个文件）。**别在 `dcpfp32-build` 里构建。**
+- 产物：`dist/xllm_npu_torch2_9_0-0.11.0-cp311-cp311-linux_aarch64.whl`
+  = 576,357,358 B，md5 `ac503fe5763fb7b325703736dc7d3f1a`（旧 wheel 是 576,354,918 B /
+  `f87c4008abc0d130098165414fdddd9f`）。装到 0911 容器后 ELF md5 从
+  `3a65489db9dfd7732a135ccb2ffc791d` 变成 `ee47ec797979cdc0efc9cac322c7cd07`。
+- **wheel 文件名不能改**（PEP 427）：`pip` 会自己解析文件名，改成 `xllm_peerdecl.whl`
+  直接报 `Invalid wheel filename (wrong number of parts)`；必须先 `cp` 回原名再装。
+
+### (8) 恢复点
+
+下一步就是**用修好的 wheel 重跑 `run_trace.sh`**，看推送能否成功、并落下
+PREFILL/DECODE 两侧的 trace，然后 `compare_kv.py` 出逐字节结论。
+仍悬着的环境债：`aclnnSparseFlashAttentionLse` 需要一份定向编译的算子包
+（源在 `~/work/xllm/third_party/xllm_ops`，`build.sh -n sparse_flash_attention_lse`
+需要补上 `third_party/{abseil-cpp,ascend_protobuf,json,makeself,pkg}` 与
+`cmake/third_party/build`——后者的 patch 文件在第一次打包时被 `--exclude=./build` 误删过，
+正确写法是 `COPYFILE_DISABLE=1 tar czf ... --exclude-vcs --exclude='._*'`，
+**不要**排除 `./build`，否则会连 `cmake/third_party/build` 一起去掉，
+而且 macOS 的 tar 会塞进 `._*` 苹果双胞胎文件把 AscendC 编译搞崩）。
+
+### (9) 第一次跑通与字节级比对的第一版结论
+
+修好的 wheel 装进 0911 容器后，`run_trace.sh` 一次跑通：
+
+```
+http_code=200 time=5.39s   prompt_tokens=3492   completion_tokens=4
+trace: PREFILL 4 ranks × 19782 行, DECODE 2 ranks × 2560 行
+```
+
+比对（`compare_kv.py --tp-size 2`，prefill 源取**两个 chunk 的并集**）：
+
+| slot | 类 | 总数 | 命中预测位置 | 备注 |
+|---|---|---|---|---|
+| `key` / `value` | split | 116 | **108** | 每条摘要出现在 **2 个** prefill rank 上 = MLA 单 latent head 在 tp 对上的复制 ✓ |
+| `index` | replicated | 87 | 81（并集口径 84） | 48 条在**全部 4 个** prefill rank 上出现 ✓ |
+
+**所有"不匹配"行的 sha256 恰好等于对应形状的全零缓冲区**：
+
+```
+key   131072 B -> fa43239bcee7
+value  16384 B -> 4fe7b59af6de
+index  32768 B -> c35020473aed
+```
+
+即**失败项全部是 decode 侧没被写入的行**，且它们的源行**根本不在 prefill 那次 batch 的行集合里**：
+
+* `row 3620+call`：tracer 从 `slot_mapping` 推出的**伪行号**（每步 +1，请求之外的槽位）；
+* `row 1`：prefill 的**逻辑块号从 1 开始**（`block_table=[1..14, 128…]`），
+  所以 prefill 没有逻辑 0 / canonical 1，decode 的 canonical row 1 无源；
+* `index` 的 `row 15..` 是 decode **自己**在上一步之后才写的（`after call0` 非零行 13→14），符合 DSA 逐步写。
+
+⇒ **传输的字节本身是对的**；verdict 的 FAIL 来自「全零行 + 源行不在 prefill batch 内」，
+属于比对口径过严 + tracer 伪行号。已把 `block_table` / `slot_min/max/len` / `slot_derived` / `slot_unit`
+插桩进 `__meta__`，用于定位最后那个边界块。
+
+### (10) 又一个环境坑：`--shm-size=64m` 被**具名 POSIX 信号量**撑满
+
+连跑第二次 bring-up 时，prefill rank 0/2/3 全死，症状分散得像三个不同的 bug：
+
+```
+File "multiprocessing/synchronize.py", line 57, in __init__
+  sl = self._semlock = _multiprocessing.SemLock(...)
+OSError: [Errno 28] No space left on disk
+RuntimeError: SetPrecisionMode:...AclSetCompileopt(...) error code is 500001
+F llm_master.cpp:62] Check failed: engine_->init(master_status_)
+```
+
+根因：**每个 Python `multiprocessing.Lock`/`Queue` 都是一个住在 `/dev/shm` 的具名信号量**，
+而 CANN TBE 并行编译池会创建很多个；**SIGKILL 不会 unlink 它们**，
+所以每跑一轮就漏一批，几轮之后 64M 的 `/dev/shm` 满了。
+
+`df -h /dev/shm` 在 reset 前后：`64M 用满` → `0% / 0 个条目`。
+修法：`stop_workers.sh` 在所有 worker 都停掉之后
+`find /dev/shm -maxdepth 1 \( -name 'sem.*' -o -name 'mp-*' \) -delete`，并打印回收前后用量。
+
+**记住：这个容器里"起不来"的第一件事是看 `/dev/shm`，不是看日志。**
+
+### (11) 插桩定位：伪行号的来源，以及剩下的**唯一**疑点
+
+给 `__meta__` 加上 `block_table` / `slot_min/max/len` / `slot_derived` / `slot_unit` 之后，
+run6 的 meta 直接给出答案：
+
+```
+DECODE  before call0: block_table=[1..28] len=28 slot_len=1 slot_min=slot_max=3620 slot_unit=128 slot_derived=[28]
+PREFILL after  call1: block_table=[1..14] len=14 slot_len=3492 slot_min=256 slot_max=3747 slot_unit=256 slot_derived=[1..14]
+```
+
+⇒ decode 的 `slot_mapping` **只有一个槽**（本步新 token，slot=3620 = block28×128+36），
+它 `//128` 得到 28，**本来就在 block_table 里**。写入 trace 的 `block 3620` 是 tracer 的 bug：
+
+```python
+block_tokens = max(1, int(getattr(metadata, "block_size", 0) or 0)) * split   # ← block_size=0 时得 1！
+```
+
+`max(1, 0)` 把"没有 block_size"变成了 **1**，于是 `slot // 1` = 槽位值本身。
+prefill 侧同理：`split=2` 让除数变成 2，`slot//2` 产出 `128..1873` 一堆伪块号
+（这正是 run4/5 里 prefill `blocks` 出现 128+ 的原因）。
+修法：**block_table 非空时只信它**，为空时才用 slot 推导，且缺失 block_size 时回退到 128 而不是 1。
+
+按修好的口径重算 run6：decode 行集 = `block_table`（308 = 28 行 × 11 slot），
+K/V 的非零行 **27/28**，唯一全零行是 **row 1**；index 非零 13 行（15..28 是 decode 自己逐步写的）。
+
+### (12) 剩下的唯一疑点：decode 的 row 1（第一个块）
+
+事实：
+* decode `block_table=[1..28]`（28 个块），slot 约定是 **1-based**：`slot = block_id*128 + offset`
+  （新 token 在位置 3492 = (28-1)*128+36 ⇒ slot 3620）⇒ **block 1 = 位置 0..127**，是序列的第一个块。
+* prefill `block_table=[1..14]`，`slot = logical*256 + offset` ⇒ **逻辑 1 = 位置 0..255**，
+  即 canonical 2（slice 0 = 位置 0..127）、canonical 3（slice 1 = 位置 128..255）。
+* 实测映射（两边一致、108/116 命中）：`decode.row[c] ← prefill 逻辑 c//2, slice c%2`。
+  ⇒ decode row 2 拿到的是 **位置 0..127** 的 KV，而 row 2 语义上是位置 128..255;
+  decode row 1（位置 0..127）**全零**。
+
+两种解释，必须二选一：
+
+1. **口径对**：canonical id 空间里 0 号块保留不用，序列从 canonical 2 开始，
+   decode 的 block 1 是空穴 —— 但 decode 只有 28 个块（1..28），若 1 是空穴则只有 27 个有效块
+   = 3456 token < 3492，**差 36 个 token 正好等于最后那个 offset**。
+2. **差一个块（真 bug）**：正确的配对应是 `decode (1,2) ← prefill 逻辑 1`、`(3,4) ← 逻辑 2`…
+   即 `prefill 逻辑 = (c+1)//2`，而实现用的是 `c//2` —— 偶数块对、奇数块全部错位一格。
+
+**判据（下一次实验）**：让 decode 把它的 KV 行**按语义位置**对一遍：
+`decode.row[k]` 应当等于「位置 (k-1)*128.. 的 KV」。prefill 侧位置可从
+`slot // 256 = logical-1`、`(slot % 256) // 128 = slice` 直接算出，
+于是不需要猜 canonical 定义：把 prefill 的 (位置块, slice) 与 decode 的 row 直接对上即可。
+如果 `decode.row[1] == prefill(位置 0..127 的 slice0)` 不成立而 `decode.row[2]` 成立，
+就是解释 2，需要把 canonical→row 的映射改成 `(c+1)//2`。
+
+### (13) 与口径无关的硬结论：**decode 只拿到 27 个块的 KV，而请求需要 28 个**
+
+把两边的**位置语义**拉出来对，就不需要再争 canonical 定义：
+
+| | slot 约定 | 第一个块 | 覆盖 |
+|---|---|---|---|
+| PREFILL | `slot = logical*256 + offset`（`slot_min=256`） | 逻辑 1 = 位置 0..255 | 逻辑 1..14 = 位置 0..3583 |
+| DECODE | `slot = block_id*128 + offset`（本步新 token 位置 3492 → slot 3620 = 28*128+36） | 块 1 = 位置 0..127 | 块 1..28 = 位置 0..3583 |
+
+请求 prompt = 3492 token ⇒ **需要 28 个 128-token 块**（块 1..28，最后一块用 36 token）。
+而 decode 侧实测：**非零行只有 27 个（row 2..28），row 1 全零** ⇒
+
+* 无论 canonical id 是 0 基还是 1 基，**decode 的 row 1（位置 0..127）是空的**，
+  而它有数据的 27 行装的是 prefill 前 27 个 128-token 半块（位置 0..3455）；
+* ⇒ **位置 3456..3491（最后 36 个 token）的 KV 没有任何一行接收**；
+* ⇒ `decode(块1) 缺数据` 与 `尾部 36 token 缺数据` 二者必居其一，
+  取决于映射是「差一个」还是「帧不同」——**无论哪种都是传输侧的真实缺陷，不是比对假阳性**。
+
+判据（口径无关）：decode 的**非零 K/V 行数必须 = ceil(prompt_tokens / 128)**。
+本次 27 ≠ 28。
+
+下一步实验（用来二选一，并顺手排除边界噪声）：
+
+1. **把 prompt 长度凑成 256 的整数倍**（例如 3584 token = 14 个逻辑块）再跑一次：
+   若尾部差块消失、只剩 row 1 空 ⇒ 是「差一个」的映射问题；
+   若仍然差一块 ⇒ 是尾部半块没被规划进 route。
+2. 在 `PdRouteTransfer::plan` / binder 里加一行 VLOG，打印
+   `(canonical_block -> dst_local_rank, dst_row)` 的配对，直接把映射钉死。
+3. 同时给 `compare_kv.py` 的口径加一条**与口径无关的断言**：
+   `count(nonzero K/V rows) == ceil(prompt_tokens/128)`，任何映射假设错了都会立刻暴露。
+
+### (14) 定位完成：**目标行整体高了一格（off-by-one）**，证据闭环
+
+用 decode **自己的第一步**当标尺（这一步写的 token 在绝对位置 3492，slot=3620）：
+
+```
+decode rank0 before0 -> after0，行内容发生变化的行：
+   layer 0/1/2/3 × slot key/value/index  ⇒ 全部是 row 28
+```
+
+⇒ **decode 的 row k 覆盖位置 (k-1)*128**：位置 3492 属于块 28（3456..3583）✓ 与 slot 3620 = 28*128+36 自洽。
+
+再把两侧按**位置**对齐（与 canonical 定义无关）：
+
+| 半块 h（0 基，位置 h*128..h*128+127） | 应由谁提供 |
+|---|---|
+| h = 0..3455/128 = 0..26 | prefill 逻辑 L = h//2 + 1，slice s = h%2 |
+| h = 27（位置 3456..3583，prompt 用到 3456..3491） | prefill 逻辑 14，slice 1 |
+
+实测 decode 侧：**row 1 全零**，row 2..28 装的是 prefill 的 `(L = c//2, s = c%2)`，c = 2..28，
+即 **h = 0..26 的内容被写进了 row 2..28** —— 而它应该落在 row 1..27。
+
+⇒ **一个 off-by-one 同时解释了两个现象**：
+* decode row 1（h=0）空；
+* prefill 的最后一个半块（L=14, s=1，h=27）没有任何目标行接收（本该落在 row 28，现在被 h=26 占了）。
+
+**根因**：`canonical_blocks_of_request`（`cache_directory.h:135` 那段注释）把**1 基的逻辑块号**
+直接展开成 `canonical = logical * kv_split_size + slice`。prefill 的逻辑块号是 1 基（`block_table=[1..14]`，
+`slot_min=256` 说明位置 0 落在逻辑 1），于是展开得到 **2..29**；而 decode 的块号是同一序列的
+**1 基半块编号 1..28**（`block_table=[1..28]`）。两者相差 1。
+展开式在**同一实例内部**自洽（prefill 自己的 indexer 表也这么展开，所以源侧行号 `c//S` 是对的），
+但**跨实例当目标行号用**就错了：目标行应为 `(logical-1)*S + slice + 1 = c - 1`。
+
+**修法方向**（下一轮做，需要重编 + 重跑）：跨实例不再用「各自的 canonical id」当键，
+而是**经由共享的逻辑块号 + 半块序号（或绝对位置）换算**到对端的行号；
+`KvLayoutIndex` / `ReshardPlanner` 本就是为这件事准备的。修完的验收判据（口径无关）：
+
+```
+count(nonzero K/V rows on decode) == ceil(prompt_tokens / 128) == 28
+decode row 1 非零，且 == prefill(L=1, s=0) 的摘要
+```
+
+---
+
+## 第 29 轮（2026-09-18 晚）：canonical 坐标改成「位置」，off-by-one 落地修掉 + 单元测试 114 全绿
+
+### (15) 定案：canonical 是**位置**，不是地址；三种池子各有一套行布局
+
+第 28 轮 (14) 的结论（目标行整体高一格）在这一轮落到代码里。补上了当时缺的那块拼图：
+**池子的行号为什么是 1 基**，以及**同一份 canonical 在不同 family 上落到哪一行**。
+
+三条运行时事实（都在代码里核过，不是推断）：
+
+| 事实 | 出处 | 结论 |
+|---|---|---|
+| 池子保留第 0 行做 padding | `BlockManagerImpl::BlockManagerImpl`：`// reserve block 0 for padding` + `CHECK_EQ(padding_block_.id(), 0)`；`free_blocks_` 升序发放（`free_blocks_.push_back(total-i-1)`，`allocate` 从尾部取），所以**第一个真实块 id = 1** | 请求的第 `p` 个块 = 池行 `p + 1`；`num_total_blocks() = free_blocks_.size() - 1` |
+| `slot = block_id * block_size + offset` | `KVCacheState::cache_slots` | 行号 = 池 id，**1 基** |
+| DCP 局部化 `local_row = global_slot / logical_block_size = block_id` | `localize_kv_shard_slots`（`kv_shard_batch_metadata.cpp`） | KV cache 的行 = 池 id = 位置块 + 1 |
+| indexer 全序列池按 `row = block_id * dcp_size + slice` 展开 | `expand_kv_shard_indexer_block_table` + `KVShardLayout::globalize` | 全序列副本的行 = 位置 `h` + `dcp_size` |
+
+于是 **canonical 只能定义成「位置」**：`h = (id - 1) * split + slice`（`id` 是池 id，`split` 是该实例的 kv_split）。
+把它变成行号按 family 分三种：
+
+```
+sequence_scoped（SSM/CONV/LINEAR/EMBEDDING）  row = h            // slot id 本身就是位置
+full_sequence_replica（DSA indexer 池）        row = h + kv_split // 每个 slice 一行，整体后移一个保留块
+其它（KV cache / MLA latent）                  row = h / split + 1 // 每块一行，第 0 行是 padding
+```
+
+**为什么同构时看不出来**：`row = (h + S)/S = h/S + 1` 只在两端 `S` 相同时成立；
+`S_P=2, S_D=1` 时 `(h+2)/1 = h+2`，比正确的 `h+1` 高正好一格 —— 就是第 28 轮实测的那一格。
+也就是说：**旧的 `canonical = id*S+slice` 是「用源侧坐标当目标行号」，同构下恰好对，异构下必错**。
+
+改动：
+
+* `cache_directory.{h,cpp}`：`canonical_blocks_of_request` 改成 `(id - 1) * factor + offset`，
+  并对 `id == 0`（padding 块，没有位置语义）**直接报错**而不是静默平移；头注释重写，把
+  「位置而非地址」和三条行布局写清楚。
+* `route_binder.{h,cpp}`：新增文件内 `peer_row(view, split, block)`，把 canonical → 池行号的三条规则
+  收在一处；`bind` 里 `local_row`/`remote_row` 都走它。注释里点明「同构下旧公式恰好对，异构下必错」。
+* `pd_route_transfer.h` / `kv_redundancy.h`：`CanonicalBlock::local_row` 的文档补上
+  「这是**位置行**（0 基）；池行是它 +1，因为池子把第 0 行留给了 padding 块」，并说明这个偏移
+  属于 peer-dependent 那一侧，所以落在 `RouteBinder` 而不是 `CanonicalBlock`。
+
+### (16) 单元测试跟着改口：114 用例全绿
+
+口径一改，5 个测试文件的 fixture 必须一起改（它们原本**自洽地**编码了旧口径 —— 这正是
+`kv_shard_contract_test` 开头那段警告说的「两边用同一个错误公式，谁都发现不了」）：
+
+| 文件 | 改了什么 |
+|---|---|
+| `kv_shard_contract_test.cpp` | id → canonical 的期望改成 `(id-1)*4+j` 且 id 用池行 `{1,2,4}`；新增「拒绝 padding 块 0」用例；indexer 行断言改成 `h + kv_split`（即运行时展开式） |
+| `pd_route_transfer_test.cpp` | fixture `resource_count = 资源数/split + 1`（多出的第 0 行 = padding 行）；`fill_expected` 的行号 `+1`，并给 sequence-scoped family 走 `row = block`（slot 就是行） |
+| `pd_route_integration_test.cpp` | 新增 `RowLayout` + `position_of_row()`，把三种行布局写成 fixture 的显式模型；行数按布局算（副本族 = `(位置数/S + 1) * S`）；`canonical_content` 不再用 `CanonicalBlock::local_row` |
+| `cache_directory_test.cpp` | 源 `rows=1→2`、目标 `rows=4→5`（给保留行让位） |
+| `pd_route_test.cpp` | 三处 golden 字节偏移改成 `block/split + 1`（这些是**独立写死**的期望值，所以它们真能抓错） |
+
+构建 + 运行（同一个 cmake build dir，见 (17)）：
+
+```
+kv_shard_contract_test    6/6      pd_route_test            12/12
+kv_redundancy_test       12/12     pd_route_transfer_test   14/14
+cache_directory_test     23/23     pd_route_integration_test 4/4
+reshard_planner_test     43/43     --------------------------------
+                                   合计 114 用例，exit=0
+```
+
+其中 `pd_route_integration_test` 是**主机端逐字节**跑的 2↔4 异构 DCP 用例（含 MLA/非 MLA、
+SSM/CONV、indexer、head class 折叠），它现在按池行布局独立算期望，所以是这次改动真正的回归网。
+
+### (17) 构建环境的两个坑（都能让「只重编一个 .cpp」变成全量或直接失败）
+
+1. **`setup.py` 的 env 会被烧进编译命令**。`scripts/build_support/env.py::set_npu_envs()` 设
+   `PYTORCH_INSTALL_PATH` / `LIBTORCH_ROOT` / `PYTORCH_NPU_INSTALL_PATH`，而 CMake 里
+   `-I$ENV{PYTORCH_INSTALL_PATH}/include` 是**配置期展开**的。用裸 `ninja`（不经过 setup.py）触发
+   重新 configure，得到的命令里会出现 `-I/include`（空值），于是
+   **整个 build dir 的 1395 个目标全部失效**并开始重编，而且因为 `LIBTORCH_ROOT` 为空，
+   CMake 走 `FetchContent` 分支去**下载 libtorch**（容器没有外网）→ `Build step for libtorch failed`。
+   正确做法：先跑一段 python 复刻 setup.py 的 env（`import scripts.build_support.env; set_npu_envs()`，
+   把 `os.environ` dump 成 `export`），再 `cmake -S <tree> -B <build dir>` 显式重生成一次。
+2. **ops 门要 `XLLM_OPS_GIT_HEAD_CACHED`，值不是 `git ls-tree` 的 pin**。`CMakeLists.txt:74` 比的是
+   `git -C third_party/xllm_ops rev-parse HEAD`。xllm_ops **是**注册的子模块（`.gitmodules` 里
+   有 `third_party/xllm_ops`），但 **98 构建树里的 `third_party/xllm_ops/.git` 不存在**（子模块
+   从未在那棵树里初始化），于是 git 向上找到**父仓库**、打印**父树 HEAD**（本树 `ad98850a8`）；
+   本机这份 clone 的 `third_party/xllm_ops/.git` 是 48 字节 gitfile，同一个命令打印的才是
+   `b94b873`。不设这个变量 → 每次 configure 都跑 `third_party/xllm_ops/build.sh`（这棵树里没有）→
+   `error code: 127` + `Configuring incomplete`。**正确取值 = 在哪棵树里构建，就在那棵树里跑一次
+   这条命令取它打印的值**；第 28 轮 RESUME 写的 `b94b873` 是从本机 clone 抄的，在 98 那棵树上
+   是错的。
+
+顺带：`stop_workers.sh` 之后 `/dev/shm` 的清理、端口轮询、`custom_xllm_math` 的
+`load_priority` 顺序都保持第 28 轮的做法，不再重复。
+
+### (18) 端到端验收：**PASS（字节级）**
+
+重编 wheel（`576,360,599 B` / md5 `864cd27e…`，装完 ELF md5 `873c87ac9d544f119cad5e94bc5572e9`，
+旧 `ee47ec79…`；二进制里能 grep 到新错误串 `the reserved padding block` 作为「这版确实进去了」的凭据），
+装进 0911 容器 `fengmin-pdroute91`，`run_trace.sh` 跑一次 3492-token 请求，`http_code=200`，
+trace 落下（PREFILL 4 rank × 708 行，DECODE 2 rank × 2472 行 —— 修好的 tracer 只 hash
+`block_table ∪ block_table*S+j`，比上一轮 19782 行的伪行号集合小一个量级）。
+
+判据 1（口径无关、第 28 轮定的）：**decode 每个 layer 的 K/V 非零行数 = ceil(3492/128) = 28**
+
+```
+layer 0 key  : rows=28 nonzero=28 min=1 max=28 all_nonzero=True
+layer 0 value: rows=28 nonzero=28 min=1 max=28 all_nonzero=True
+... layer 1/2/3 同（8/8 组合全部 1..28 全非零）
+```
+
+判据 2：**每一行的字节都来自规则预测的 (prefill rank, prefill row)**。
+`compare_kv.py` 的「先按摘要反查真实落点、再和规则比」在 `before call 0`（推送后、decode 自己
+第一步之前）这一帧：
+
+```
+key    split       total=112 written=112 zero=0 match=112 mismatch=0 absent_in=0
+value  split       total=112 written=112 zero=0 match=112 mismatch=0 absent_in=0
+index  replicated  total= 84 written= 39 zero=45 match= 84 mismatch=0 absent_in=0
+VERDICT: PASS
+```
+
+`key/value` 112 = 28 行 × 4 layer，**一条 mismatch / 一条空行都没有**；反查出来的配对是
+`(rank,row) = (0,1)、(2,1)、(0,2)、(2,2) …`，正是 `row = h/S + 1`、writer slice `= h % S` 的
+新规则（`row 1` 来自 prefill rank 0 row 1 = 逻辑 1 的 slice 0 —— 上一轮那个「空穴」就在这一行）。
+index 84 = 28 行 × 3 layer，0 mismatch / 0 absent；45 个 zero 行是**两边都还是零**的
+（prefill 自己那 4 个 rank 在该行也是全零，逐行核过：lost=0、phantom=0）。
+
+**顺带推翻了一个之前的臆断**：indexer 池并不是「每个 rank 内容相同」。同一 index 行上，
+cp=0 的两个 rank（0,1）与 cp=1 的两个 rank（2,3）持有**不同**的摘要 —— 只有同一 slice 的
+副本（tp 对）才逐字节相同。所以 `compare_kv.py` 里那条「摘要必须在全部 4 个 prefill rank 上
+出现」的断言是错的期望（`all_ranks=45 ≠ replica_rows=84` 就是它在报 FAIL），已降级为
+**信息性统计**：路由按声明把 full-replica family 从**单个 writer rank** 推一份，这个语义没问题，
+但「副本天然相同」这个前提在 DCP 下不成立于跨 slice 的副本 —— 这条记在这里，留给后续
+判断「indexer 只推一份是否够用」（本次 decode 侧拿到的是 cp=0 那份，逐行与源一致）。
+
+其余 7 个 decode 帧 FAIL 是**口径使然**：`call ≥ 1` 之后 decode 自己往上写了新 token 的那一行
+（row 28）和它自己算的 index 行，prefill 的 trace 里当然没有这些字节；`compare_kv.py` 现在
+明确把「最早 PASS 的那一帧」当判据，并在输出里写明原因。
+
+### (19) 本轮留下的债（下一轮候选）
+
+1. **位置信息仍然是从块 id 推的**：`canonical = (id - 1) * S + slice` 假设「请求的块 id = 位置块 + 1」。
+   池子保留 0 号块 + 升序发放保证了**首个请求**成立；prefix cache 命中（共享块 id 任意）或
+   多请求并发（第二个请求的基址不是 1）时会失配。真正的修法是把位置显式带进 `KVTransferMapping`
+   （`batch_input_builder` 里 `local_idx` 就是位置，`next_transfer_idx` 是基址），
+   让 canonical 由位置而不是 id 推出来。这条现在会**静默**错（不会报错），优先级最高。
+2. indexer 跨 slice 副本不同 → 「只推一个 writer」是否够用，需要模型侧确认（见 (18) 末段）。
+3. 收尾清理：`scripts/build_support/utils.py` 的 `PDROUTE_BUILD_ONLY_BYPASS`、未跟踪的
+   `push_route.{h,cpp}` / `push_route_test.cpp` / `kda_constants.py` / `third_party/dependencies.sh`、
+   `trace_remove.sh` 还原；`~/work/pdtrace/` 不进仓库。
+
+### (20) 代码评审补刀：prefix cache / chunked prefill 下位置不能从块 id 推
+
+评审（Claude）指出 (19) 债#1 是真问题，并给了最小修法：`base = index * split`（`index` = `local_ids`
+里的位置，恒等于 `p`）。**方向对，但那个式子只在「这一步的列表从位置 0 开始」时才成立**：
+
+* `build_step_transfer_info`（`batch_input_builder.cpp`）里，发给数据面的
+  `step_mapping.local_ids` 是**本步**的子序列：`for (local_idx = next_transfer_idx; local_idx < map_end; ++local_idx)`，
+  而 `next_transfer_idx` 是传输游标（会被 `remote_shared_num` 压缩到 D 侧已有的共享块数之后）。
+  所以列表第 k 项的位置是 `next_transfer_idx + k`，**不是 k** —— 用 `index * split` 会把
+  「chunked prefill 的第二块 / 前缀命中之后的第一块」整段平移到位置 0。
+* 反过来，原来的 `(id - 1) * split` 在**没有前缀共享**时恰好等于 `next_transfer_idx + k`（因为
+  池子按 1 基顺序发放），所以单请求场景看不出问题；前缀命中时 id 是共享前缀所在的行，`id-1`
+  与位置无关，**静默错位**。
+
+**本轮做法（＝把「位置」显式带上，而不是从任何东西推）**：
+
+| 位置 | 改动 |
+|---|---|
+| `common/types.h` | `KVTransferMapping` 新增 `std::vector<uint64_t> local_positions`，与 `local_ids` 一一对齐（**逐项**记录，所以中间丢掉一条 lane 也不会把后面的位置带偏） |
+| `batch_input_builder.cpp` | `build_step_transfer_info` 里 push `local_ids` 的同时 push `local_idx`（就是绝对位置） |
+| `forward_shared_memory_manager.cpp` | 共享内存序列化（size/write/read ×2）把新字段一起带上，schedule overlap 打开时位置不丢 |
+| `cache_directory.{h,cpp}` | `CacheGroupRequest` 增加 `positions`；`canonical = position * split + offset`；**positions 缺失/条数不匹配 → 直接报错**（不再猜），position 溢出也报错 |
+| `mooncake_kv_cache_transfer.cpp` | 调用点把 `local_positions` 传进去 |
+| `kv_shard_contract_test.cpp` | 改成「位置驱动」：id 用**任意的池行**（37/38/51 模拟前缀命中，60/61 + 位置 7/8 模拟第二块），并覆盖 `id-1` 与 `index` 两种错法；新增「缺 positions 报错」用例 |
+
+这样：单请求（本轮实测 PASS 的那次）行为不变；前缀命中 / chunked prefill 的第二块从
+「静默错位」变成「正确」；而**忘了带位置**的生产者会当场报错，不会静默平移。
+
+### (21) 操作坑清单（下次直接照这个躲）
+
+1. **裸 `ninja` 触发 cmake 重新 configure 时，env 必须和 `setup.py` 完全一样**。
+   `scripts/build_support/env.py::set_npu_envs()` 设 `PYTORCH_INSTALL_PATH` / `LIBTORCH_ROOT`，
+   而 CMake 用 `-I$ENV{PYTORCH_INSTALL_PATH}/include`（配置期展开）。env 不对 → 命令里出现
+   `-I/include` → **整个 build dir（1395 目标）失效重编**；`LIBTORCH_ROOT` 为空还会走
+   FetchContent **去下载 libtorch**（容器没有外网）→ `Build step for libtorch failed`。
+   做法：用 python dump 一遍 `set_npu_envs()` 的 env（`export KEY='VALUE'`）再 source，然后
+   `cmake -S "$TREE" -B "$BUILD"` 显式重生成一次（缓存里的 `-D` 参数会复用）。
+   **不要在 build 目录里裸跑 ninja 试探。**
+2. **`XLLM_OPS_GIT_HEAD_CACHED` 的正确取值** = 在**你实际构建的那棵树**里跑
+   `git -C third_party/xllm_ops rev-parse HEAD` 打印出来的值。98 构建树里 xllm_ops 的 `.git`
+   缺失，这个命令会向上解析到**父仓库**、打印**父树 HEAD**（本机 clone 里子模块元数据在，同一
+   命令给的是 `b94b873` —— 所以★不要★照抄 `git ls-tree` 的 pin）。不设 → 每次 configure 都跑
+   `third_party/xllm_ops/build.sh`（这棵树里没有）→ `error code: 127` + `Configuring incomplete`。
+3. **工具是两份拷贝**：本机 `~/work/pdtrace/` 和 83 容器里的 `$BASE/tracefiles/` 不是同一个地方，
+   `trace_install.sh` 只从 `tracefiles/` 取。改完 tracer **必须**同步过去（本轮就踩了一次：
+   容器里跑的是旧版 `_pd_trace.py`，md5 与本地不一致）。跑之前先 `md5sum` 对一遍。
+4. **分清脚本该在哪台机器上跑**：`rebuild_peerdecl2.sh` / `deploy_stage98.sh` 依赖本机
+   `sudo -n docker`，必须在 **98 host** 上执行（`rrun … jd-node-98 bash -s <`）；在 mac 上直接跑
+   只会得到 `sudo: a password is required`。包装器：`r83.sh`（83 容器内）/`r83.sh --host`（83 host）/
+   `r98.sh`（98 容器内）。
+5. **`rrun` 不转发环境变量**：`STAGE_WHAT=wheel rrun …` 无效（远端拿到默认值 `all`）。要传参就写死
+   在脚本里，或另生成一个脚本。
+6. **trace 目录是 root 所有**：打包要 `sudo -n tar`，再 `chown` 成自己才能 `scp` 回本机。
+7. **验收前先确认「跑的是哪一版二进制」**：装完 wheel 必须
+   `md5sum $SP/xllm/xllm` + `strings` 里 grep 一个**本轮新增字符串**（这轮用
+   `the reserved padding block`）。否则很容易把旧二进制的结论当成新结论。
+8. **`/dev/shm` 只有 64M**：每轮 SIGKILL worker 都会漏具名 POSIX 信号量，撑满后报
+   `OSError: [Errno 28]` + `llm_master.cpp:62 Check failed`；`stop_workers.sh` 停完要清，起不来
+   第一件事看 `/dev/shm`。
+9. **端口随时被抢**：容器 `ip_local_port_range = 1024 65535`，固定端口会被 host 上别的容器占用；
+   `start_workers.sh` 用轮询等空闲窗口（`PORT_WAIT` 默认 180s）。
+10. **`libcust_opapi.so` 的解析顺序决定算子 ABI**：SFA 必须解析到 `glm_next_transformer`（23 参数，
+    匹配 0911 的 `libtorch_npu`）；source 任何把 17 参数旧 SFA 的 vendor 放进
+    `ASCEND_CUSTOM_OPP_PATH` 的 `set_env.bash` 都会让 SFA 解析错 → 段错误。
+11. **判断「卡住」先分清进程身份**：`multiprocessing.Manager` 子进程的 argv 和引擎完全相同，
+   别按 argv 杀错。
+
+## 第 30 轮（2026-09-18 20:00–）：位置显式化的第一次重编，与一次**静默同步失败**造成的「新旧混合构建树」
+
+### (22) 时间线（本轮最贵的一课在第 (25) 节）
+
+| 时刻 | 事件 |
+|---|---|
+| 19:30 | 把本机改动同步到 98 构建树（**这次同步静默漏了一个文件**，见 (25)） |
+| 19:32–19:40 | 重编 `setup.py build` + `bdist_wheel`：`BUILD_EXIT=0`、`WHEEL_EXIT=0`，wheel md5 `49dc1feb5fc36f5a8883d311db70bd4e`（576,367,916 B） |
+| 19:45 | 装进 0911 容器：新 ELF md5 `141cbe43c7b3a5f9084b35db5c12fbe7`（旧 `873c87ac…`）；`strings` 能 grep 到本轮新增串 `positions; a block-scoped group has to say where each id`、`reports position` ×1 |
+| 19:46–19:51 | 干净重启 + 带 trace 的单请求：**http_code=500**，`Instance is failed and deleted` |
+| 19:51:49 | P rank_0：`E mooncake_kv_cache_transfer.cpp:880 Cannot convert the request's cache ids into canonical blocks, cache group 0 supplies 14 block ids but **0 positions**` → `F llm_worker_impl.cpp:286 Check failed: kv_transfers.wait() KV cache push failed` |
+| 19:53 | 定位：98 构建树里的 `forward_shared_memory_manager.cpp` 是 **14:08 的旧版**（`grep -c local_positions` = 0），其余 10 个文件 md5 与本机一致 |
+| 19:54 | 修好同步脚本（(25)）→ 15 个文件全部 `ok`；重编复测中 |
+
+### (23) 坑：`rrun` 不转发环境变量，`STAGE_WHAT=wheel` 被静默忽略
+
+`STAGE_WHAT=wheel rrun -F … jd-node-98 bash -s < deploy_stage98.sh` 里，那个变量只存在于**本机**
+`rrun` 进程的环境里，远端一个都收不到 —— `deploy_stage98.sh` 于是拿默认值 `all`，先去 stage
+`libasio.so`（83 上那个文件是 root 所有、15:36 留下的，于是三次 `scp: Permission denied`），
+再 stage wheel。表现是「日志看着像失败，其实 wheel 成功了」。
+
+正确写法（无引号嵌套，一次成功）：
+
+```bash
+rrun -F ~/work/.ssh-xllm-config jd-node-98 env STAGE_WHAT=wheel bash -s < deploy_stage98.sh
+```
+
+### (24) 坑：重编日志在**容器里**，不在 98 host 上
+
+`rebuild_peerdecl2.sh` 是「host 上跑、`docker exec -d` 在容器里编」，所以 `LOG=/tmp/rebuild_peerdecl.log`
+写的是**容器**的 /tmp。我在 98 host 上写的等待脚本去 grep host 的 `/tmp/rebuild_peerdecl.log`，
+永远看不到 `REBUILD DONE`，白等 30 分钟（`tail` 报 `No such file` 才反应过来；更早一次 `stat`
+的输出还和 `date` 的输出混在一起看错了，误以为文件存在）。
+
+修法：把日志写到 **bind-mount 里的路径**（`/export/home/shifengmin.3/workspace/rebuild_peerdecl.log`），
+容器内写、host 直接读；host 侧等待脚本 grep 同一个路径。
+
+### (25) 本轮真正的坑：`sync98.sh` 用 argv 传 base64，撞上 `MAX_ARG_STRLEN`
+
+原来的同步脚本对每个文件生成：
+
+```bash
+python3 - "$TREE/<rel>" <167 KB 的 base64> <<'PYEOF'
+import base64,sys
+open(sys.argv[1],'wb').write(base64.b64decode(sys.argv[2]))
+PYEOF
+```
+
+Linux 单个 argv 的上限是 **128 KiB**（`MAX_ARG_STRLEN`）。于是：
+
+* `types.h`（13 KB → base64 18 KB）、`batch_input_builder.cpp`（66 KB → 90 KB）等 **10 个文件都写成功**；
+* `forward_shared_memory_manager.cpp`（**125,503 B** → base64 **167 KB**）**失败**：
+  `bash: python3: Argument list too long`；
+* 脚本头是 `set -u`（**没有 `-e`**），所以这一行失败**不中断**，后面 4 个文件继续写成功，
+  最后还打印了一堆 `git status`；我从「同步脚本跑完了」这个现象判断「同步成功」。
+
+后果非常隐蔽：**构建树里 11 个改动文件有 10 个是新的、1 个是 14:08 的旧的，编译完全通过**，
+wheel 正常产出、正常安装、正常启动，只在运行期炸 —— 而且炸出来的现象看起来像「位置逻辑写错了」。
+如果本轮没有那条「positions 缺失就报错」的硬检查，它会**静默地把位置全丢**，然后按 D 侧行号
+乱搬字节（因为 `local_positions` 空 ⇒ 传不进 canonical，旧行为是猜一个基址）。
+
+### (26) 硬检查的价值：它把「静默错搬」变成了「当场报错」
+
+失败信息精确到「哪个 group、给了几个 id、给了几个 position」：
+
+```
+Cannot convert the request's cache ids into canonical blocks, request_id=chatcmpl-…:
+cache group 0 supplies 14 block ids but 0 positions; a block-scoped group has to say
+where each id sits in the sequence, because its id does not
+```
+
+14 正好是 3492 token / 128 token-per-block / 2（本 rank 的 slice）= 14 个块。**这正是
+第 29 轮 (20) 想要的性质**：生产者漏带位置时，宁可当场失败，也不要静默平移。
+
+### (27) 修法与防范（已落地）
+
+1. `gen_sync98.py` 改成 **`base64 -d > file <<'B64EOF_…'` 的 heredoc**，payload 走 stdin，
+   彻底绕开 argv 限制（`mk_stage83.sh` 一直就是这么做的，同步脚本当初没跟上）。
+2. 脚本头改成 **`set -eu`**，任何一步失败立即非零退出。
+3. 每个文件写完**立刻 `md5sum` 与本机 md5 比对**，不匹配就打印 `MISMATCH <rel> want=… got=…`
+   并最终 `SYNC INCOMPLETE` + `exit 1`。本轮修复后 15 个文件全部 `ok`。
+4. 等待/巡检一律读 **bind-mount 路径**上的日志（(24)）。
+
+> 一般化：**「远端脚本返回了」不等于「远端步骤都做了」。** 凡是 base64/大 payload/多步骤的
+> 搬运，必须逐项回读校验（md5/行数/关键字），并把 `set -e` 打开。
+
+### (28) 修好同步后的端到端复测：**字节级 PASS**，并且第一次拿到「id ≠ 位置」的运行期铁证
+
+重编（wheel md5 `3dfac6685b3d5e5d7557f8683f0b3f12`，576,369,247 B；装完 ELF
+`e8c14a5ef73f72d1f700458bf3990be8`）→ 干净重启 → 单请求 3492 token：
+
+```
+http_code=200  prompt_tokens=3492  completion_tokens=4  time=2.81s
+VERDICT: PASS
+key    split       total=112 written=112 zero=0 match=112 mismatch=0 absent_in=0
+value  split       total=112 written=112 zero=0 match=112 mismatch=0 absent_in=0
+index  replicated  total= 84 written= 39 zero=45 match=84  mismatch=0 absent_in=0
+```
+
+与第 29 轮 (18) 的 PASS 数字**逐项一致** —— 位置显式化对「首个请求」没有行为改变（回归面干净）。
+
+**prefix cache 场景**：同一对 P/D 上发 A、B、B（P 侧 `--enable_prefix_cache=true`）：
+
+| 请求 | cached_tokens | 输出 |
+|---|---|---|
+| 1 (A) | 3328 | `enujoulette outnumber` |
+| 2 (B) | 3584（命中） | `enujoulette outnumber` |
+| 3 (B) | 3584（命中） | `enujoulette outnumber` |
+
+`B1 == B2` 为 True，`VERDICT: PASS`。而带 trace 的同款三轮跑，把 **prefill 自己的 block table**
+打印出来后，铁证到手（4 个 prefill rank 完全一致）：
+
+```
+call=4（请求 A，14 个局部块）blocks=[1, 2, 3, …, 13, 28]
+call=5（请求 B，15 个局部块）blocks=[14, 15, 16, …, 28]
+call=6（请求 B，前缀命中）    blocks=[14, 15, 16, …, 28]
+```
+
+* A 的**第 14 个块 id = 28**（不是 14）—— 池子把之前释放的 28 号行复用给了它，
+  `(id-1)*S` 会得到 54，而它真实位置是 13 → canonical 26。
+* B 的**第 1 个块 id = 14**（不是 1）—— 前缀命中/分配顺序让它从 14 号行开始，
+  `(id-1)*S` 会得到 26，而真实位置是 0 → canonical 0，**整段平移 13 个位置**。
+
+也就是说：老的 `(id - 1)` 规则在这两个请求上**都会静默错位**（A 错在尾块、B 错在整段），
+而位置驱动的实现在同一批请求上给出的解码文本与冷启动**逐字节相同**。这是第 29 轮 (20) 那个
+「方向对但写法不对」的评审意见所需要的运行期证据 —— 顺带也说明 `index * split` 更错：
+B 这一步的列表从位置 0 开始（`next_transfer_idx=0`）时它恰好对，而 A 这种「尾块在 28 号行」的
+情形它同样无能为力（列表里第 13 项的位置是 13，不是 28）。
+
+### (29) 复测同时验证的两件事
+
+1. **共享内存这一环确实是位置丢失的唯一出口**：`forward_shared_memory_manager.cpp` 同步过去之后，
+   同一批请求从「0 positions 硬报错」直接变成「字节级 PASS」，没有改任何别的文件。
+   （P 侧 `--enable_schedule_overlap=false` 也照样走这个序列化器 —— 不要以为关掉 overlap 就没有这一层。）
+2. **`grep -c 'the reserved padding block'` 不再是有效的「这版装上了」凭据**（这一版该串为 0）。
+   有效的凭据是每轮新增的错误串，例如本轮：
+   `positions; a block-scoped group has to say where each id`（×1）、`reports position`（×1），
+   加上 `md5sum $SP/xllm/xllm` 的变化（`141cbe43…` → `e8c14a5e…`）。
+
+## 第 31 轮（2026-09-18 20:10–）：再加两个异构场景（P kv4→D kv2、P kv2→D kv4），卡在**连接期的旧分片门禁**
+
+### (30) 请求与配置
+
+在原来那对 P/D 之外再加两个场景，方向相反：
+
+| 场景 | Prefill | Decode | 设备 |
+|---|---|---|---|
+| `base` | 4 ranks cp2/tp2/kv_split2 | 2 ranks cp1/tp2/kv_split1 | 0-3 / 4-5 |
+| `p4d2` | 4 ranks cp4/tp1/kv_split4 | 2 ranks cp1/tp2/kv_split2 | 0-3 / 4-5 |
+| `p2d4` | 4 ranks cp2/tp2/kv_split2 | 4 ranks cp1/tp4/kv_split4 | 0-3 / 4-7 |
+
+`env.sh` 里加了 `PD_SCENARIO` 开关（`base|p4d2|p2d4`），`run_trace_p4d2.sh` /
+`run_trace_p2d4.sh` 先 `clean_restart.sh reset` 再跑 `run_trace.sh`。
+
+**一个硬约束，先踩到**：本 build 里 **decode 不能用 CP** ——
+
+```
+F master.cpp:489] Check failed: !cp_error.has_value()
+                   Model-side CP supports only DEFAULT or PREFILL roles
+```
+
+（`xllm/core/distributed_runtime/master.cpp:206`，`cp_size > 1` 只允许 DEFAULT/PREFILL。）
+所以最初写的「D 4 ranks cp2/tp2/kv2」连启动都过不去，四个 D rank 一起 FATAL。**decode 侧的
+kv_split 只能靠 TP 承担**（cp1/tp<kv_split>），上表已经是修正后的配置。
+
+### (31) 两个新几何在**主机端逐字节**都能过（新增 2 个集成用例）
+
+`pd_route_integration_test` 里加了两条与运行期同几何的用例（cp4×tp1 → cp1×tp2、cp2×tp2 → cp1×tp4），
+第一次跑 **失败**，但失败信息是**夹具自相矛盾**，不是路由错：
+
+```
+layer 0, role 4, group 1: a whole-resource descriptor holds no head axis and 8 local heads;
+publish one span per local head instead
+```
+
+MLA 下 linear-state 家族是「一个打包 head 的 whole resource」，而夹具把它的 `global_heads` 写成
+`kSsmHeads = 8`：tp8 时 `local_heads = 8/8 = 1` 侥幸成立，tp1 时就变成 8 个 local head 与
+whole-resource 描述符冲突（`cache_directory.cpp:118` 的检查）。**修夹具**：MLA 下
+`linear_key/value_head_count = 1`、`conv/ssm.global_heads = 1`（与 KV 家族
+`enable_mla ? 1 : kv_head_count` 的处理保持一致）。改完：
+
+```
+kv_shard_contract 6 · kv_redundancy 12 · pd_route 12 · pd_route_transfer 14
+pd_route_integration 6 · cache_directory 23 · reshard_planner 43   → 共 116 全绿，NINJA_EXIT=0
+```
+
+其中 `pd_route_integration` 6 条包含新的 `RuntimePrefillFourDecodeTwoSlicesReshard` 与
+`RuntimePrefillTwoDecodeFourSlicesReshard`（主机端逐字节校验，含 head class 折叠）。
+
+### (32) **运行期卡点**：decode 侧 `link_sessions` 里的旧分片门禁把这两个几何直接拒了
+
+`p4d2` 起来后 P/D 引擎都到了 `Brpc Server started`，但 **HTTP 58888 一直不监听**，
+master 日志：
+
+```
+I instance_mgr.cpp:1386] Register a new decode instance, instance name : 11.87.191.83:29994
+E instance_mgr.cpp:1337] Fail to link instance during registration, op index 0
+E instance_mgr.cpp:580]  Fail to register instance: 11.87.191.83:28994
+W instance_mgr.cpp:456]  Ignore heartbeat from unknown instance: 11.87.191.83:28994
+```
+
+`Fail to link` = master 让 **D** 去 link **P**（`call_link_instance` → `DisaggPDService::LinkInstance`），
+D 侧拒绝，拒绝原因在 D 的引擎日志里：
+
+```
+E mooncake_transfer_engine.cpp:798] Remote cache layouts cannot cover local destination:
+   source CP/KV-split partitions can only collapse into a CP1 destination with
+   either KV-split1 or the matching KV-split size
+E disagg_pd_scheduler.cpp:1355] Link instance failed, instance_name: 11.87.191.83:28994
+```
+
+代码路径（本机源码可读）：
+
+* `MooncakeTransferEngine::link_sessions()` → `ReshardPlanner::select_sources(remote_manifests, *local_manifest, ...)`
+* `reshard_planner.cpp::supports_partition_layout()`：
+
+  ```cpp
+  if (same_partition_sizes(source, destination)) return true;
+  return destination.cp_size == 1 && destination.cp_rank == 0 &&
+         (destination.kv_split_size == 1 ||
+          (supports_kv_split_topology(source) &&
+           source.kv_split_size == destination.kv_split_size));
+  ```
+
+  即**目标必须 cp1，且 kv_split ∈ {1, 源的 kv_split}**。于是：
+
+  * `p4d2`：D cp1 ✓、D kv2 ∉ {1,4} → **拒**
+  * `p2d4`：D cp1 ✓、D kv4 ∉ {1,2} → **拒**
+  * `base`：D cp1 ✓、D kv1 ✓ → 过（所以之前一直能跑）
+
+这是**旧分片模型的假设**（「源的分片只能塌缩成 cp1 且分片数不变」）。canonical 路由本身就是
+为了替代这个假设：`RouteBinder` 按 canonical block 自己算 writer，不需要 `select_sources` 的
+rank 对齐推导；但**连接期这道门禁在 canonical 模式下也会跑**，所以这两个几何在搬到任何字节之前
+就被挡住 —— 主机端路由（(31)）能过、运行期进不去。
+
+**结论**：要跑通 `p4d2`/`p2d4`，需要让 canonical 模式下的连接期选择不再套用旧分片门禁
+（`select_sources` 的产物只用来决定哪些远端 rank 开 ACTIVE session / 走 PLAN_ONLY；canonical 的
+writer 由 `RouteBinder` 决定）。这是链路校验语义的改动，需单独评审，不在本轮位置修复的范围内。
