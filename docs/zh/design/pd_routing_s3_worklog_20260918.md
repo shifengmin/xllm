@@ -15,8 +15,8 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 12~13 轮**：canonical 已是可选生产数据面（默认 legacy），PUSH 全链路接线；71 用例全绿 + 三个生产 TU rc=0。**PULL 只差把 `src_dp_rank` 带到 pull 侧**（其余输入第 13 轮已留存，无未知项）；**运行时未验证**（§1.3） |
-| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **PUSH 已接线、待运行时验证**（第 12~13 轮；71 用例全绿 + 三个生产 TU rc=0）。**PULL 按用户要求停放**在本地分支 `pd-routing-pull-wip`（`8526462c5`，未推送）——实现已起草且编译通过，但未跑 host 全量、未验证。详见第 14 轮 |
+| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ✅ **已落地并接进数据面**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle 用 `KVShardLayout`/`ContextParallelTopology` 钉死；第 12 轮接进 PUSH） |
 
 ## 1. 硬约束（每轮先读，别再试错）
 
@@ -855,3 +855,63 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 **仍未验证（原因）**：真实运行时（§1.3，GLM5.3flash 不支持 PD 分离）；
 `src_dp_rank` 的取值语义（读码是 `LLMEngine::pull_kv_blocks` 的入参，来自 `disagg_pd_scheduler.cpp:1210` 的
 `src_dp_rank`，其与 `dst_dp_rank` 的配对规则未在运行时验证）。
+
+### 2026-09-18（第 14 轮）——按用户要求**暂停 PULL**；PUSH 状态盘点与"打通"的准确含义
+
+用户指示：**PULL 先不做**，先确认 PUSH 是否已打通。本轮不加新功能，只做状态盘点 + 把已起草的 PULL 代码**停放**。
+
+**(1) PULL 代码已起草但按指示停放**
+
+第 13 轮判定"PULL 只差 `src_dp_rank`"；本轮进一步发现**连这个都不需要**：
+`pull_kv_blocks_async` 拿到的那个 `src_addr` 本身就是"源 DP 组的一个 rank"，
+而该 rank 的 manifest `coordinates` 里有 `dp_rank`/`cp_rank`/`tp_rank`/`cp_size`/`tp_size`
+（第 13 轮已把所有源 manifest 留在 `peer_layouts_`）⇒ 可以直接把 `src_addr` 所属的整个源 DP 组
+按 `local_rank = cp_rank*tp_size + tp_rank` 重新拼出来，不需要改 RPC/签名。
+
+于是本轮写出了一版完整实现（`pull_kv_blocks_canonical`：按 `src_addr` 定位源 DP 组 →
+`build_route_peer` → `canonical_blocks_of_request` → `PdRouteTransfer::transfer(PULL, ...)`
++ `move_memory_regions(READ)`；另把 `local_rank_`/`local_rank_count_` 在 `configure_cache_layout` 存下来、
+把 `PdRouteCache` 提为成员供两个方向共用（F8））。
+
+**按用户指示停放**：这些改动**不在** `pd-routing-s0s1` 上，而是单独放在**本地分支 `pd-routing-pull-wip`**
+（commit `8526462c5`，**未推送**）。这样做的好处：① 评审分支 `pd-routing-s0s1` 保持在第 13 轮那个
+"PUSH 已验证"的干净状态；② 起草的代码不丢，随时 `git cherry-pick 8526462c5` 或 `git diff a1c4186b6..pd-routing-pull-wip` 取回。
+该分支只做过**编译验证**（三个生产 TU rc=0），**未跑 host 全量**、**未做运行时验证**。
+
+**(2) "PUSH 已打通"的准确含义（不要过度解读）**
+
+已经做到的：
+
+| 层 | 状态 |
+|---|---|
+| 开关 | `--pd_route=legacy\|canonical`（默认 legacy）；工厂解析、非法值 `LOG(FATAL)`；**无静默回落** |
+| 生产调用点 | `push_kv_blocks_async` 分流到 `push_kv_blocks_canonical`，**完全跳过** `filter_kv_split_infos`/`rotate_dst_rank`/`merge_kv_blocks` |
+| 全链路 | 请求 id → 规范块（`canonical_blocks_of_request`）→ 对端每个局部 rank 的 manifest（`peer_cache_layout`）→ `build_route_peer` → `plan(PUSH)` → 按 layer 折叠（`flatten_route_for_layers`）→ 逐层 `synchronize_layer` + `move_memory_regions(WRITE)` |
+| 数据可得性（读码） | ① P 侧有 D 的 manifest：`link_sessions` 会把本侧 manifest 通过 `SetCachePeer` 发给源；② D 的地址表来自 `TransferKVInfo.remote_instance_info.addrs`（下标 = 实例全局 rank）；③ 本侧声明/视图在 `publish_cache_layout` 时建好 |
+| 编译 | 三个生产 TU（`mooncake_transfer_engine.cpp`/`mooncake_kv_cache_transfer.cpp`/`kv_cache_transfer.cpp`）真实 flags 编译 rc=0（用第 12 轮修好的"先解包再编译"流程） |
+| host 单测 | **71 用例全绿**；其中 `pd_route_transfer_test`（14）覆盖 PUSH/PULL 双向逐字节、腿枚举、层化折叠；`cache_directory_test`（23）覆盖声明映射与对端装配；`kv_shard_contract_test`（6）用运行时本体钉 `slice == dcp_rank` 与 `CanonicalBlock ↔ KVShardLayout`；`pd_route_integration_test`（4）真实张量→统一入口→memcpy 逐字节 |
+
+**没有做到的（关键，别当成"已验证可用"）**：
+
+1. **运行时零验证**：GLM5.3flash 尚不支持 PD 分离（§1.3），没有实机可跑；RDMA/NPU/真实调度 block id 全部未跑过。
+2. `push_kv_blocks_canonical` **本身没有单测**（它直接依赖 Mooncake 引擎与 NPU layer synchronizer）；
+   它调用的每个纯函数都有单测，但"串起来是否对"只有编译验证。
+3. 两处**读码得到的假设**未在运行时确认：
+   ① `InstanceInfo.addrs` 的下标就是"实例全局 rank = `dp*(cp*tp) + local`"（依据 `merge_kv_info` 的用法）；
+   ② 每个目的局部 rank 的 manifest 都能从 `peer_cache_layout` 取到（依据 `link_sessions` 的 `SetCachePeer` 方向）。
+4. XTensor（`explicit_resource_offsets`）与角色几何未钉住的族（WINDOW/SWA/KV_STATE…，即 DSV4 实例）
+   在 canonical 下**显式拒绝**（`canonical_ready_ = false` + 警告），只能走 legacy。
+5. canonical 与非 canonical 的**等价性**只在 host 上验证过（`S_P = S_D` 锚点 + 折叠/发散场景），
+   没有在真实 PD 上对照过字节。
+
+**结论**：PUSH 方向**代码链路完整、可编译、可单测的部分全绿**，但**不能称为"已验证打通"** ——
+准确说法是"**已接线、待运行时验证**"。要真正验收 PUSH，最小路径是：先把 canonical 在**单机 co-located
+的 P/D（或 mock 引擎 + 真实 tensor）**下跑一次字节比对，再上真实 PD；S3-4 的"运行时可验证"门槛仍受 §1.3 限制。
+
+**(3) 剩余清单（下一轮的入口）**
+
+- 取回 `pd-routing-pull-wip`（`8526462c5`）→ 跑 host 全量 → 补 `src_addr` 定位的 host 单测 → 再决定是否并入主线；
+- 若继续 PUSH 方向：想清楚"用 mock 引擎给 `push_kv_blocks_canonical` 做单测"是否可行
+  （它是 `MooncakeKVCacheTransferDefault` 的成员，`MooncakeTransferEngine` 的方法是 virtual，理论上可派生 mock）；
+- 未覆盖的 T5 项：`MixedLayers`、`DpExpansion`、XTensor `explicit_offsets` 端到端；
+- `ContextParallelTopology` 的 DCP **组组成**判据（第 9 轮主动放弃）仍未钉死，与路由契约无关。
