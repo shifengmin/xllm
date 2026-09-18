@@ -1803,3 +1803,113 @@ BRPC_REVISION 都变，brpc 就整包重编**。
 推论：`align_remote_tree.sh` 必须在**打包完全结束之后**再跑，
 否则对齐动作会连带触发一次 ~13 分钟的 brpc 重编（外加 ops 门的风险）。
 本次因为一直等到 `WHEEL_EXIT=0` 才动，所以没有付出这个代价。
+
+---
+
+## 第 25 轮：**在真机上跑出第一个真 bug**（canonical 静默退化），以及四个环境坑（2026-09-18 16:0x）
+
+### (1) 头条：canonical 路由在真机上**静默退化成 legacy**
+
+第一次把 P/D 拉起来（用了旧 wheel），6 个 rank 全部打出：
+
+```
+W mooncake_kv_cache_transfer.cpp:513] The canonical route cannot interpret this
+  rank's own published layout: cache tensor declarations are duplicated for
+  role 0 group 0; use pd_route=legacy.
+```
+
+**这正是第 22 轮预判的那条静默退化路径**（`LOG(WARNING)`，不 fatal，实例照常启动），
+`diagnose.sh` 的签名也命中了。根因在**我自己的注册代码**：
+
+`mooncake_kv_cache_transfer.cpp` 的 `register_kv_cache_impl` 里，遍历的是
+**每个 layer 的每个 tensor**（本模型 11 个 buffer），对每个都 emplace 一个
+`CacheTensorDeclaration`。但 `PeerDirectory::describe`（`cache_directory.cpp:612`）要求
+**每个 `(cache_namespace, role, group_id)` 只能有一个 declaration**，并且
+`declaration_matches`（`:56`）**故意忽略 layer_id** —— 也就是"一个 declaration 覆盖该族的全部 layer"。
+所以 4 层 ⇒ role 0 被声明 4 次 ⇒ 直接判重复。
+
+**修法**：声明前先按 `(namespace, role, group_id)` 去重（`row_bases_` 才是按 layer 的那一份，
+本路径留空，`describe_tensor` 在 `row_bases == nullptr` 时有专门分支，安全）。
+改的是**远端树的工作区**（不 commit，这样 HEAD 不动、ops 门保持满足），
+增量构建只走了 **3 个 ninja 边**（`BUILD_EXIT=0 16:01:22`），**brpc 没有重编**。
+
+### (2) 意外收获：真机日志**独立验证**了第 20 轮的行索引裁定
+
+prefill（S=2）的 kv cache 初始化日志：
+
+```
+kv cache capacity: 44.38 GB, blocks: 60593, slot_size: 1152, index_slot_size: 512, indexer_layers: 3
+Initializing k cache with shape:      [60593  128 1 512]
+Initializing v cache with shape:      [60593  128 1  64]
+Initializing indexer cache with shape:[121186 128 1 128]
+```
+
+**`121186 = 2 × 60593`** —— index cache 的行数是 **canonical 块数**，而 k/v 的行数是
+**逻辑块数**（`60593`）。这和第 20 轮纯从契约推出来的裁定**完全一致**：
+
+| slot | 行号语义 | 行数 |
+|---|---|---|
+| `key` / `value` | 逻辑块 | 60593 |
+| `index` | **canonical 块** | **121186 = 2 × 60593** |
+
+`indexer_layers: 3` 也印证了 `indexer_types=['full','full','full','shared']` 里
+`shared` 层**不分配** indexer cache（11 buffer = 4×k + 4×v + 3×index）。
+decode 侧（S=1）是 `blocks: 69253, index_slot_size: 256`，进一步说明两边空间不同、必须以 canonical 为桥梁。
+
+### (3) 坑一：4 个同机 rank 共用 `HCCL_IF_BASE_PORT` ⇒ EI0019
+
+```
+RuntimeError: createHCCLCommOrigin ... hcclGetRootInfo(&hcclID), error code is 7
+Communication_Error_Bind_IP_Port(EI0019): The IP address 11.87.191.83 and port 48439
+  have already been bound.
+```
+
+我原来给 P 的 4 个 rank 都设了 `HCCL_IF_BASE_PORT=48439`（两个角色分开、但**同角色内没分**）。
+单机多 rank 必须**每 rank 一个 base**。改成 `HCCL_IF_BASE_PORT=$((BASE + rank * 200))`，
+并且把 base 挪到 **ephemeral 范围(32768-60999)之外**（先扫出容器内 61000-64263 空闲）：
+P = 62000/62200/62400/62600，D = 63000/63200。改完 **EI0019 归零**。
+另加了启动前的端口自检（`start_workers.sh`），占用就直接报错退出，不再等到几分钟后炸在集合通信里。
+
+### (4) 坑二：我的"就绪"判据是错的
+
+`run_all.sh`/`wait_ready.sh` 原来要求**每个** rank 的日志里都有 `Brpc Server started`。
+但只有每个角色的 **master（node_rank 0）** 才起 HTTP/brpc 服务，worker rank 永远不会有这行
+⇒ 判据永远不可能满足。已改成只看 `rank_0.log`，并且 `http_58888` 端口作为附加条件。
+
+### (5) 坑三：同机多进程并排进 CANN 算子编译 ⇒ 知识库锁死锁
+
+6 个 rank 全部拉起来后，卡在：decode rank_0 起来了（brpc OK），其余 5 个 **CPU 0%、futex 等待**。
+gdb 抓到 prefill rank 0 的栈：
+
+```
+#3  acquire_timed (lock=..., timeout=1000000000)      ← timeout=1000 秒 的 Lock.acquire
+#51 CannKb::PyInterface::CannKbInit(...)              libcann_kb.so
+#53 PythonAdapterManager::InitCannKB()               libop_compile_adapter.so
+#55 TbeInitialize()                                   libop_compile_adapter.so
+#57 fe::TbeOpStoreAdapter::InitializeInner(...)       libfe.so
+#59 fe::OpStoreAdapterManager::InitializeAdapter(...)
+```
+
+即 **CANN 的 TBE 算子编译"知识库"(cann_kb) 初始化**里拿一把 1000 秒超时的锁，6 个同机进程
+同时进入 ⇒ 互相等。注意第一次运行**曾经**越过这一点（那次是死在后面的 HCCL 端口），
+所以这是**竞态**而不是硬阻塞。
+
+对策：`start_workers.sh` 里加 `START_GAP`（默认 15s）**把各 rank 的启动错开**
+（`[ "$rank" -lt $((N-1)) ] && sleep "$START_GAP"`）。另写了 `clean_restart.sh`：
+杀干净所有 worker + 控制面、**清掉 `/tmp/etcd_pdroute83` 的 etcd 状态**再重启
+（残留的实例注册会让下一次启动表现得像代码 bug）。
+
+### (6) 坑四：三个"自己坑自己"的脚本错误（都已修）
+
+| 现象 | 真因 |
+|---|---|
+| `launch_fix_build.sh` 执行到一半整段消失 | `pkill -f "fix_build_inner.sh"` **匹配到了自己**（脚本正文里就有这个字符串）⇒ 自杀。同理 `pgrep -f "setup.py build"` 也会自匹配（`bash -c` 的正文就是命令行）。改用 `ps -eo comm,args \| awk '$2 ~ /^python/'` 按**可执行名**过滤 |
+| `bash: line 8: $2: unbound variable` | 在外层 `bash -c '...'` 里嵌了带**单引号**的 awk 程序 ⇒ 单引号提前闭合，`$2` 被外层 shell 展开。**改成把内层脚本写成文件用 `bash -s` 送进去**（正是本仓库规范说的那条） |
+| `check_fix_build2.sh` 完全没有输出 | `sudo docker exec "$C" bash -s <<'INNER'` **少了 `-i`** ⇒ docker 不转发 stdin ⇒ 内层 bash 拿到空脚本。加 `-i` |
+| `why_stuck.sh`/`in_ctr.sh` 报 `cannot find env.sh (HERE=/export/home/...)` | 入口脚本经 `bash -s` 送进去时 `$0` 是 `bash`，`dirname` 得到的是当前目录。**这个报错是我的守卫脚本主动报的**（第 25 轮新增），比原来的 `unbound variable` 清楚得多；解法是 `docker exec -i -w <脚本目录>`，子脚本再用 `bash "$HERE/xxx.sh"` 调用（子脚本的 `$0` 就正确了） |
+
+### (7) 状态与下一步
+
+* `BUILD_EXIT=0 16:01:22`；`bdist_wheel` 正在写（wheel 从 15MB 长到 197MB，目标 ~576MB）。
+* 之后：`deploy_stage98.sh wheel`（**一次只传一个文件**）→ `install83.sh`（保持规范 wheel 文件名）
+  → `clean_restart.sh`（全清 + 错开启动）→ 通了再 `run_trace.sh` + `smoke_long.sh` → `compare_kv.py`。
