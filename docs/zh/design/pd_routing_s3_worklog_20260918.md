@@ -1076,3 +1076,69 @@ tp-invariant kv cache` 两个提交。⇒ **"验证 P/D DCP 异构 + indexer ful
   （`xllm_coding/xllm`，仅 root 可见）或 `xllm-coding/xllm`，用它们的 runtime + 我的 routing。
 - 4 层模型 `layer3` 是 MoE（`n_routed_experts=256`，`first_k_dense_replace=3`）⇒ 小 tp（2）时要注意 `--ep_size` 是否需要显式给。
 - 83 是共享机（别人有容器在跑，但卡是空的）：我只用 chip 0–5，绝不 kill 别人的进程。
+
+### 2026-09-18（第 17 轮）——构建路径的坑与**暂停点（用户要求先压缩上下文）**
+
+用户指令：**"启动标准构建前，先等我压缩上下文"**。本轮把构建折腾清楚后**主动停掉**在跑的构建，
+状态全部落在下面（压缩后按 §(5) 直接续接）。
+
+**(1) 上一轮的"编译成功"是假成功（重要，别再被骗）**
+
+`ninja -C .../xllm-pdroute/build/cmake.linux-aarch64-cpython-311 xllm` 报 `NINJA_EXIT=0`，
+但那份 build dir 是从 `xllm-dcp-fp32` **整份拷来的**，`CMakeCache.txt` 里
+`CMAKE_HOME_DIRECTORY=/export/home/shifengmin.3/workspace/xllm-dcp-fp32`（`CMAKE_CACHEFILE_DIR` 同样），
+ninja 文件里所有源码路径都写死指向 `xllm-dcp-fp32`。⇒ **那次编译编的是 dcp-fp32 那棵树**，
+产出的 ELF（`xllm-dcp-fp32/build/lib.linux-aarch64-cpython-311/xllm/xllm`，14:03，559MB）**不含我的改动**。
+（注：探针 `run_probe3.sh` 用的是 `-v $HOSTWORK:/export/home/.../xllm-dcp-fp32` 的**挂载覆盖**，
+所以探针确实编到了我 staged 的文件 —— 探针结论仍然有效。）
+
+**(2) 两棵树的 git 关系（踩过的坑）**
+
+`xllm-pdroute` 与 `xllm-dcp-fp32` **共用同一份 git worktree 元数据**
+（`.git` 指向 `xllm-coding/xllm/.git/worktrees/xllm-dcp-fp32`）。
+所以在 `xllm-pdroute` 里做的 `git checkout -f pd-routing-s0s1` **也改了共享的 HEAD/index**，
+导致 dcp-fp32 的文件仍停在 72e0ea817 而 HEAD 变成我的分支（172 个 dirty）。
+**已修正**：在真实树 `xllm-dcp-fp32` 里也执行了 `git checkout -f pd-routing-s0s1` ⇒ 现在两棵树都在
+我的分支 `d68d7eda2`、工作区干净、`push_route.*` 不在磁盘上。
+
+**(3) 已查清的三处构建机关（后续直接用）**
+
+| 机关 | 事实 | 正确做法 |
+|---|---|---|
+| `xllm_ops` 预编译 | `third_party/xllm_ops` 在这棵树里**不是真子模块**（只有一个内嵌目录，**没有 `build.sh`**）。CMakeLists.txt:81 在 `ENV{XLLM_OPS_GIT_HEAD_CACHED}` 与 `git -C third_party/xllm_ops rev-parse HEAD` 不等时会跑 `build.sh` → `error code 127` 直接失败 | 导出 **`XLLM_OPS_GIT_HEAD_CACHED=$(git -C third_party/xllm_ops rev-parse HEAD)`**（这里会解析成超项目的 HEAD，即 `d68d7eda2…`）→ 日志出现 `xllm_ops git HEAD unchanged; skipping precompile` ✅ 已验证有效 |
+| `setup.py` 的子模块门禁 | `scripts/build_support/utils.py:504 _validate_submodules_or_exit`：`git submodule status --recursive` 每行首字符 `-`（未在 `.git/config` 注册）即 `exit(1)`。`git submodule init` **不解决**（这些目录没有自己的 `.git`） | 已在该函数开头插入 **`PDROUTE_BUILD_ONLY_BYPASS` 早返回**（**仅本地树、未提交、后续要还原**）。真正合入前必须还原 |
+| torch/torch_npu 路径 | 只用 ninja 触发 reconfigure 时，`find_package(Torch)` 会算空（`-I/include`）且 `$ENV{PYTORCH_NPU_INSTALL_PATH}` 若为 `/usr/local/libtorch_npu` 在该容器**不存在** ⇒ 133 条 `fatal error: torch/torch.h: No such file or directory` | 正确环境：`PYTHON_EXECUTABLE=/usr/local/python3.11.15/bin/python3`、`PYTORCH_NPU_INSTALL_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu`（`.../torch_npu/include/torch_npu/csrc/...` 与 `.../torch_npu/lib/libtorch_npu.so` 都在）。**用户指示改用标准构建 `python setup.py build --device npu`**（它会自己 setup 这些） |
+
+`CMakeCache.txt` 已被污染 ⇒ 我把它改名成 `CMakeCache.txt.broken` 并删掉 `CMakeFiles/`，
+下一次 configure 会从干净状态开始（对象文件保留，成功过的目标不会重编）。
+
+**(4) 本轮结束时状态**
+
+- 标准构建**已启动过又被按要求停掉**（停在 `dependencies.sh` 装 Mooncake 依赖阶段：
+  `yalantinglibs`、Go 工具链、dnf 元数据；日志 `/tmp/std_build.log` 尾部是 dnf 下载）。
+  进程树已终止（复查只剩我自己那次 `pgrep` 的 shell）。
+- 83 容器 `fengmin-pdroute-83`：镜像 `xllm-dev-a3-arm-cann9-20260801`，`--network=host`，
+  挂 `/export/home`、`/mnt/cfs/9n-das-admin/llm_models`、`/etc/hccn.conf`、Ascend driver/add-ons、`npu-smi`、
+  `/var/log/npu`、`/runtime`、`/var/queue_schedule`。已核实：hccn `address_0=11.83.191.11`、CFS 4 层模型可读、
+  16 chip 可见、torch/torch_npu 可导入。**还缺 `custom_xllm_math`（135MB 编译好的 xllm 自定义算子）** ——
+  `cop` 脚本已写好（`copy_vendor.sh`：从 `fengmin-cann9-0801` `docker cp` 出来再 `docker cp` 进我的容器），**尚未执行**。
+- 83 侧启动脚本：本地已写好 `pdroute83/env.sh`（模型/端口/topology/ATB+HCCL 环境）与
+  `pdroute83/start_control.sh`（etcd 5389 + `xllm_master_serving` 58888/58889，**独立端口**，避开别人占用 4389/48888 的实例）；
+  **还差 `pdroute83/start_workers.sh`（P/D 启动）与 `smoke.sh`**，写完 `scp` 到 83 的 `workspace/pdroute83/`。
+- 83 上别人的 `etcd(4389)` 与 `xllm_master_serving(48888)` **在跑，别动**；83 卡是空的，我只用 chip 0–5。
+
+**(5) 压缩上下文后的续接步骤（照做即可）**
+
+1. **跑标准构建**（在 98 的容器里）：
+   ```bash
+   rrun -F ~/work/.ssh-xllm-config jd-node-98 < ~/work/std_build.sh     # 会 docker cp + docker exec -d
+   # 日志：容器内 /tmp/std_build.log；标记 BUILD_EXIT= / WHEEL_EXIT=；wheel 落在
+   #   /export/home/shifengmin.3/workspace/xllm-dcp-fp32/dist/*.whl
+   ```
+   （`std_build.sh` 里已含：清 cache、正确 torch/torch_npu 环境、`XLLM_OPS_GIT_HEAD_CACHED`、
+   `SKIP_TEST=1 python setup.py build --device npu` 后接 `bdist_wheel`。）
+2. 构建成功后：`cp wheel` → 83 → `docker cp` 进 `fengmin-pdroute-83` → `pip install --force-reinstall --no-deps`；
+   并执行 `copy_vendor.sh` 补 `custom_xllm_math`。
+3. 写 `start_workers.sh` + `smoke.sh`，`scp` 到 83，起 control(D) → P，做 smoke。
+4. 字节级验证探针（设计见第 16 轮 §(4).6）。
+5. 所有结论回写本文件并 push。
