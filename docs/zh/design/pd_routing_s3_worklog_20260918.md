@@ -1615,3 +1615,68 @@ payload 已在容器里用 3.11 校验：两个文件 `ast.parse` 都 OK。
 * 两个 payload 已重新上传到 83，容器内 Python 3.11 `ast.parse` 通过
   （`_pd_trace.py` 8694B md5前缀 `c90ed6cc73f4`，`executor_hook_tail.py` 1578B `f4a8d3d1c58d`）。
 * 构建 `[988/1380]`、undefined=0、无 error。
+
+---
+
+## 第 22 轮：跑之前的三个致命细节（prompt 长度 / 路由是否真被采用 / 日志签名）（2026-09-18 15:2x）
+
+构建还在跑（实测 **25.75 边/分钟**，剩 253 边，ETA ~10min）。本轮全是"跑之前必须想清楚"的事。
+
+### (1) 致命细节一：短 prompt 让整个验证**等于没做**
+
+原计划用 `smoke.sh` 的 `你好，请用一句话介绍你自己。`（~15 token）。但一个物理块 = 128 token、
+一个**逻辑块 = 128 * S = 256 token**，所以 15 token 的请求**只落在一个 canonical 块上**，
+而且只落在 `dcp_rank = 0` 那**一个**分片上 —— 整个"异构 S_P=2 vs S_D=1 重分片"的验证就退化成
+"一个 slot 的一行字节相等"，`c // S` 这个映射根本没被走到。
+
+所以新增 `smoke_long.sh`：把一句话重复到 **~1200+ token**（≈5 个逻辑块），这样
+
+* canonical 块覆盖 `0..9`，**两个分片都被走到**（`c%2 = 0` 和 `1`）；
+* 逻辑块跨多个，`c // S` 的跨块映射（row 0,1,2,…）被真正检验；
+* chunked prefill 若把 prefill 切成多 chunk，比对器取**每个 rank 的最高 call**（= 最终状态），
+  正好覆盖全部分片。
+
+并且 `run_trace.sh` **只发这一个请求**：trace 记的是每个 rank **最后一次** dump 的 block table，
+发第二个请求会把比对需要的 block table 覆盖掉。
+
+### (2) 致命细节二：`canonical` 可能**静默退化**成 legacy，实例照样能起来
+
+读了 `mooncake_kv_cache_transfer.cpp` 的注册路径，发现 canonical 的可用性是**注册期**决定的
+（`canonical_ready_`），而且失败只打 **`LOG(WARNING)`**，不 fatal：
+
+| 位置 | 触发条件 | 日志 |
+|---|---|---|
+| `:474` | 任何 tensor 带 `explicit_resource_offsets` | `The canonical route does not build GlobalXTensor page bases yet; use pd_route=legacy.` |
+| `:498` | `declare_cache_group` 拒绝某个 role | `The canonical route cannot serve this instance: ...` |
+| `:515` | `PeerDirectory::describe` 看不懂自己的布局 | `The canonical route cannot interpret this rank's own published layout: ...` |
+
+退化之后实例**照常启动、照常接请求**，直到 push 时才报错：
+
+* `:805` `LOG(ERROR) pd_route=canonical cannot serve this instance: this rank's published cache layout was not declared or could not be interpreted.` → push 返回 false ⇒ **KV 一个字节都没传**。
+
+派发点在 `kv_cache_transfer.cpp:233`：`if (canonical_route_) { push_kv_blocks_canonical(...); }`，
+`canonical_route_` 只反映**命令行**（`:325` `set_canonical_route(route_mode == CANONICAL)`），
+和 `canonical_ready_`（布局）是**两件事** —— 所以"flag 写了 canonical"绝不等于"走的是 canonical"。
+
+**因此新增 `diagnose.sh`**：按"日志出现顺序"逐条 grep 上面所有签名 + `Create Mooncake KVCacheTransfer, pd_route=...`
+（`:303`，确认 flag 解析成什么）+ push 期错误 + `Brpc Server started` + FATAL/Check failed/Traceback，
+最后给一句"结论提示"。这样跑完第一件事就是看它，而不是瞎猜。
+
+### (3) 致命细节三：`plane=canonical ... success=` 是 VLOG(1)，默认看不见
+
+canonical push 的成功日志是 `VLOG(1) << "[Mooncake][PDTransfer] direction=push, plane=canonical, requests=..., success=..."`
+（legacy 那条是 `direction=push, destinations=...`）。默认 VLOG 关着，所以"没看到 canonical push 日志"
+**不能**推出"没走 canonical"。`env.sh` 加了 `PD_VLOG`（默认 0，设了才导出 `GLOG_v`），
+需要时用它把这条证据打开；不需要时靠字节比对反证（字节对上 ⇒ 路由确实跑了）。
+
+### (4) 其它确认
+
+* 构建产物路径确认：wheel 在 `$TREE/dist/*.whl`（`bdist_wheel` 才创建，现在还没有）；
+  ELF 由 `setup.py build` 最后产出；`libasio.so` 已在
+  `$TREE/build/cmake.linux-aarch64-cpython-311/mooncake-common/libasio.so`（1.8MB）。
+* 内层脚本尾部顺序确认：`BUILD_EXIT=...` → `setup.py bdist_wheel` → `WHEEL_EXIT=...` → `ls dist/*.whl`。
+* 注意 `XLLM_OPS_GIT_HEAD_CACHED` 是在**构建启动时**用 `git -C third_party/xllm_ops rev-parse HEAD`
+  钉住的（该目录不是真子模块 ⇒ 冒泡成 xllm 的 HEAD）。它在 cmake configure 时与当前 HEAD 比对，
+  所以**只要 HEAD 在 configure 之前不动**就不会触发 ops 预编译 —— 结论不变：构建期间别动 HEAD。
+* `rrun ... docker exec -i C bash -s < npu_init.sh 0,1,2,3,4,5` 这种写法**传不了参数**
+  （stdin 已经是脚本本身），用脚本里的默认 `DEVICES=0,1,2,3,4,5`。
