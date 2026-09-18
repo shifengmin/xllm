@@ -457,6 +457,66 @@ void MooncakeKVCacheTransferBase::publish_cache_layout(
   const Status status =
       mooncake_te_->set_local_cache_layout(local_cache_layout_);
   CHECK(status.ok()) << "Failed to publish cache layout: " << status.message();
+
+  // Declare the model-side geometry of every family this rank published and
+  // derive the view the canonical route addresses. Both are optional: the
+  // legacy path reads neither, so anything the model does not pin downgrades
+  // the canonical route instead of failing a legacy instance at startup.
+  declarations_.clear();
+  row_bases_.clear();
+  local_directory_.reset();
+  canonical_ready_ = true;
+  for (const CacheTensorManifest& tensor : local_cache_layout_.tensors) {
+    if (tensor.explicit_resource_offsets) {
+      LOG(WARNING) << "The canonical route does not build GlobalXTensor page "
+                      "bases yet; use pd_route=legacy.";
+      canonical_ready_ = false;
+      declarations_.clear();
+      break;
+    }
+    CacheTensorDeclaration declaration;
+    declaration.cache_namespace = tensor.cache_namespace;
+    declaration.role = tensor.role;
+    declaration.group_id = tensor.group_id;
+    declaration.topology.dp_size = registration_context.coordinates.dp_size;
+    declaration.topology.cp_size = registration_context.coordinates.cp_size;
+    declaration.topology.tp_size = registration_context.coordinates.tp_size;
+    declaration.topology.kv_split_size =
+        registration_context.coordinates.kv_split_size;
+    declaration.topology.tokens_per_block = static_cast<int32_t>(
+        registration_context.tensor_layout.block_token_capacity);
+    std::string reason;
+    if (!declare_cache_group(
+            registration_context.tensor_layout,
+            KVCacheTensorRole(
+                static_cast<KVCacheTensorRole::Value>(tensor.role)),
+            &declaration.group,
+            &reason)) {
+      LOG(WARNING) << "The canonical route cannot serve this instance: "
+                   << reason << "; use pd_route=legacy.";
+      canonical_ready_ = false;
+      declarations_.clear();
+      break;
+    }
+    declarations_.emplace_back(std::move(declaration));
+  }
+  if (canonical_ready_) {
+    PeerDirectory directory;
+    std::string reason;
+    if (!PeerDirectory::describe(local_cache_layout_,
+                                 declarations_,
+                                 row_bases_,
+                                 &directory,
+                                 &reason)) {
+      LOG(WARNING) << "The canonical route cannot interpret this rank's own "
+                      "published layout: "
+                   << reason << "; use pd_route=legacy.";
+      canonical_ready_ = false;
+      declarations_.clear();
+    } else {
+      local_directory_ = std::move(directory);
+    }
+  }
 }
 
 void MooncakeKVCacheTransferDefault::register_kv_cache_spec(

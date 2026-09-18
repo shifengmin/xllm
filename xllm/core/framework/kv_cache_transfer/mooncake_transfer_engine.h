@@ -74,6 +74,11 @@ class MooncakeTransferEngineCore {
   bool has_outgoing_plan(const std::string& remote_addr,
                          CacheNamespace cache_namespace) const;
   bool has_reshard_plan(const std::string& remote_addr) const;
+  // The cache layout a peer published, for the canonical route. The legacy path
+  // keeps only the plan it built from this layout; the canonical route derives
+  // its own tables, so it needs the layout itself.
+  std::optional<WorkerCacheLayoutManifest> peer_cache_layout(
+      const std::string& remote_addr) const;
   Status bind_outgoing_regions(const std::string& remote_addr,
                                const std::vector<KVTransferMapping>& mappings,
                                CacheNamespace cache_namespace,
@@ -127,6 +132,9 @@ class MooncakeTransferEngineCore {
     uint64_t destination_layout_generation = 0;
     CachePeerMode mode = CachePeerMode::PLAN_ONLY;
     std::optional<ReshardPlanTemplate> plan;
+    // Retained for the canonical route, which builds its tables from the peer's
+    // own layout instead of from a plan.
+    std::optional<WorkerCacheLayoutManifest> manifest;
     bool holds_session = false;
   };
   std::unordered_map<std::string, SessionInfo> handles_;
@@ -179,6 +187,8 @@ class MooncakeTransferEngine {
   bool has_outgoing_plan(const std::string& remote_addr,
                          CacheNamespace cache_namespace) const;
   virtual bool has_reshard_plan(const std::string& remote_addr) const;
+  std::optional<WorkerCacheLayoutManifest> peer_cache_layout(
+      const std::string& remote_addr) const;
 
   Status bind_outgoing_regions(const std::string& remote_addr,
                                const std::vector<KVTransferMapping>& mappings,

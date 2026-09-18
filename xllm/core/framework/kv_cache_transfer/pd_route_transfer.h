@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "framework/kv_cache_transfer/cache_directory.h"
@@ -120,6 +121,33 @@ struct RouteLeg {
 // F8). Caching by peer instead would rebuild the same table once per
 // destination worker and would also make the table unable to describe a pair
 // whose peer has not been linked yet.
+// One transport call the push loop makes: the byte regions to write to one
+// peer while one layer is being published.
+struct RouteLayerBatch {
+  int64_t layer_id = 0;
+  std::string peer_addr;
+  std::vector<RouteRegion> regions;
+};
+
+// Flattens a planned route into the calls a layer-synchronized push makes.
+//
+// A region addresses a cache buffer, and every cache buffer belongs to exactly
+// one layer, which is what makes the flattening possible: the route derives its
+// regions from canonical blocks, and a canonical block spans every layer of the
+// model. The output is ordered by ascending layer and, inside a layer, by the
+// order the legs were planned in, so a caller can synchronize once per layer
+// and then emit every peer's bytes for it before moving on. Layers with no
+// regions produce no batch.
+//
+// `layer_of_buffer` maps the buffer id a region names to its layer; a region
+// whose buffer is unknown is an error rather than a dropped write, because
+// dropping it would leave the destination with a hole nothing checks.
+bool flatten_route_for_layers(
+    const std::vector<RouteLeg>& legs,
+    const std::unordered_map<uint64_t, int64_t>& layer_of_buffer,
+    std::vector<RouteLayerBatch>* batches,
+    std::string* error);
+
 class PdRouteCache final {
  public:
   // Returns the edges connecting `src` to `dst`, building and validating them

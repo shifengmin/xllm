@@ -803,6 +803,70 @@ TEST(PdRouteTransferTest, RejectsABlockOfAnotherDestinationSlice) {
       << error;
 }
 
+TEST(PdRouteTransferTest, FlattensALegIntoAscendingLayerBatches) {
+  // Two layers, two peers, and a region per (leg, layer). A buffer belongs to
+  // one layer, so the same plan becomes one transport call per (layer, peer),
+  // in layer order, because the push loop synchronizes a layer before sending
+  // it.
+  std::vector<RouteLeg> legs;
+  RouteLeg first;
+  first.peer_local_rank = 3;
+  first.peer_addr = "peer-3";
+  first.regions = {RouteRegion{/*local_buffer_id=*/10, 0, 100, 0, 8},
+                   RouteRegion{/*local_buffer_id=*/11, 0, 200, 0, 8}};
+  RouteLeg second;
+  second.peer_local_rank = 5;
+  second.peer_addr = "peer-5";
+  second.regions = {RouteRegion{/*local_buffer_id=*/10, 8, 300, 0, 4},
+                    RouteRegion{/*local_buffer_id=*/20, 0, 400, 0, 4}};
+  legs.emplace_back(std::move(first));
+  legs.emplace_back(std::move(second));
+
+  const std::unordered_map<uint64_t, int64_t> layer_of_buffer = {
+      {10, 0}, {11, 1}, {20, 1}};
+  std::vector<RouteLayerBatch> batches;
+  std::string error;
+  ASSERT_TRUE(flatten_route_for_layers(legs, layer_of_buffer, &batches, &error))
+      << error;
+  ASSERT_EQ(batches.size(), 4u);
+  // Layer 0 first, and inside it the legs in plan order.
+  EXPECT_EQ(batches[0].layer_id, 0);
+  EXPECT_EQ(batches[0].peer_addr, "peer-3");
+  ASSERT_EQ(batches[0].regions.size(), 1u);
+  EXPECT_EQ(batches[0].regions[0].local_buffer_id, 10U);
+  EXPECT_EQ(batches[0].regions[0].local_offset, 0U);
+  EXPECT_EQ(batches[1].layer_id, 0);
+  EXPECT_EQ(batches[1].peer_addr, "peer-5");
+  EXPECT_EQ(batches[1].regions[0].local_offset, 8U);
+  EXPECT_EQ(batches[2].layer_id, 1);
+  EXPECT_EQ(batches[2].peer_addr, "peer-3");
+  EXPECT_EQ(batches[2].regions[0].local_buffer_id, 11U);
+  EXPECT_EQ(batches[3].layer_id, 1);
+  EXPECT_EQ(batches[3].peer_addr, "peer-5");
+  EXPECT_EQ(batches[3].regions[0].local_buffer_id, 20U);
+
+  // Every region of the plan is emitted exactly once.
+  size_t emitted = 0;
+  for (const RouteLayerBatch& batch : batches) {
+    emitted += batch.regions.size();
+  }
+  EXPECT_EQ(emitted, 4u);
+}
+
+TEST(PdRouteTransferTest, RejectsARegionWhoseBufferHasNoLayer) {
+  std::vector<RouteLeg> legs;
+  RouteLeg leg;
+  leg.peer_addr = "peer-0";
+  leg.regions = {RouteRegion{/*local_buffer_id=*/7, 0, 0, 0, 4}};
+  legs.emplace_back(std::move(leg));
+  std::vector<RouteLayerBatch> batches;
+  std::string error;
+  EXPECT_FALSE(
+      flatten_route_for_layers(legs, /*layer_of_buffer=*/{}, &batches, &error));
+  EXPECT_NE(error.find("belongs to no layer"), std::string::npos) << error;
+  EXPECT_TRUE(batches.empty());
+}
+
 TEST(PdRouteTransferTest, ParsesTheRouteModesAndRejectsATypo) {
   PdRouteMode mode = PdRouteMode::CANONICAL;
   EXPECT_TRUE(parse_pd_route_mode("legacy", &mode));
