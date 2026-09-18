@@ -1680,3 +1680,60 @@ canonical push 的成功日志是 `VLOG(1) << "[Mooncake][PDTransfer] direction=
   所以**只要 HEAD 在 configure 之前不动**就不会触发 ops 预编译 —— 结论不变：构建期间别动 HEAD。
 * `rrun ... docker exec -i C bash -s < npu_init.sh 0,1,2,3,4,5` 这种写法**传不了参数**
   （stdin 已经是脚本本身），用脚本里的默认 `DEVICES=0,1,2,3,4,5`。
+
+---
+
+## 第 23 轮：**链接成功**，并在二进制里证实路由代码真的进了（2026-09-18 15:25）
+
+### (1) 结果
+
+* `BUILD_EXIT=0 2026-09-18T15:25:18+08:00` —— **第 18 轮那个链接缺陷确实是唯一的拦路虎**：
+  给 `kv_cache_transfer` 目标补上 `:pd_route_transfer` 之后，7 个 `undefined reference` 全部消失，
+  一次通过。之前 `[0/2] → [1380]` 的增量段实测 **25.75 边/分钟**（240s 走 66 边）。
+* 产物 ELF：`$TREE/build/lib.linux-aarch64-cpython-311/xllm/xllm`，**563,018,848 字节**（15:23:29）。
+* `bdist_wheel` 接着在跑（正在编 TileLang kernels），wheel 落在 `$TREE/dist/*.whl`。
+
+### (2) 在**二进制里**证实路由代码被链接进去了（不只是"编译过了"）
+
+这是比"退出码 0"强得多的证据：以前 4 个路由 `.cpp` **根本没被编译**，所以下面这些字符串和符号
+**不可能**出现在产物里。现在全都在：
+
+日志字符串（`strings -a`，命中数）：
+
+| 字符串 | 命中 |
+|---|---|
+| `pd_route=canonical cannot serve this instance` | 1 |
+| `The canonical route cannot serve this instance` | 1 |
+| `The canonical route failed to write to` | 1 |
+| `direction=push, plane=canonical` | 1 |
+| `Create Mooncake KVCacheTransfer, pd_route=` | 1 |
+| `The canonical route cannot interpret this rank` | 1 |
+| `canonical route does not build GlobalXTensor` | 1 |
+
+符号（`nm -C`，命中数）：
+
+| 符号 | 命中 |
+|---|---|
+| `canonical_blocks_of_request` | 1 |
+| `build_route_peer` | 1 |
+| `flatten_route_for_layers` | 8 |
+| `pd_route_mode_name` | 1 |
+| `PdRouteTransfer::plan` | 1 |
+| `declare_cache_group` | 1 |
+| `PeerDirectory::describe` | 1 |
+
+`flatten_route_for_layers` 有 8 处是因为它被内联进了各个调用点（canonical/主 cache/spec draft 等）。
+验收脚本：本机 `~/work/verify_binary.sh`（rrun 到 98 上跑）。
+
+### (3) 顺带确认的部署前提（在 98 host 上实测）
+
+`/export/home/shifengmin.3/.ssh/id_rsa` 在位（2643B）；`md5sum/scp/ssh/base64` 全有；
+`/tmp` 可写；**98 → 83 直连可达**（`REACHED A03-R40-I191-83-4100038.JD.LOCAL`）。
+另外给 `env.sh` 补了 `LD_LIBRARY_PATH=$LIBDIR`（wheel 不一定带 `libasio.so`，
+部署时是单独 stage 到 `pdroute83/lib/` 的，之前 `start_workers.sh` 没把它加进搜索路径）。
+
+### (4) 下一步
+
+等 `WHEEL_EXIT=0` → `deploy_stage98.sh` → `deploy_install83.sh` →（容器内）`npu_init.sh`
+→ `run_all.sh` → `smoke.sh` → 通了再 `run_trace.sh` + `smoke_long.sh` → `compare_kv.py`。
+构建已完成，所以**现在可以安全地**用 `~/work/align_remote_tree.sh`（不带参数先只报告）对齐 98 的树。
