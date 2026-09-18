@@ -141,6 +141,24 @@ WorkerCacheLayoutManifest make_pcp_manifest(int32_t tp_rank,
   return manifest;
 }
 
+// A peer manifest whose sequence partition geometry is spelled out: the legacy
+// planner reasons about `kv_split_size`, and these cases are about a
+// destination whose split differs from its sources'.
+WorkerCacheLayoutManifest make_split_manifest(int32_t tp_rank,
+                                              int32_t tp_size,
+                                              int32_t cp_rank,
+                                              int32_t cp_size,
+                                              int32_t kv_split_rank,
+                                              int32_t kv_split_size,
+                                              const std::string& addr,
+                                              uint64_t cluster_id) {
+  WorkerCacheLayoutManifest manifest =
+      make_pcp_manifest(tp_rank, tp_size, cp_rank, cp_size, addr, cluster_id);
+  manifest.coordinates.kv_split_rank = kv_split_rank;
+  manifest.coordinates.kv_split_size = kv_split_size;
+  return manifest;
+}
+
 class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
  public:
   struct MoveCall {
@@ -310,6 +328,109 @@ TEST(MooncakeTransferEngineTest, LinkFailureRollsBackEveryPcpSource) {
       8);
   EXPECT_EQ(transfer.closed_sessions,
             std::vector<std::string>({"rollback-source_0"}));
+}
+
+TEST(MooncakeTransferEngineTest,
+     CanonicalLinkAcceptsASplitTheLegacyRuleRefuses) {
+  // prefill cp4 x tp1 x kv_split4 -> decode cp1 x tp2 x kv_split2: the split
+  // count changes and the slice-to-rank map changes with it, which is exactly
+  // the heterogeneous reshard the canonical route exists to serve.  The legacy
+  // selection refuses it, because it only lets a CP1 destination keep KV-split
+  // 1 or the source's own split.
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  WorkerCacheLayoutManifest destination = make_split_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/2,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      /*kv_split_rank=*/0,
+      /*kv_split_size=*/2,
+      "split-destination",
+      /*cluster_id=*/3);
+  ASSERT_TRUE(core.set_local_cache_layout(destination).ok());
+
+  RecordingMooncakeTransferEngine transfer(/*listen_port=*/0,
+                                           torch::Device(torch::kCPU));
+  std::vector<uint64_t> cluster_ids;
+  std::vector<std::string> remote_addrs;
+  for (int32_t cp_rank = 0; cp_rank < 4; ++cp_rank) {
+    const std::string addr = "split-source_" + std::to_string(cp_rank);
+    const uint64_t cluster_id = static_cast<uint64_t>(cp_rank + 30);
+    transfer.remote_layouts.emplace(
+        addr,
+        make_split_manifest(/*tp_rank=*/0,
+                            /*tp_size=*/1,
+                            cp_rank,
+                            /*cp_size=*/4,
+                            /*kv_split_rank=*/cp_rank,
+                            /*kv_split_size=*/4,
+                            addr,
+                            cluster_id));
+    cluster_ids.emplace_back(cluster_id);
+    remote_addrs.emplace_back(addr);
+  }
+
+  EXPECT_FALSE(transfer.link_sessions(cluster_ids, remote_addrs));
+
+  RecordingMooncakeTransferEngine canonical(/*listen_port=*/0,
+                                            torch::Device(torch::kCPU));
+  canonical.remote_layouts = transfer.remote_layouts;
+  ASSERT_TRUE(canonical.link_sessions(cluster_ids,
+                                      remote_addrs,
+                                      /*canonical_route=*/true));
+  ASSERT_EQ(canonical.peer_calls.size(), 4U);
+  for (const RecordingMooncakeTransferEngine::PeerCall& call :
+       canonical.peer_calls) {
+    EXPECT_EQ(call.mode, CachePeerMode::ACTIVE);
+  }
+  EXPECT_EQ(canonical.opened_sessions, remote_addrs);
+}
+
+TEST(MooncakeTransferEngineTest,
+     CanonicalLinkStillRejectsADifferentCacheFamily) {
+  // Partitioning is the route's business; which cache is being partitioned is
+  // not.  A peer that describes a different model must still be refused, or the
+  // route would place blocks in a coordinate space that does not exist there.
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  WorkerCacheLayoutManifest destination = make_split_manifest(
+      /*tp_rank=*/0,
+      /*tp_size=*/2,
+      /*cp_rank=*/0,
+      /*cp_size=*/1,
+      /*kv_split_rank=*/0,
+      /*kv_split_size=*/2,
+      "family-destination",
+      /*cluster_id=*/4);
+  ASSERT_TRUE(core.set_local_cache_layout(destination).ok());
+
+  RecordingMooncakeTransferEngine transfer(/*listen_port=*/0,
+                                           torch::Device(torch::kCPU));
+  std::vector<uint64_t> cluster_ids;
+  std::vector<std::string> remote_addrs;
+  for (int32_t cp_rank = 0; cp_rank < 4; ++cp_rank) {
+    const std::string addr = "family-source_" + std::to_string(cp_rank);
+    const uint64_t cluster_id = static_cast<uint64_t>(cp_rank + 40);
+    WorkerCacheLayoutManifest source =
+        make_split_manifest(/*tp_rank=*/0,
+                            /*tp_size=*/1,
+                            cp_rank,
+                            /*cp_size=*/4,
+                            /*kv_split_rank=*/cp_rank,
+                            /*kv_split_size=*/4,
+                            addr,
+                            cluster_id);
+    if (cp_rank == 1) {
+      source.fingerprint = "some-other-model";
+    }
+    transfer.remote_layouts.emplace(addr, std::move(source));
+    cluster_ids.emplace_back(cluster_id);
+    remote_addrs.emplace_back(addr);
+  }
+
+  EXPECT_FALSE(transfer.link_sessions(cluster_ids,
+                                      remote_addrs,
+                                      /*canonical_route=*/true));
+  EXPECT_TRUE(transfer.opened_sessions.empty());
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,

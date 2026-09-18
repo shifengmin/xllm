@@ -86,6 +86,23 @@ class ReshardPlanner final {
                         const WorkerCacheLayoutManifest& destination,
                         std::vector<size_t>* selected_indices) const;
 
+  // Selects the source ranks a canonical route may have to read or write.
+  //
+  // The canonical route derives every block's writer from the two published
+  // layouts, so it has no use for the legacy "which source rank can cover this
+  // destination" derivation -- and that derivation is exactly what forbids a
+  // destination whose KV-split differs from the source's, because it only lets
+  // a destination collapse partitions when it is CP1 with KV-split 1 or the
+  // source's own split. What still has to hold is that both sides describe the
+  // same kind of cache, since the route's directories are keyed by a shared
+  // coordinate space, and that each side's own partition geometry is one the
+  // runtime can express. Every source that satisfies those is selected: the
+  // binder skips the ones a given request does not need.
+  Status select_canonical_sources(
+      const std::vector<WorkerCacheLayoutManifest>& sources,
+      const WorkerCacheLayoutManifest& destination,
+      std::vector<size_t>* selected_indices) const;
+
   Status validate_destination_coverage(
       const std::vector<WorkerCacheLayoutManifest>& sources,
       const WorkerCacheLayoutManifest& destination) const;
