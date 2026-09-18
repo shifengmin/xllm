@@ -133,7 +133,12 @@ folly::SemiFuture<bool> KVCacheTransfer::pull_kv_blocks_async(
                         src_addr,
                         mappings,
                         promise = std::move(promise)]() mutable {
-    const bool success = pull_kv_blocks(src_cluster_id, src_addr, mappings);
+    // The canonical pull derives the writer of every canonical block from the
+    // two peers' layouts, so the rank-aligned stride remap the legacy path
+    // applies does not describe it at all.
+    const bool success =
+        canonical_route_ ? pull_kv_blocks_canonical(src_addr, mappings)
+                         : pull_kv_blocks(src_cluster_id, src_addr, mappings);
     promise.setValue(success);
   });
   return future;

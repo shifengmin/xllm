@@ -125,6 +125,19 @@ class KVCacheTransfer {
       const std::string& src_addr,
       const std::vector<KVTransferMapping>& mappings);
 
+  // The canonical data plane in the pull direction: the reader reads the
+  // canonical blocks it needs from their writers instead of consuming the
+  // rank-aligned mapping the legacy path assumes. Backends without per-layer
+  // buffers refuse, exactly like the push direction.
+  virtual bool pull_kv_blocks_canonical(
+      const std::string& src_addr,
+      const std::vector<KVTransferMapping>& mappings) {
+    (void)src_addr;
+    (void)mappings;
+    LOG(ERROR) << "This KV cache transfer backend has no canonical data plane.";
+    return false;
+  }
+
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   virtual folly::SemiFuture<bool> push_kv_blocks_async(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
