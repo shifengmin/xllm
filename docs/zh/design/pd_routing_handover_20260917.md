@@ -51,13 +51,17 @@ KDA 缓存（`G=64, TP=8 ⇒ D=1`，而实例 `S=4`）误拒。
 
 ```
 sequence_scoped        => S_eff = 1     无块维可切
+full_sequence_replica  => S_eff = 1     语义性全序列复制（显式声明，S2 新增）
 D == 1                 => S_eff = 1     无冗余可消
 S <= D 且 D % S == 0   => S_eff = S
 其余                    => 报错          不做静默降级
 ```
 
-这条规则**推导出**了现在硬编码的白名单 `is_kv_split_cache_block_type`（`block/block.h:75-88`），
-改造后该函数应降级为断言 `EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`。
+**S2 修正**：`S_eff` **不能**由 `G/TP/CP/S` 推导出来。indexer kPool（`G=1`）按规则会得到
+`S_eff=4`，但它必须整序列复制（top-k 读全序列），所以由 `GroupTopology::full_sequence_replica`
+**声明**。因此原先设想的
+`EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`
+（MLA latent 与 indexer 同 `BlockType::KV`、同 `group_id`，却一个 4 一个 1）**作废**。
 
 ### 2.3 GLM 5.3 flash 目标场景
 
@@ -67,7 +71,7 @@ S <= D 且 D % S == 0   => S_eff = S
 | group | `G` | scope | P: `D`/`S_eff`/`N_rep` | D: `D`/`S_eff`/`N_rep` | DCP |
 |---|---|---|---|---|---|
 | MLA latent | **1** | BLOCK | 8 / **4** / 2 | 2 / **2** / 1 | ✅ |
-| indexer kPool | **1** | BLOCK | 8 / **4** / 2 | 2 / **2** / 1 | ✅（**S_eff 待实测，见 §6.1**） |
+| indexer kPool | **1** | BLOCK | 8 / **1** / 8 | 2 / **1** / 2 | ✗（**全序列复制，`full_sequence_replica`，见 §6.1**） |
 | KDA conv / ssm | **64** | SEQUENCE | 1 / **1** / 1 | 1 / **1** / 1 | ✗ |
 
 **场景可解的必要条件是 `G = 1`**（P 需 `max(8/G,1) ≥ 4` 且被 4 整除 ⇒ `G∈{1,2}`；D 需 `max(2/G,1) ≥ 2` ⇒ `G=1`）。
@@ -155,6 +159,20 @@ sudo docker run --rm --privileged \
   -c 'cd /export/home/shifengmin.3/workspace/xllm-dcp-fp32 && python3 /tmp/manual.py'
 ```
 
+### 4.4 S2 的验证证据（2026-09-18）
+
+| 项 | 结果 |
+|---|---|
+| `kv_redundancy_test`（L1，含新增的 `full_sequence_replica` 用例） | ✅ **11 tests / 3 suites 全 PASSED** |
+| `pd_route_test`（L2/L3：T3 golden + 拓扑矩阵不变量 + T4 字节 golden + T5 mock） | ✅ **12 tests 全 PASSED** |
+| MLA golden：表本体 4 条、DP 展开 16 条；写者仅 local rank 0–3 | ✅ |
+| KDA golden：表本体 8 条、DP 展开 32 条；P 侧 8 个 rank 全参与 | ✅ |
+| indexer：`full_sequence_replica` ⇒ 1 源 rank → 2 个目的副本（对照：不声明时是 4 条 MLA 形状） | ✅ |
+| 拓扑矩阵：`G ∈ {1..64} × TP ∈ {1,2,4,8} × split ∈ {1,2,4,8} × {block, sequence}` 全枚举，`validate` 覆盖不变量全成立 | ✅ |
+| T4：`local_row = b/4`、`remote_row = b/2` 与文档表格逐行一致；发散方向、`explicit_offsets`、checkpoint 3 子单元均逐字节正确 | ✅ |
+| T5：真实内存 + memcpy 端到端字节校验，且"故意把远端行基点错位"必须被校验抓住 | ✅ |
+| clang-format **20.1.6**（pre-commit 缓存里的真版本）后复跑 | ✅ 仍全绿 |
+
 ---
 
 ## 5. 开发机上的坑（省下重复踩的时间）
@@ -180,6 +198,18 @@ sudo docker run --rm --privileged \
    （已做对照实验：用同一套 flags 编译 `git show HEAD:` 的改动前同名文件，失败信息逐字相同）。
 9. 批量 `sed` 改 build 目录时**务必用 `grep -rIl`（大写 I 跳过二进制）** —— 否则会把
    `libopencv_core4.a` 这类静态库改坏。
+10. **CMake 重配置在这棵树里已经不可能成功**（2026-09-18 复核）：
+    - `vcpkg install` 的 `detect_compiler` 会认为在跨编译，去找 `aarch64-linux-gnu-gcc`，镜像里只有 `/usr/bin/gcc`；
+    - 加 `-DVCPKG_MANIFEST_INSTALL=OFF` 可跳过 vcpkg，但下一关是
+      `FETCHCONTENT_SOURCE_DIR_LIBTORCH = /export/home/shifengmin.3/.dcplab/libtorch-src`（主机路径，未挂进容器）；
+    - 只要动到任何 `CMakeLists.txt`，`ninja` 就会触发重配置 → 失败 → `build.ninja` 不更新（旧文件仍在）。
+    - ⇒ **新目标不要指望 `ninja`**，用 §5.11 的手编回路。
+11. **手编回路**（`~/pdroute_tools/s2_host_test.py`）：`compile_commands.json` 取真 flags（库源用
+    `reshard_planner.cpp` 的、测试源用 `reshard_planner_test.cpp` 的）编译，再**最小链接**
+    `libgtest_main.a + libgtest.a` 即可 —— 新层只用标准库，不需要 `libcommon.a`。
+12. **21:58 那棵预编译树不可靠**：`xllm/core/common/libcommon.a` 是坏档案（`malformed archive`），
+    镜像里也没有 `-lcust_opapi`，所以**任何依赖旧 planner 的测试在这棵树里链接不起来**（这也是
+    §7.1 取消旧路径比对的附带原因）。新层刻意不依赖这些库。
 
 ---
 
@@ -194,8 +224,12 @@ sudo docker run --rm --privileged \
 若成立，**indexer 的 `S_eff` 应为 1 而非 4**，且行↔规范块映射与 KV 不同（KV 用 `row = canonical / S`，
 INDEX 用 `row = canonical`）。
 
-**定音探针**：目标配置（TP8 + DCP4）下单次启动，打印 `index_cache_shape()` 与 `k_cache_shape()` 的行数比、
-`kv_cache_cap.n_blocks()`、`num_indexer_layers()`。
+**S2 的处理**：建模上已按"复制"落地 —— `full_sequence_replica = true` ⇒ `S_eff=1`、`N_rep=D`，行映射仍是
+统一公式 `row = canonical / S_eff`（退化为 `row = canonical`，正好对上 index 行数 `= n_blocks × S`）。
+目标场景下 indexer 的边表因此是 1 个源 rank 扇出到 `N_rep` 个目的 rank（P 侧 8、D 侧 2）。
+
+**定音探针（仍待做，但不再阻塞）**：目标配置（TP8 + DCP4）下单次启动，打印 `index_cache_shape()` 与 `k_cache_shape()` 的行数比、
+`kv_cache_cap.n_blocks()`、`num_indexer_layers()`；它现在只需确认"这组是否真的该声明"。
 
 ### 6.2 kPool packed 宽度
 
@@ -211,45 +245,68 @@ mock 应对两种各出一例。
 使 remap **被整体跳过**。若探针确认，则说明 **kv_split 的序列划分是在 D 侧分配 block id 时就完成的
 （rank-preserving 契约）**，而不是在传输层做的 —— 这直接决定 S3 应在**传输层**还是**分配层**引入 canonical block。
 
+**S2 期间的旁证（读码，非探针）**：MLA 的描述符来自 `describe_replicated_tensor`（`enable_mla` 分支），内容是
+"整行一个 span + `owner_tp_rank=0`"，**描述符里根本没有块身份**。既然 manifest 无法表达"哪些规范块归哪个 rank"，
+该划分只可能来自调度侧分配的 block id ⇒ 倾向"canonical block 应引入在**契约层/分配层**"。
+
 ### 6.4 其他（详见 review 文档）
 
 - `B_token` 暂定取 `options_.block_size()`（= 现有 `CacheTensorManifest::block_token_capacity`），
   需确认两侧 `--block_size` 配置相同即成立；
-- F7 `RouteBinder::bind` 应按 `t` 预分桶（`O(#blocks)` 而非 `O(#edges × #blocks)`）；
-- F8 边表按 `(本侧拓扑, 对侧拓扑)` 缓存，而非按 peer；
-- F9 `bind_regions` 的 `repeat_count / local_stride / remote_stride`（块内 token 维压缩）**必须保留**。
+- F7 `RouteBinder::bind` 按 `t` 预分桶 ✅（已实现）；
+- F8 边表按 `(本侧拓扑, 对侧拓扑)` 缓存，而非按 peer（S3 接入时实现）；
+- F9 块内 token / checkpoint 行的压缩 ✅：`RouteBinder` 用 `units_per_resource` + 每 rank 的
+  `local_head_count` 计算子单元步长，输出再合并相邻区间（因此目标场景下"整行搬运"是一条 region）。
 
 ---
 
-## 7. 下一步：S2 的具体任务
+## 7. S2 已完成（2026-09-18），下一步是 S3
 
-按 `pd_transfer_redesign_proposal_20260917.md` §3.3/§3.4 与 `pd_route_verification_plan_glm53flash_20260917.md`
-第三部分（T3/T4/T5）：
+原计划 5 项的去向：
 
-1. **`PdRouteTable`**：`build(src_topology, src_group, dst_topology, dst_group, edges)`。
-   `RouteEdge` 只含 **DP 组内局部 rank**（F3）：`{src_local_rank, dst_local_rank, head_begin, head_end, src_slice, dst_slice}`；
-   全局 rank = `dp * (CP*TP) + local_rank`，DP 配对由 `TransferKVInfo.dp_rank` 给出。
-2. **`RouteBinder`** + **`BufferDirectory`**：规范块 → 物理 `(buf_id, offset, length)`，
-   按 `t` 预分桶，`explicit_offsets` 支持 XTensor。
-3. **与旧计划器并行比对**：同构/异构配置下，新边表与原 `select_sources` 的 ACTIVE 集合**逐边一致**；
-   `S_P = S_D` 时 `RouteBinder` 输出与 `bind_outgoing_regions` **逐字节一致**。
-4. **目标场景 golden**：MLA 16 条边（写者只有 P rank 0–3）、KDA 32 条边（P 侧 8 个 rank 全参与）。
-5. **host mock 端到端（T5）**：真实内存 + 本地 memcpy 代替 RDMA，验证「边表 + 绑定 + 搬运」合起来字节正确；
-   含"故意打乱一条边必须校验失败"的判别性反例。
+| # | 原计划 | 结果 |
+|---|---|---|
+| 1 | `PdRouteTable`（DP 组内局部 rank 的边表） | ✅ 已实现并跑绿 |
+| 2 | `RouteBinder` + `BufferDirectory`（规范块 → 物理字节区间） | ✅ 已实现并跑绿 |
+| 3 | 与旧计划器并行、逐边/逐字节比对 | ❌ **取消**：旧路径在目标配置下不可表达（见 §7.1），验收改为 golden + mock |
+| 4 | 目标场景 golden（MLA / KDA） | ✅ T3 全绿（表本体 4 / 8 条，DP 展开 16 / 32 条） |
+| 5 | host mock 端到端（T5，含判别性反例） | ✅ 全绿 |
 
-**顺序原则**：S2 必须"新旧并行 + 逐边逐字节比对"通过后才进 S3；
-S3（规范逻辑地址）之前**不要**同时改 `block_size` 语义（那是独立的 S6）。
+### 7.1 为什么取消"与旧计划器比对"
 
----
+MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED），而 `select_sources` 的去重是
+"`same_partition` + `tp_rank == owner_tp_rank`"。在 `TP8 + DCP4` 下：用运行时真实的 `kv_split_rank = rank % S`
+⇒ 除 dst rank 0 外 **0 个写者**；用 fallback `rank/(world/kv)` ⇒ 每个目的 rank **2 个写者**。两条路都过不了
+覆盖率校验 —— 目标场景本来就是旧路径不支持的形状，所以"S2 必须新旧逐边一致"在目标场景上不可执行。
+旧路径支持的形状（`G ≥ TP` 且 `S=1`、`G < TP` 且 `S=1`、sequence-scoped）仍可比对，属可选补充。
+
+### 7.2 新增/改动文件
+
+| 文件 | 内容 |
+|---|---|
+| `xllm/core/framework/kv_cache_transfer/pd_route_table.{h,cpp}` | `RouteEdge` + `build`（`head_pairs ⊗ block_map`）+ `validate`（逐 `(目的 rank, 源片, head)` 覆盖不变量 + 源侧唯一写者） |
+| `xllm/core/framework/kv_cache_transfer/route_binder.{h,cpp}` | `RouteRegion` / `BufferDirectoryEntry` / `BufferDirectory` / `PeerCacheView` + `bind` |
+| `tests/core/framework/kv_cache_transfer/pd_route_test.cpp` | 12 个用例：T3 golden（MLA / KDA / indexer）、拓扑矩阵不变量、T4 字节 golden、T5 mock |
+| `xllm/core/framework/kv_cache_transfer/kv_redundancy.{h,cpp}` | `GroupTopology::full_sequence_replica` + 派生规则第 2 行 |
+| 两处 `CMakeLists.txt` | `cc_library(pd_route_table)` / `cc_library(route_binder)` / `cc_test(pd_route_test)` |
+
+### 7.3 验证方式（全部在 jd-node-98 容器内，本机不能构建）
+
+`~/pdroute_tools/s2_host_test.py`：从 `compile_commands.json` 取真实 flags 手编 4 个 TU，再用最小链接
+（`libgtest_main.a` + `libgtest.a`）成两个测试二进制并运行。结果 `kv_redundancy_test` **11/11 PASSED**、
+`pd_route_test` **12/12 PASSED**（clang-format 20.1.6 之后复跑仍全绿）。详见 §4.4 与 §5.10。
+
+**顺序原则不变**：S3 之前不要同时改 `block_size` 语义（那是独立的 S6）。
 
 ## 8. 交接清单
 
 | 项 | 位置 |
 |---|---|
-| 本地改动 | `xllm` 仓库分支 **`pd-routing-s0s1`**（本地，未 push）。见 `git log -1 --format=%H pd-routing-s0s1`；subject：`refactor(kv_cache_transfer): add KV redundancy layer, drop dead routing code` |
+| 本地改动（S0/S1，已提交） | `xllm` 仓库分支 **`pd-routing-s0s1`**（本地，未 push）。见 `git log -1 --format=%H pd-routing-s0s1`；subject：`refactor(kv_cache_transfer): add KV redundancy layer, drop dead routing code` |
+| 本地改动（S2，**尚未提交**） | 同一工作区：新增 `pd_route_table.{h,cpp}` / `route_binder.{h,cpp}` / `pd_route_test.cpp`，改 `kv_redundancy.{h,cpp}`、`kv_redundancy_test.cpp`、两处 `CMakeLists.txt`、本文档与另外两份设计文档 |
 | 四份设计文档 + 本文 | `docs/zh/design/{kv_redundancy_model_and_pd_routing,pd_routing_simplification,pd_route_verification_plan_glm53flash,pd_transfer_redesign_proposal,pd_routing_handover}_20260917.md`（已随该 commit 一并提交） |
 | 开发机工作树（含改动 + 可手动编译） | jd-node-98 `~/workspace/xllm-pdroute` |
-| 开发机验证脚本 | jd-node-98 `~/pdroute_tools/` |
+| 开发机验证脚本 | jd-node-98 `~/pdroute_tools/`（S2 用 `s2_host_test.py`） |
 | 原树（**未被改动，勿动**） | jd-node-98 `~/workspace/xllm-dcp-fp32`（含 5 个与本工作无关的未提交文件） |
 | 容器镜像 | `quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911` |
 

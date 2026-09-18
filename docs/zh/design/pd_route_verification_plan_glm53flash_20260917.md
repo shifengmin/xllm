@@ -52,23 +52,28 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
 }
 ```
 
-**修法**：把 `S` 的作用域限定到 group，派生
+**修法（已实现）**：把 `S` 的作用域限定到 group，派生
 
 ```
-S_eff(group) = (S <= D(group) && D(group) % S == 0) ? S : 1
+sequence_scoped            => S_eff = 1
+full_sequence_replica      => S_eff = 1
+D == 1                     => S_eff = 1
+S <= D 且 D % S == 0       => S_eff = S
+其余                        => 报错（不静默降级）
 ```
 
-语义：**能被冗余度吸收的缓存才切分；不能被吸收的缓存整体复制到每个 rank**（`S_eff = 1` ⇒ `t ≡ 0`，每个 rank 持完整序列）。
+语义：**能被冗余度吸收的缓存才切分；不能被吸收的缓存整体复制到每个 rank**（`S_eff = 1` ⇒ `t ≡ 0`，每个 rank 持完整序列）。但"不能被吸收"分两类：**语义性**的（`sequence_scoped`，或由 `full_sequence_replica` 显式声明，如 indexer 池）退 1；**配置性**的（`S>1` 却除不尽 `D`）报错 —— 静默退 1 会让使用者误以为切分已经生效。
 
-**收益**：`is_kv_split_cache_block_type` 的白名单**由模型推导出来**，可作为断言而非规则：
+**S2 已修正原 F1 的两处结论**：
+
+1. `S_eff` 的判定多出 `full_sequence_replica`，且它**不能**从 `G/TP/CP/S` 推导：indexer 的 `G=1, D=8` 按规则会得到 `S_eff=4`，而它必须整序列复制（kPool 的 top-k 读全序列）。因此它由 `GroupTopology` **声明**，理由写进注释。
+2. "白名单由 `S_eff` 推导、改造后降级为 `EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`" **作废**：MLA latent 与 indexer 同属 `BlockType::KV`、同 `group_id`，却一个 `S_eff=4`、一个 `S_eff=1`，该断言必然自相矛盾。两者的对应关系改由 `(namespace, role, group_id)` 粒度的 `GroupTopology` 表达：
 
 | BlockType | GLM5-next `G` | `TP` | `D_tp` | `D` | `S=4` 时 `S_eff` | 现有白名单 | 一致 |
 |---|---|---|---|---|---|---|---|
 | KV（MLA latent） | 1 | 8 | 8 | 8 | **4** | true | ✅ |
-| KV（indexer k） | 1 | 8 | 8 | 8 | **4** | true | ✅ |
+| KV（indexer k） | 1 | 8 | 8 | 8 | **1**（`full_sequence_replica`） | true | ❌ 白名单无法表达 |
 | LINEAR（conv / ssm） | 64 | 8 | 1 | 1 | **1** | false | ✅ |
-
-**这项修正同时消除了模型与实现之间唯一一处"硬编码知识"。**
 
 ---
 
@@ -157,6 +162,8 @@ SEQUENCE 类                   : 无 canonical block 概念，用 slot id
 两处同时生效 ⇒ index 张量行数 = `n_blocks × S` = **全部规范块数**，配合估算侧的 S 倍预算，指向「**每个 rank 保留全部规范块的 index**」，即 **index cache 在 DCP 下是复制而非切分**（kPool 的 top-k 需要全局序列的 index）。
 
 若成立，则 **indexer 的 `S_eff` 应为 1**（每 rank 持完整序列），而**不是**与 MLA latent 相同的 4。这会改变 T3 的 indexer 用例与边表。**必须用一次探针实测确认**（见第六部分）。
+
+**S2 的处理**：建模上已按"复制"落地 —— indexer 组由 `GroupTopology::full_sequence_replica` 声明，`S_eff=1`、`N_rep=D`，行映射仍是统一公式 `row = canonical / S_eff`（`S_eff=1` 退化为 `row = canonical`，正好对应 index 张量行数 `= n_blocks × S`）。探针仍待做，但它只影响"这组是否真的该声明"，不再阻塞 L1/L2/L3 的形状。
 
 ---
 
@@ -281,7 +288,7 @@ P 侧 rank 0..7 的 `(h, t, c)`：
 
 ⇒ **写者只有 rank 0..3**（`c=0`），rank 4..7 是冗余副本、不发任何边。
 
-期望边表（**每个 `dst_dp ∈ [0,4)` 一份，共 4 × 4 = 16 条**）：
+期望边表。按 F3，边表**不含 DP 维**，因此表本体只有 **4 条**；下表是"每个 `dst_dp ∈ [0,4)` 各一份"的展开视图（共 **4 × 4 = 16 条有效边**）：
 
 | # | src_local | dst_local | head range | `t_P` | `t_D` |
 |---|---|---|---|---|---|
@@ -291,7 +298,7 @@ P 侧 rank 0..7 的 `(h, t, c)`：
 | 4 | 3 | 1 | [0,1) | 3 | 1 |
 
 断言：
-- 边数 == 16（4 dst_dp × 4）；
+- 表本体边数 == 4；按 `dst_dp` 展开后 == 16（4 × 4）；
 - `{edge.src_local_rank} == {0,1,2,3}`，**不含 4..7**；
 - 对每个 `(dst_dp, canonical block b ∈ [0,64))`：恰好 1 条边的 `t_P == b % 4` 指向 `dst_local == b % 2`；
 - 对每个 `(dst_dp, dst_local)`：源集合 == `{t_P : t_P % 2 == dst_local}`。
@@ -315,7 +322,9 @@ P 侧 rank 0..7 的 `(h, t, c)`：
 | 6 | 1 | [48,56) |
 | 7 | 1 | [56,64) |
 
-断言：边数 == 8 × 4(dst_dp) = 32；**P 侧 8 个 rank 全部参与**（与 MLA 只有 4 个形成对照，是 `S_eff` 生效的判别性证据）；每条边的 head range 与上表一致。
+断言：表本体边数 == 8；按 `dst_dp` 展开后 == 8 × 4 = 32；**P 侧 8 个 rank 全部参与**（与 MLA 只有 4 个形成对照，是 `S_eff` 生效的判别性证据）；每条边的 head range 与上表一致。
+
+> 实现时两组数都已固定：`pd_route_test.cpp` 同时断言表本体（4 / 8）与展开后的有效边数（16 / 32），后者用 `全局 rank = dst_dp * (CP*TP) + local_rank` 计算。
 
 ### 3.5 T4 `route_binder_test`：字节区间 golden
 
@@ -469,6 +478,21 @@ index_cache_shape_ = {index_block_count, kv_cache_cap.block_size(), 1, cache_hea
 
 ---
 
+## 第五部分补：旧计划器为什么不能作为 S2 的比对基准 **[读码]**
+
+S2 原定的验收是"新边表与旧 `select_sources` 的 ACTIVE 集合逐边一致"。实施时发现**目标配置下旧路径无法表达**：
+
+1. MLA 缓存在 `describe_cache_tensor` 里走 `describe_replicated_tensor`（`cache_layout_builder.cpp` 的 `enable_mla` 分支）：**整行**一个 span、`bytes_per_region = resource_stride_bytes`、`owner_tp_rank = 0`、`kind = REPLICATED`。也就是说描述符里**没有块维身份**。
+2. `select_sources`（同构分支）要求源的 `cp_rank`、`kv_split_size`、`kv_split_rank` 与目的完全相同，再用 `only_static_owner`（此处 `kv_split_spans_cp_and_tp` 为假 ⇒ 为真）按 `tp_rank == span.owner_tp_rank` 去重。于是 `TP8 + DCP4` 下有：
+   - `kv_split_rank = dcp_group_->rank() = rank % S`（运行时真实 DCP 分组，与模型 §5 的 `t` 一致）⇒ 目的 rank 1/2/3 的候选源只有 `{1,5}`/`{2,6}`/`{3,7}`，而它们的 `owner_tp_rank` 都是 0 ⇒ **0 个写者**（`"no source writer"`）；
+   - fallback `kv_split_rank = rank / (world/kv) = rank/2` ⇒ 每个目的 rank 有 **2 个写者**（`"multiple writers"`）。
+
+两条路都过不了覆盖率校验。**结论**：旧路径支持的形状只有 `G ≥ TP 且 S = 1`、`G < TP 且 S = 1`、sequence-scoped 三类；目标场景（MLA `G=1` 配 `DCP4/2`）恰恰是它不支持的。因此 S2 的验收改为 **golden + mock 逐字节**（T3/T4/T5），旧路径比对仅作可选补充。
+
+顺便回答 §6 的问题 5（kv_split 的划分发生在哪一层）：MLA 的描述符里既然没有块身份，`kv_split` 的"哪些规范块归谁"就**不可能**由 manifest 表达，只能来自调度侧分配的 block id（即 rank-preserving 契约）。这与"canonical block 应引入在**分配层/契约层**"的判断一致，S3 应据此评估。
+
+---
+
 ## 第六部分：待确认（更新后）
 
 | # | 项 | 状态 |
@@ -477,5 +501,5 @@ index_cache_shape_ = {index_block_count, kv_cache_cap.block_size(), 1, cache_hea
 | 2 | `qk_rope_head_dim` | ✅ **已确认 = 0** ⇒ MLA V 张量维数为 0，实际只有 K（latent）承载 KV；`head_bytes(MLA) = kv_lora_rank × dtype_size = 512 × 2 = 1024` |
 | 3 | indexer 的 `group_id` | ✅ **已查实**：与 MLA latent 同属 `group_id = 0`（`kv_cache_impl.cpp:147`）⇒ 需新增「同组内 role 的 `(G, S_eff)` 一致」断言 |
 | 4a | kPool packed 宽度 | ⚠️ **代码默认 `index_kpool_compress = false`（宽度 128），但注释与 `use_kpool_indexer_` 表明真实 checkpoint 预期为 true（宽度 257）** ⇒ mock 两种各出一例 |
-| 4b | index cache 是否随 `S` 放大 | ⚠️ **两处 ×S 均已定位且目标平台生效**；推断为「复制而非切分」⇒ **indexer 的 `S_eff` 可能为 1 而非 4**。需按 §5.2 的探针定音后再定稿 T3 的 indexer 用例 |
+| 4b | index cache 是否随 `S` 放大 | ⚠️ **两处 ×S 均已定位且目标平台生效**；推断为「复制而非切分」⇒ indexer 的 `S_eff` 为 1。**S2 已按此建模**（`full_sequence_replica` 显式声明，见 F4′）；探针只需确认"该不该声明"，不再阻塞实现 |
 | 5 | kv_split 划分发生在哪一层 | ⚠️ `has_rank_preserving_kv_groups` 在 GLM5-next 的分组集合上恒为 true ⇒ `filter_kv_split_infos` 被跳过 ⇒ 划分可能已在 D 侧分配 block id 时完成。**这决定 S3 应在传输层还是分配层引入 canonical block**，需探针确认 |

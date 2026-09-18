@@ -22,6 +22,18 @@ cc_test(
 
 cc_test(
   NAME
+    pd_route_test
+  SRCS
+    pd_route_test.cpp
+  DEPS
+    :kv_redundancy
+    :pd_route_table
+    :route_binder
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     pd_topology_guard_test
   SRCS
     pd_topology_guard_test.cpp

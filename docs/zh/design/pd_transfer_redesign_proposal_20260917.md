@@ -91,7 +91,8 @@ struct KvTopology {                      // 实例级
 struct GroupTopology {                   // 每个 (namespace, role, group_id)
   int32_t global_head_count = 0;         // G
   uint64_t head_bytes = 0;               // 一个 head 的字节数
-  CacheResourceScope scope = CacheResourceScope::BLOCK;
+  bool sequence_scoped = false;          // SSM / CONV / LINEAR / EMBEDDING：无块维
+  bool full_sequence_replica = false;    // indexer kPool 等"有块维但必须全序列"的组
 };
 
 struct KvRedundancy {
@@ -103,8 +104,9 @@ struct KvRedundancy {
   int32_t N_rep = 0;   // 残余冗余度             = D / S_eff
 
   // C1: (G % TP == 0 || TP % G == 0)
-  //     S_eff = (S <= D && D % S == 0) ? S : 1     <-- 见 §6
-  // C2: 1 <= S_eff <= D
+  //     sequence_scoped / full_sequence_replica / D == 1  => S_eff = 1
+  //     S <= D 且 D % S == 0                              => S_eff = S
+  //     其余                                              => 报错（见 §6）
   static Status derive(const KvTopology&, const GroupTopology&, KvRedundancy*);
 };
 
@@ -320,19 +322,28 @@ dst_global = dst_dp * (CP_D * TP_D) + edge.dst_local_rank
 
 ## 6. 适用范围边界
 
-### 6.1 由 `S_eff` 推导，而不是按 BlockType 白名单
+### 6.1 `S_eff` 按组派生：显式声明优先，其余不匹配直接报错
 
 C2（`S ≤ D`）必须作用在**每个 cache 组**上，因为 `D = CP × D_tp` 依赖该组的全局 head 数 `G`，而 `S` 是实例级的。GLM5-next 就是反例：KDA 状态 `G = kda_num_heads = 64`，`TP = 8` ⇒ `D = 1`，而实例 `S = 4` —— 按实例级 C2 会被误拒。
 
-因此定义：
+已实现的派生规则（`kv_redundancy.cpp`）：
 
 ```
-S_eff(group) = (S <= D(group) && D(group) % S == 0) ? S : 1
+sequence_scoped            => S_eff = 1    无块维可切
+full_sequence_replica      => S_eff = 1    语义性全序列复制（见下）
+D == 1                     => S_eff = 1    无冗余可消
+S <= D 且 D % S == 0       => S_eff = S
+其余                        => 报错          不做静默降级
 ```
 
-语义：**能被冗余度吸收的缓存才切分；不能被吸收的缓存整体复制到每个 rank**（`S_eff = 1 ⇒ t ≡ 0`，每 rank 持完整序列）。
+语义：**能被冗余度吸收的缓存才切分；不能被吸收的缓存整体复制到每个 rank**（`S_eff = 1 ⇒ t ≡ 0`，每 rank 持完整序列）。但"能不能被吸收"只解释前三种情形；**配置与冗余度不匹配（`S>1` 又除不尽 `D`）是配置错误，应当显式报错**——静默退 1 会让使用者以为更宽的切分已经生效。若某个组确实只能全序列保留，必须由 `full_sequence_replica` **声明**，把原因写进注释。
 
-这**推导出**了现有实现里硬编码的白名单（`block/block.h:75-88` `is_kv_split_cache_block_type`：`KV/SWA/C4/C128` 为 true，`EMBEDDING/LINEAR` 为 false），因此改造后该函数应降级为断言：`EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`。详见验证文档 F1。
+**`full_sequence_replica` 的由来（indexer kPool）**：`groups.kv` 里的 MLA latent 与 indexer 同属 `BlockType::KV`、同 `group_id`，但 indexer 的 top-k 需要读取**全序列**的 gate/valid，因此它是有块维、却必须整序列复制的组。这带来两个后果：
+
+1. `S_eff` **不能**从 `G/TP/CP/S` 推导出来（该组 `G=1, D=8`，按规则会得到 `S_eff=4`，而实际必须是 1），所以它必须是 `GroupTopology` 上的显式声明，而不是白名单或推导；
+2. 原先设想的 `EXPECT_EQ(is_kv_split_cache_block_type(t), S_eff(group) > 1)`（验证文档 F1）**不成立**：同一个 `BlockType::KV` 组内 MLA latent 的 `S_eff=4`、indexer 的 `S_eff=1`。该断言作废，`is_kv_split_cache_block_type` 与 `S_eff` 不是同一件事，改造后由 `(namespace, role, group_id)` 粒度的 `GroupTopology` 取代。
+
+行 ↔ 规范块的映射仍然统一为 `row = canonical / S_eff`：`S_eff=1` 时退化为 `row = canonical`，这正是 indexer 张量行数 `= n_blocks × S`（全部规范块）的含义。
 
 ### 6.2 按 scope 分类
 
@@ -407,8 +418,10 @@ S_eff(group) = (S <= D(group) && D(group) % S == 0) ? S : 1
 |---|---|---|---|
 | **S0** | 删除 §7.1 中不参与运行时的死代码（`push_route.*`、base `merge_kv_blocks`、无用 include） | 零 | 四种构建配置全树编译；现有单测全绿 |
 | **S1** | 新增 L0/L1（`KvTopology` / `GroupTopology` / `KvRedundancy` / `KvLayoutIndex` / `CanonicalBlock`）与穷举单测，不改调用方 | 低 | `G∈{1,2,4,8,16,32,64}` × `TP∈{1,2,4,8}` × `CP∈{1,2}` × `S` 全枚举：(a) 每 `(h,t)` 恰一个 `c=0` 写者；(b) `N_rep == D/S_eff`；(c) `H_c·H_l == G`；(d) 负例 `TP=8,G=2,S=3` 被拒；(e) `S_eff` 与 `is_kv_split_cache_block_type` 在 GLM5-next 的 5 个组上一致（验证文档 T1/T2） |
-| **S2** | 新增 L2/L3（`PdRouteTable` / `RouteBinder` / `BufferDirectory`）；与旧计划器**并行**跑，逐边比对 | 中 | 对同构/异构配置，新边表与原 `select_sources` 的 ACTIVE 集合**逐边一致**；`S_P = S_D` 时 `RouteBinder` 输出的 `ByteRegion` 与 `bind_outgoing_regions` 逐字节一致；**GLM 5.3 flash 场景边表 golden 通过（验证文档 T3/T4）** |
-| **S2'** | host 侧 mock 端到端：真实内存 + 本地 memcpy 代替 RDMA | 低 | **验证文档 T5 八个用例全绿** —— 这是"GLM 5.3 flash 尚不支持 PD 分离"约束下的主要验收手段 |
+| **S2** | 新增 L2/L3（`PdRouteTable` / `RouteBinder` / `BufferDirectory`） | 中 | **GLM 5.3 flash 场景边表 golden 通过（验证文档 T3）**；拓扑矩阵下 `validate` 全覆盖不变量成立；T4 字节 golden（`S_P≠S_D` 双向、`explicit_offsets`、checkpoint 子单元）逐字节正确 |
+| **S2'** | host 侧 mock 端到端：真实内存 + 本地 memcpy 代替 RDMA | 低 | **验证文档 T5 全绿**（含判别性反例）—— 这是"GLM 5.3 flash 尚不支持 PD 分离"约束下的主要验收手段 |
+
+> **S2 的原定验收"与旧 `select_sources` 逐边一致、`S_P=S_D` 时与 `bind_outgoing_regions` 逐字节一致"已放弃**，原因是旧路径在目标配置下根本无法表达：MLA 走 `describe_replicated_tensor`（整行一个 span、`owner_tp_rank=0`），而 `select_sources` 的 `same_partition` + `only_static_owner` 去重在 `TP8 + DCP4` 下要么选中 0 个写者（`kv_split_rank = rank % S`，即运行时 DCP 分组）要么选中 2 个写者（fallback `rank/(world/kv)`）。旧路径支持的形状（`G ≥ TP` 且 `S=1`、`G < TP` 且 `S=1`、sequence-scoped）仍可比对，属可选补充，不构成 S2 验收。
 | **S3** | 数据面切到 `transfer(opcode)`：先切 PULL，再切 PUSH（PUSH 有 layer synchronizer，最后切） | 中 | PD 端到端字节正确；PULL/PUSH 结果一致 |
 | **S4** | 删除 D1/D2/D3 全部旧路径与 `rank_local_mapping`；`SetCachePeer` 去掉 mode/plan | 中 | 全树编译 + 单测 + 端到端 |
 | **S5** | 门禁提前（`PdTopo` → `KvTopology`）；建链只连有边的对端 | 低 | 配置矩阵负例；建链 RPC 数下降可观测 |
@@ -457,6 +470,25 @@ S <= D 且 D % S == 0       => S_eff = S
 
 **该层零非标准库依赖**，可被穷举单测完全覆盖。
 
+### S2 已完成（2026-09-18）
+
+新增 L2/L3（`xllm/core/framework/kv_cache_transfer/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `pd_route_table.{h,cpp}` | `RouteEdge`（DP 组内局部 rank）、`PdRouteTable::build`（`head_pairs ⊗ block_map`，源侧 `c==0` 去重、目的侧副本全遍历）、`PdRouteTable::validate`（逐 `(目的 rank, 源片, head)` 覆盖不变量 + 源侧唯一写者） |
+| `route_binder.{h,cpp}` | `RouteRegion`、`BufferDirectoryEntry`、`BufferDirectory`、`PeerCacheView`、`RouteBinder::bind`（规范块 → 物理字节区间，按 `t` 预分桶，`units_per_resource` 承载块内 token / checkpoint 行压缩，`explicit_offsets` 支持 XTensor） |
+| `kv_redundancy.{h,cpp}` | `GroupTopology` 增加 `full_sequence_replica`（§6.1） |
+
+配套单测（host 侧，不依赖 NPU/RDMA）：
+
+| 测试 | 结果 |
+|---|---|
+| `tests/core/framework/kv_cache_transfer/pd_route_test.cpp` | ✅ **12/12 PASSED**：T3 golden（MLA / KDA / indexer）、拓扑矩阵不变量、T4 字节 golden（汇聚、发散、`explicit_offsets`、checkpoint 子单元）、T5 mock 端到端（真实内存 + memcpy，含"远端行基点错位必须被校验抓住"的判别性反例） |
+| `tests/core/framework/kv_cache_transfer/kv_redundancy_test.cpp` | ✅ **11/11 PASSED**（新增 full-sequence-replica 用例） |
+
+边表规模口径：F3 去掉 DP 维后，目标场景的边表本体是 **MLA 4 条 / KDA 8 条**；把同一张表套到 4 个 `dst_dp` 上才是交接文档所说的 **16 / 32 条有效边**。两者都在测试中固定。
+
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 
 环境：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（cmake 3.27.9 / ninja 1.11.1 / gtest 1.14.0），
@@ -490,7 +522,7 @@ sudo docker run --rm --privileged \
 
 | 风险 | 缓解 |
 |---|---|
-| 规范坐标与现状不等价，导致静默错字节 | S2 强制"逐边 + 逐字节"比对；不等价则不进入 S3 |
+| 规范坐标与现状不等价，导致静默错字节 | S2 以 golden + mock 逐字节验证（旧路径无法表达目标配置，见 §8）；`S_eff` 侧仍用 `S_P = S_D` 的退化配置做等价锚点 |
 | 两侧独立推导边表出现分歧（实现/版本不一致） | `PdRouteTable::validate` 作为两侧互相断言；拓扑元组进 `fingerprint`，不一致直接拒链 |
 | XTensor 页映射与规范块语义冲突 | `explicit_offsets` 作为 `BufferDirectoryEntry` 的一个标志位，规范层不感知；S1/S2 单测覆盖 XTensor 形态 |
 | sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
