@@ -1138,6 +1138,113 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
   EXPECT_NE(error.find("belongs to rank 1"), std::string::npos) << error;
 }
 
+// The model-side group geometry of every role the canonical route can serve.
+// These are the declaration half of the descriptor builder, so they must agree
+// with its dispatch: the adapter cross-checks them against a real descriptor in
+// `pd_route_integration_test`.
+TEST(CacheDeclarationTest, DeclaresTheGeometryOfEverySupportedRole) {
+  CacheTensorLayoutContext context;
+  context.kv_head_count = 8;
+  context.index_head_count = 64;
+  context.linear_key_head_count = 8;
+  context.linear_value_head_count = 8;
+  context.linear_key_head_dim = 4;
+
+  struct Expectation {
+    KVCacheTensorRole::Value role;
+    bool enable_mla;
+    int32_t global_head_count;
+    bool sequence_scoped;
+    bool full_sequence_replica;
+  };
+  const std::vector<Expectation> expectations = {
+      // An MLA instance keeps one latent head per rank; a plain attention cache
+      // keeps the model's KV heads.
+      {KVCacheTensorRole::KEY, true, 1, false, false},
+      {KVCacheTensorRole::KEY, false, 8, false, false},
+      {KVCacheTensorRole::VALUE, false, 8, false, false},
+      {KVCacheTensorRole::KEY_SCALE, false, 8, false, false},
+      // The indexer pool holds one shared head and has to see the whole
+      // sequence on every rank.
+      {KVCacheTensorRole::INDEX, true, 1, false, true},
+      {KVCacheTensorRole::INDEX, false, 1, false, true},
+      {KVCacheTensorRole::INDEX_SCALE, false, 1, false, true},
+      // Recurrent state is sequence scoped and head sharded either way.
+      {KVCacheTensorRole::SSM, true, 8, true, false},
+      {KVCacheTensorRole::SSM, false, 8, true, false},
+      {KVCacheTensorRole::CONV, true, 8, true, false},
+      {KVCacheTensorRole::CONV, false, 8, true, false},
+  };
+
+  for (const Expectation& expectation : expectations) {
+    context.enable_mla = expectation.enable_mla;
+    const KVCacheTensorRole role(expectation.role);
+    GroupTopology group;
+    std::string error;
+    EXPECT_TRUE(declare_cache_group(context, role, &group, &error))
+        << role.to_string() << " (enable_mla=" << expectation.enable_mla
+        << "): " << error;
+    EXPECT_EQ(group.global_head_count, expectation.global_head_count)
+        << role.to_string();
+    EXPECT_EQ(group.sequence_scoped, expectation.sequence_scoped)
+        << role.to_string();
+    EXPECT_EQ(group.full_sequence_replica, expectation.full_sequence_replica)
+        << role.to_string();
+    // The descriptor owns the width of one head.
+    EXPECT_EQ(group.head_bytes, 0U) << role.to_string();
+  }
+}
+
+TEST(CacheDeclarationTest, RefusesRolesWhoseGeometryIsNotPinned) {
+  CacheTensorLayoutContext context;
+  context.kv_head_count = 8;
+  context.index_head_count = 64;
+  context.linear_value_head_count = 8;
+  context.linear_key_head_count = 8;
+  context.linear_key_head_dim = 4;
+
+  // A role the builder sends to the whole-resource replica: it carries no head
+  // axis, so nothing in the model says how many logical heads the group has.
+  const std::vector<KVCacheTensorRole::Value> unknown_roles = {
+      KVCacheTensorRole::WINDOW,
+      KVCacheTensorRole::SWA,
+      KVCacheTensorRole::KV_STATE,
+      KVCacheTensorRole::SCORE_STATE,
+      KVCacheTensorRole::COMPRESS_STATE,
+  };
+  for (KVCacheTensorRole::Value value : unknown_roles) {
+    const KVCacheTensorRole role(value);
+    GroupTopology group;
+    std::string error;
+    EXPECT_FALSE(declare_cache_group(context, role, &group, &error))
+        << role.to_string();
+    EXPECT_NE(error.find("no declared group geometry"), std::string::npos)
+        << error;
+  }
+
+  // The recurrent roles are only head sharded while the model declares linear
+  // heads; without them the descriptor degrades to a whole resource and the
+  // geometry is gone.
+  CacheTensorLayoutContext no_linear = context;
+  no_linear.linear_value_head_count = 0;
+  GroupTopology group;
+  std::string error;
+  EXPECT_FALSE(declare_cache_group(
+      no_linear, KVCacheTensorRole(KVCacheTensorRole::SSM), &group, &error));
+  EXPECT_NE(error.find("no declared group geometry"), std::string::npos)
+      << error;
+
+  // Without a KV head count an attention role has no head geometry either.
+  CacheTensorLayoutContext no_kv = context;
+  no_kv.kv_head_count = 0;
+  EXPECT_FALSE(declare_cache_group(
+      no_kv, KVCacheTensorRole(KVCacheTensorRole::KEY), &group, &error));
+  EXPECT_NE(error.find("no KV head count"), std::string::npos) << error;
+
+  EXPECT_FALSE(declare_cache_group(
+      context, KVCacheTensorRole(KVCacheTensorRole::KEY), nullptr, &error));
+}
+
 }  // namespace
 
 }  // namespace xllm

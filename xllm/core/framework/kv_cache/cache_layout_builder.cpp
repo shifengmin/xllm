@@ -367,13 +367,6 @@ bool describe_conv(const CacheTensorLayoutContext& context,
   return true;
 }
 
-bool is_kv_head_role(KVCacheTensorRole role) {
-  return role == KVCacheTensorRole::KEY || role == KVCacheTensorRole::VALUE ||
-         role == KVCacheTensorRole::KEY_SCALE ||
-         role == KVCacheTensorRole::VALUE_SCALE ||
-         role == KVCacheTensorRole::CACHE_SCALE;
-}
-
 }  // namespace
 
 bool describe_cache_tensor(const CacheTensorLayoutContext& context,

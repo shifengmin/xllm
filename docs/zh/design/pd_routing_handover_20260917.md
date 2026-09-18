@@ -378,8 +378,13 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
   顺带加固 `RouteBinder::bind`（拒绝不属于目的切片的块）并把 `coordinates.kv_split_rank` 与 `slice_of` 的对账
   加进适配器。容器内 **59 用例全绿**（含新增 `pd_route_transfer_test` 12/12，PUSH/PULL 双向逐字节对照模型期望），
   三个生产 TU 真实 flags 编译 rc=0。**runtime 仍未验证**（§1.3）。
-- ② 数据面**生产调用点**与 ③ 规范逻辑地址层（请求 block id ↔ 规范块）仍未接线；下一轮的入口是把上面
-  （a）（b）两项输入补齐后打开 `canonical`，并把集成测试改走统一入口。
+- ② 数据面**生产调用点**与 ③ 规范逻辑地址层（请求 block id ↔ 规范块）仍未接线；**第 8 轮已把生产侧声明输入做完**
+  （`declare_cache_group`，映射表与依据见工作日志第 8 轮；集成测试改用该函数造声明，于是适配器成了声明的 oracle，
+  容器内 61 用例全绿），并把剩下的接法定案：对端 manifest 需要一个 getter（在
+  `MooncakeTransferEngine::cache_peers_`）、对端拓扑取自 manifest 的 `ParallelCoordinates`、
+  `InstanceInfo.addrs` 要按对端 `cp*tp` 把"全局 rank 下标"换算成 `RoutePeer.addrs` 需要的"DP 组内局部 rank 下标"；
+  请求的 `local_ids` 是**本 rank 物理行号**，不同族的 `split` 不同，需按族换算成规范块后取**并集**再交给 `plan()`
+  （`plan` 内部按 `block % split == slice` 过滤，故并集安全）。
 
 **下一个会话的第一件事（建议顺序）**：
 

@@ -15,8 +15,8 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7 轮**：入口 + F8 表缓存 + 开关已落地，59 用例全绿；**生产调用点未接**（原因见第 7 轮） |
-| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **切片契约已修正**（第 6 轮：C3 + `KvLayoutIndex` = `dcp_rank`，47 用例全绿）；地址层与请求 block id 换算未接线（与 S3-4 一起） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~8 轮**：入口 + F8 表缓存 + 开关 + **生产声明映射**已落地，61 用例全绿；生产调用点未接（缺对端视图与并集换算，接法已定案，见第 8 轮） |
+| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **切片契约已修正**（第 6 轮：C3 + `KvLayoutIndex` = `dcp_rank`，61 用例全绿）；地址层与请求 block id 换算未接线（**第 8 轮定了并集接法**） |
 
 ## 1. 硬约束（每轮先读，别再试错）
 
@@ -422,3 +422,83 @@ id 单独寻址缓冲（生产里 Mooncake 按注册顺序给全局唯一 id）�
 - `bind` 的 `local_rank` 守卫仍只覆盖 MAIN（SPEC_DRAFT 视图 `local_rank == -1`）；
   `plan` 用"同族只有一个未命名视图才接受"来兜底，多于一个直接报错。
 
+
+### 2026-09-18（第 8 轮）——S3-4 输入 (a)：**生产侧的 role → 组几何声明**，61 用例全绿
+
+上一轮列出生产接线缺两项输入。本轮把 **(a) 本侧声明** 做完并验证；**(b) 对端视图** 的接法也已定案（见下）。
+
+**新增**：`declare_cache_group(const CacheTensorLayoutContext&, KVCacheTensorRole, GroupTopology*, std::string*)`
+（放在 `cache_directory.{h,cpp}`，**不依赖 torch**）。它是 `describe_cache_tensor` 的"声明半边"：
+描述符说一个 rank 的字节怎么排，它说这个组暴露几个逻辑 head、有没有块维度、是否全序列留在每个 rank。
+两者由同一个 role + 同一份 layout context 推出，所以布局改了必须同时改。
+
+| role（按 `describe_cache_tensor` 的分支镜像） | `global_head_count` | `sequence_scoped` | `full_sequence_replica` |
+|---|---|---|---|
+| `is_kv_head_role`（KEY/VALUE/KEY_SCALE/VALUE_SCALE/CACHE_SCALE）且 `kv_head_count > 0` | `enable_mla ? 1 : kv_head_count` | false | false |
+| INDEX / INDEX_SCALE | 1 | false | **true** |
+| SSM（且 `linear_value_head_count > 0`） | `linear_value_head_count` | true | false |
+| CONV（且两个 linear 计数都 > 0） | `linear_value_head_count` | true | false |
+| 其它（WINDOW/SWA/KV_STATE/SCORE_STATE/COMPRESS_* 等无 head 轴者） | **报错拒绝** | — | — |
+
+三条本轮查证的依据（都不是猜的）：
+
+1. **MLA 下 KV 组的 `G` 必须是 1**：`enable_mla` 时 builder 走 `describe_replicated_tensor`（整资源、无 head 轴），
+   适配器要求 `H_l == 1`；`G=1` 给出 `D_tp = tp`、`Hc = 1`，正是第 6 轮 `DerivesTheGlm53FlashPilotScenario`
+   钉住的契约（`slice == cp`、写者 `local_rank = 8*cp`）。若错用 `G = kv_head_count`，`D_tp` 变 1、`Hc` 变 8，
+   写者会变成 `(cp=t, tp=h)` —— 路由**完全不同**且不会报错，所以这一条必须由声明钉死。
+2. **INDEX_SCALE 与 INDEX 同宽**：`KVCacheShape::init_index_cache_scale_shape()` 直接用
+   `(*index_cache_shape_)[0]` 作行数（`kv_cache_shape.cpp:406-414`），而 `init_index_cache_shape()` 在
+   `supports_dsa_indexer_cache_sharding() && kv_split_size_effective() > 1` 时把行数乘上 `kv_split`
+   （同文件 387-404）。⇒ 实测的 `26052 = 6513 × 4` 表示 index 持有**全部规范块**（`S_eff = 1`）⇒
+   `full_sequence_replica = true` 对 INDEX **和** INDEX_SCALE 都成立。
+3. **SSM/CONV 的 `G` 在 MLA 与非 MLA 下相同**（`linear_value_head_count`）：builder 的 MLA 分支只改描述符
+   *种类*，不改组的 head 语义；整资源形态下 `head_begin = tp_rank / tp_redundancy`，只有 `G = linear_value_head_count`
+   才能让每个 rank 认领自己的那个 head（`G=1` 会让所有 rank 都宣称 head 0 ⇒ 静默错路由）。
+
+**两条安全性说明**（写进函数注释）：
+
+- **反向错误会响**：把实际被切分的 index 池声明成 `full_sequence_replica` 时，目的缓冲的行数不够，
+  `bind` 会在"映射到物理行超出缓冲"处失败 —— 是响亮的失败，不是静默错字节。反过来（把全序列的声明成切分）
+  没有任何检查能抓，所以默认取 `true` 是安全方向。若某平台的 `supports_dsa_indexer_cache_sharding()` 为假，
+  canonical 会在此处**响亮失败**而不是搬错行；该平台需要另行声明，已记录为已知限制。
+- **非 MLA 的 CONV** 是 COMPOSITE 描述符，canonical **按设计拒绝**（第 3/4 轮结论）。声明照给，
+  好让那句拒绝只存在于适配器一处。
+
+**顺带**：`is_kv_head_role` 从 `cache_layout_builder.cpp` 的匿名命名空间搬到 `kv_cache_tensor_role.h`
+（`inline`），builder 与新声明共用一份，杜绝两处漂移。
+
+**验证**（关键：让**适配器**当声明的 oracle，而不是手写期望）：
+
+- `cache_directory_test` 新增 2 个用例（共 **21/21**）：11 组 `(role, enable_mla)` 的字段级期望 +
+  拒绝路径（5 个无 head 轴的 role、`linear_value_head_count == 0` 的 SSM、`kv_head_count == 0` 的 KEY、空输出指针）。
+- `pd_route_integration_test` **把声明换成生产函数** `declare_cache_group`（夹具只再提供拓扑与命名空间）：
+  于是"真实张量 → 真实 `describe_cache_tensor` → `PeerDirectory::describe` 接受"这一步就成了对**生产声明映射**的
+  校验。4 个场景（MLA 与非 MLA × 4 个 role）继续逐字节全绿，搬运量与第 7 轮逐位相同
+  （`9437184 / 16842752 / 8192 / 6144`）。
+- 容器内总计 **61 用例全绿**：`kv_redundancy_test` 12、`pd_route_test` 12、`cache_directory_test` 21、
+  `pd_route_transfer_test` 12、`pd_route_integration_test` 4。
+- 生产 TU 真实 flags 编译：`kv_cache_transfer.cpp`、`mooncake_kv_cache_transfer.cpp`、`disagg_pd_config.cpp`、
+  **`cache_layout_builder.cpp`** 全部 rc=0。
+
+**输入 (b) 对端视图——接法已定案（下一轮执行）**：
+
+1. 注册期：`get_mooncake_tensors(cache)` 给出 `(role, group_id, sequence_scoped)`，`pending_registration_context_`
+   给出 `CacheTensorLayoutContext` 与拓扑 ⇒ 用 `declare_cache_group` 造 `CacheTensorDeclaration` 列表，
+   与本侧 manifest 一起交给 `PeerDirectory::describe` ⇒ **本侧视图**（顺便对账 manifest，第 3 轮的适配器就是干这个的）。
+2. 传输期：对端 manifest 在 `MooncakeTransferEngine::cache_peers_[addr].destination_manifest`
+   （由 `SetCachePeer` 写入）—— 需要一个 getter；对端**拓扑**从 manifest 的 `ParallelCoordinates` 取
+   （`InstanceInfo` 只有 `dp_size`/`kv_split_size`，没有 `cp_size`）。
+3. `RoutePeer.addrs` 的下标是**对端 DP 组内的局部 rank**，而 `InstanceInfo.addrs` 是按对端的**全局** rank
+   （`dp*(cp*tp) + local`）排的 ⇒ 要按对端 `cp_size*tp_size` 做一次下标的换算，不能直接照搬。
+
+**新发现的 S3-5 设计缺口（本轮定案，未写码）**：`plan()` 目前只接受**一份** `canonical_blocks`，但请求在
+生产里是按 group 给的**本 rank 物理行号**（`KVTransferMapping.local_ids`），而同一个 group 内不同族的
+`split` 不同（KEY `S_eff=4` vs INDEX `S_eff=1`），同一条规范块在不同族的行号不同。接法是：
+
+- 调用方对请求里的每个族把行号换算成规范块（`CanonicalBlock(tokens_per_block, split_f).canonical_of_row(row, slice_f)`），
+  再对同一 group 的各族取**并集**传给 `plan()`；`plan` 内部本来就按 `block % split == slice` 过滤，所以并集安全，
+  且完备性检查仍逐族成立（INDEX 的并集最大，恰好覆盖 KEY 需要的全部块）。
+- 校验点：`split`/`slice` 只能来自**声明**（不能被目的端反推），这正是第 3 轮"块身份不在 manifest 里"的直接后果。
+
+**仍未做**：上面的 (b)+并集换算的代码、`ContextParallelTopology` 本体 oracle、`MixedLayers`/`DpExpansion`/
+XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash 不支持 PD 分离，§1.3）。

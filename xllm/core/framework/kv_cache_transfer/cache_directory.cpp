@@ -453,6 +453,76 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
 
 }  // namespace
 
+bool declare_cache_group(const CacheTensorLayoutContext& context,
+                         KVCacheTensorRole role,
+                         GroupTopology* group,
+                         std::string* error) {
+  if (group == nullptr) {
+    set_error(error, "group geometry output must not be null");
+    return false;
+  }
+  const std::string role_name(role.to_string());
+
+  // Mirrors the dispatch order of describe_cache_tensor(): the attention roles
+  // first, then the indexer, then the recurrent state.
+  if (is_kv_head_role(role)) {
+    if (context.kv_head_count <= 0) {
+      set_error(
+          error,
+          "role " + role_name +
+              ": the model declares no KV head count, so the group has no "
+              "head geometry to route");
+      return false;
+    }
+    // An MLA instance describes these tensors as one whole resource, which
+    // holds a single latent head: `local_heads` has to stay 1 for the binder to
+    // place it.
+    group->global_head_count =
+        context.enable_mla ? 1 : static_cast<int32_t>(context.kv_head_count);
+    group->sequence_scoped = false;
+    group->full_sequence_replica = false;
+    return true;
+  }
+
+  if (role == KVCacheTensorRole::INDEX ||
+      role == KVCacheTensorRole::INDEX_SCALE) {
+    // describe_attention_heads(global_head_count=1): the cached key is one
+    // shared logical head on every rank.
+    group->global_head_count = 1;
+    group->sequence_scoped = false;
+    group->full_sequence_replica = true;
+    return true;
+  }
+
+  if (role == KVCacheTensorRole::SSM && context.linear_value_head_count > 0) {
+    group->global_head_count =
+        static_cast<int32_t>(context.linear_value_head_count);
+    group->sequence_scoped = true;
+    group->full_sequence_replica = false;
+    return true;
+  }
+
+  if (role == KVCacheTensorRole::CONV && context.linear_key_head_count > 0 &&
+      context.linear_value_head_count > 0) {
+    // Without MLA this role publishes a composite descriptor, which the
+    // canonical route refuses on purpose (see describe_tensor). Declaring the
+    // geometry anyway keeps that refusal in one place.
+    group->global_head_count =
+        static_cast<int32_t>(context.linear_value_head_count);
+    group->sequence_scoped = true;
+    group->full_sequence_replica = false;
+    return true;
+  }
+
+  set_error(
+      error,
+      "role " + role_name +
+          ": this role has no declared group geometry, so the canonical "
+          "route cannot serve it; either declare its head count and scope "
+          "or keep the family on the legacy planner");
+  return false;
+}
+
 bool PeerDirectory::describe(
     const WorkerCacheLayoutManifest& manifest,
     const std::vector<CacheTensorDeclaration>& declarations,
