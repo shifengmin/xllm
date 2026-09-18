@@ -100,11 +100,14 @@ void set_coordinates(WorkerCacheLayoutManifest* manifest,
   manifest->coordinates.tp_size = tp_size;
   manifest->coordinates.cp_rank = cp_rank;
   manifest->coordinates.cp_size = cp_size;
-  // The runtime publishes its DCP rank here. Nothing in the directory reads it:
-  // the sequence slice of a rank is derived from the topology (see
-  // KvLayoutIndex::slice_of).
+  // The runtime publishes its DCP rank here, so the fixture has to publish the
+  // rank the runtime would: ContextParallelTopology places a split that divides
+  // cp_size as one group per CP slice, and a split that spans the whole
+  // DP-local domain as one rank per slice.
   manifest->coordinates.kv_split_rank =
-      (cp_rank * tp_size + tp_rank) % kv_split_size;
+      kv_split_size <= cp_size && cp_size % kv_split_size == 0
+          ? cp_rank / (cp_size / kv_split_size)
+          : cp_rank * tp_size + tp_rank;
   manifest->coordinates.kv_split_size = kv_split_size;
   manifest->layout_family = "token_head_dim";
   manifest->backend = "npu";

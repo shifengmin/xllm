@@ -329,6 +329,30 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
     return false;
   }
 
+  // The slice a rank physically holds is its runtime DCP rank, and the manifest
+  // publishes that rank in its coordinates. A group whose effective split is
+  // the configured one therefore has to agree with the coordinates exactly: the
+  // route places canonical blocks by slice while the runtime places them by DCP
+  // rank, and the two only line up when this holds. A group that keeps the
+  // whole sequence (split 1) has no slice to disagree about.
+  if (tensor.cache_namespace == CacheNamespace::MAIN &&
+      redundancy.split() == std::max(declaration.topology.kv_split_size, 1)) {
+    const KvLayoutIndex index(declaration.topology, redundancy);
+    const int32_t slice = index.slice_of(manifest.coordinates.cp_rank,
+                                         manifest.coordinates.tp_rank);
+    if (slice != manifest.coordinates.kv_split_rank) {
+      set_error(error,
+                id + ": rank (cp " +
+                    std::to_string(manifest.coordinates.cp_rank) + ", tp " +
+                    std::to_string(manifest.coordinates.tp_rank) +
+                    ") holds sequence slice " + std::to_string(slice) +
+                    " but publishes DCP rank " +
+                    std::to_string(manifest.coordinates.kv_split_rank) +
+                    "; the split is not placed where the runtime places it");
+      return false;
+    }
+  }
+
   uint64_t units = 0;
   if (sequence_scoped) {
     // One resource is one sequence slot, holding `physical_rows_per_resource`

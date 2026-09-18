@@ -51,7 +51,8 @@ class DisaggPDConfig final {
          "disagg_pd_port",
          "instance_role",
          "kv_cache_transfer_mode",
-         "transfer_listen_port"}};
+         "transfer_listen_port",
+         "pd_route"}};
     return kOptionCategory;
   }
 
@@ -66,6 +67,12 @@ class DisaggPDConfig final {
   PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
 
   PROPERTY(int32_t, transfer_listen_port) = 26000;
+
+  // Which data plane moves the KV cache: `legacy` (the rank-aligned strided
+  // remap) or `canonical` (the route tables derived from both peer layouts).
+  // The value is parsed where it is consumed, so a typo fails before any
+  // transfer starts instead of silently selecting one of the two.
+  PROPERTY(std::string, pd_route) = "legacy";
 
   PROPERTY(bool, kv_push_dst_rotate) = false;
 };

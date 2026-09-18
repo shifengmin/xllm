@@ -45,6 +45,12 @@ DEFINE_string(kv_cache_transfer_mode,
 
 DEFINE_int32(transfer_listen_port, 26000, "The KVCacheTranfer listen port.");
 
+DEFINE_string(pd_route,
+              "legacy",
+              "Which data plane moves the KV cache between P and D: `legacy` "
+              "remaps destination blocks by kv-split rank, `canonical` derives "
+              "them from the two peers' cache layouts.");
+
 DEFINE_bool(kv_push_dst_rotate,
             false,
             "Rotate the dst-worker traversal order in push_kv_blocks per "
@@ -59,6 +65,7 @@ void DisaggPDConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(instance_role);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_cache_transfer_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(transfer_listen_port);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(pd_route);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_push_dst_rotate);
 }
 
@@ -70,6 +77,7 @@ void DisaggPDConfig::from_json(const JsonReader& json) {
   // need to assign it from json XLLM_CONFIG_ASSIGN_FROM_JSON(instance_role);
   XLLM_CONFIG_ASSIGN_FROM_JSON(kv_cache_transfer_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(transfer_listen_port);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(pd_route);
 }
 
 void DisaggPDConfig::append_config_json(
@@ -88,6 +96,8 @@ void DisaggPDConfig::append_config_json(
       config_json, default_config, kv_cache_transfer_mode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, transfer_listen_port);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, pd_route);
 }
 
 DisaggPDConfig& DisaggPDConfig::get_instance() {

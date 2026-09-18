@@ -24,7 +24,9 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#include "core/framework/config/disagg_pd_config.h"
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
+#include "framework/kv_cache_transfer/pd_route_transfer.h"
 #endif
 
 namespace xllm {
@@ -273,7 +275,31 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
   int32_t device_id = device.index();
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
-  LOG(INFO) << "Create Mooncake KVCacheTransfer.";
+  // The requested data plane is resolved once, here, and never falls back: a
+  // value that names neither path is a typo, and a path that cannot serve the
+  // configured topology has to fail instead of quietly moving bytes the way the
+  // other one would.
+  const std::string& pd_route = DisaggPDConfig::get_instance().pd_route();
+  PdRouteMode route_mode = PdRouteMode::LEGACY;
+  if (!parse_pd_route_mode(pd_route, &route_mode)) {
+    LOG(FATAL) << "Unsupported pd_route value: " << pd_route << ", expected `"
+               << pd_route_mode_name(PdRouteMode::LEGACY) << "` or `"
+               << pd_route_mode_name(PdRouteMode::CANONICAL) << "`.";
+  }
+  if (route_mode == PdRouteMode::CANONICAL) {
+    // The canonical planner and its host verification exist, but the data plane
+    // still reaches the peers through the legacy plan negotiation, which does
+    // not publish the cache views (or the group geometry) the canonical route
+    // is derived from. Refusing here keeps `canonical` from silently behaving
+    // like `legacy`.
+    LOG(FATAL) << "pd_route=canonical is not wired into the transfer path yet: "
+                  "the canonical route needs the peer cache views and the "
+                  "model-side group declarations, which the transfer path does "
+                  "not publish yet. Use pd_route=legacy.";
+  }
+
+  LOG(INFO) << "Create Mooncake KVCacheTransfer, pd_route="
+            << pd_route_mode_name(route_mode) << ".";
   std::shared_ptr<MooncakeKVCacheTransferBase> mooncake_transfer;
 #if defined(USE_NPU)
   if (::xllm::KVCacheConfig::get_instance().enable_xtensor()) {

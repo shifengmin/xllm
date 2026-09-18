@@ -580,6 +580,53 @@ S2 原先的 `slice_of` 公式是另一套分组。证据、正确的两分支�
 > 容器内 47 个用例全绿。**仍未做**：把 `ContextParallelTopology` 本体链进单测做运行时 oracle（需给手编
 > harness 加 glog），以及数据面的"请求 block id ↔ 规范块"换算（与 S3-4 一起）。
 
+### S3-4 已落地（2026-09-18，第 7 轮）：统一入口 + 开关，生产调用点待接
+
+`xllm/core/framework/kv_cache_transfer/pd_route_transfer.{h,cpp}`：
+
+```cpp
+enum class RouteOpcode { PULL, PUSH };          // PULL = READ 取向，PUSH = WRITE 取向
+struct RoutePeer { addrs; views; };             // 对端实例：rank → 地址 + 该实例公布的视图
+struct RouteLeg  { opcode; local_rank; peer_local_rank; peer_addr; regions; };
+class  PdRouteCache { find_or_build(...); };    // 按两侧 (拓扑, 组) 缓存边表（F8）
+class  PdRouteTransfer {
+  static bool plan(cache, opcode, local_rank, canonical_blocks, local, peer, legs, error);
+  static bool transfer(..., const MoveFn& move, ...);   // plan + apply，数据面唯一入口
+};
+```
+
+设计要点：
+
+1. **`RouteLeg` = 一条腿 = 一对 (writer rank, reader rank)**，`regions` 已按 opcode 取向排好，调用方直接交给
+   `move_memory_regions(peer_addr, regions, READ|WRITE)`（`RouteRegion` 与 `ByteRegion` 字段完全一致）。
+   **因此 `filter_kv_split_infos` / `rotate_dst_rank` 那套"S==TP、rank 1:1 对齐"的隐含前提在 canonical 路径上
+   不再存在**：一条目的腿的写者来自边表（每个 `(head class, source slice)` 的唯一副本 0 rank），
+   写者的一条腿的读者来自"目的副本全遍历"，两端切片宽度可以不同。
+2. **PULL 与 PUSH 是同一对区间，只换两半的归属**（`RouteBinder` 恒 destination-last）。这样两个方向可以
+   互相核对，而不是各自被相信 —— 单测即按此跑两遍再逐字节比对。
+3. **腿的枚举由边表驱动**，不由两侧视图的笛卡尔积驱动（后者会包含 head class 不相交的假配对）。
+4. **完整性检查**：读侧必须拿到自己切片的每个块；写侧的冗余副本 rank 必须一条腿都不产生。
+5. `PdRouteCache` 在校验失败时**不**写入缓存，`find_or_build` 首次即跑 `PdRouteTable::validate`。
+
+**顺带加固**：`RouteBinder::bind` 现在拒绝"不属于目的 rank 切片的规范块"。此前若调用方分组错误，块会被写进
+错 rank 的缓冲（`remote_row = block / S_D` 默认块属于该 rank），属静默错字节。
+
+**顺带对账**（关闭 §8.1 S3-2 的未决项）：`PeerDirectory::describe` 在 MAIN 且本组 `S_eff == 配置 split` 时，
+要求 `KvLayoutIndex::slice_of(cp,tp)` 等于 manifest 公布的 `coordinates.kv_split_rank`。测试 fixture 里原先那条
+`(cp*tp+tp) % S` 的占位公式正是 S2 那套错分组，已按运行时两分支公式改正 —— 这条对账在夹具上**立刻**抓出了
+4 个用例的不一致，证明它不是空转。
+
+**开关**：`--pd_route=legacy|canonical`（默认 `legacy`，已注册进 `DisaggPDConfig::option_category`），工厂里解析；
+非法值 `LOG(FATAL)`，`canonical` 目前**显式拒绝**并说明缺的输入（见工作日志第 7 轮）：本侧声明
+（role → 组几何的生产映射尚未存在）与对端视图 / `cp_size` / DP 局部 rank 换算。**不做静默回落**。
+
+**验证**（容器内 host）：`kv_redundancy_test` 12/12、`pd_route_test` 12/12、`cache_directory_test` 19/19、
+`pd_route_transfer_test` 12/12、`pd_route_integration_test` 4/4 = **59 用例全绿**；
+生产 TU（`kv_cache_transfer.cpp` / `mooncake_kv_cache_transfer.cpp` / `disagg_pd_config.cpp`）真实 flags 编译 rc=0。
+
+**仍未做**：生产调用点接线（上面那两项输入）、集成测试改走统一入口、`ContextParallelTopology` 本体 oracle、
+`MixedLayers` / `DpExpansion` / XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash 不支持 PD 分离）。
+
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 
 环境：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（cmake 3.27.9 / ninja 1.11.1 / gtest 1.14.0），
@@ -617,9 +664,9 @@ sudo docker run --rm --privileged \
 | 两侧独立推导边表出现分歧（实现/版本不一致） | `PdRouteTable::validate` 作为两侧互相断言；拓扑元组进 `fingerprint`，不一致直接拒链 |
 | XTensor 页映射与规范块语义冲突 | `explicit_offsets` 作为 `BufferDirectoryEntry` 的一个标志位，规范层不感知；S1/S2 单测覆盖 XTensor 形态 |
 | sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
-| COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2/S3-3） | 只在非 MLA 实例可达（`enable_mla == false`）；适配器显式拒绝而非静默降级。S3-4 决定"COMPOSITE 走旧 planner"还是"边表/视图增加 per-component 字节偏移" |
+| COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2/S3-3） | 只在非 MLA 实例可达（`enable_mla == false`）；适配器显式拒绝而非静默降级。**S3-4 的决定（第 7 轮）：COMPOSITE 组留在旧 planner**，不给 `RouteEdge` / `PeerCacheView` 增加 per-component 字节偏移 —— 代价是 canonical 路径只覆盖 MLA 实例与不含 CONV 的组，收益是不把"component 局部 head 空间"这一维度塞进边表（它会让 `head_begin` / `head_end` 变成二维语义） |
 | MLA 实例下的 SSM/CONV 是整资源 span，只有 `H_l == 1` 时可路由 | 适配器按 `H_l == 1` 准入并从 rank 取 head 身份；`H_l > 1` 时报错要求 producer 改成每 head 一个 span（GLM5-next `TP8` + `linear_*_head_count = 8` 落在 `H_l == 1`） |
-| 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | **已确认不一致**（`slice` 必须是 `ContextParallelTopology::dcp_rank`，见 §8.1 "S3-5 的前置修正"）。修 C3 + `KvLayoutIndex` 之前不得开始 ② 数据面接线，否则静默搬错块 |
+| 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | **已修复并加了运行时对账**（第 6 轮修 `slice_of` = `dcp_rank`；第 7 轮 `PeerDirectory::describe` 在 `S_eff == 配置 split` 时要求 `slice_of(cp,tp) == coordinates.kv_split_rank`）。夹具里原有的占位公式被这条对账立刻抓出 4 处不一致 |
 | 建链收敛后，运行期新增对端无法建链 | 保留 on-demand 建链路径：`PdRouteTable` 可在运行期对新的拓扑元组补算边表 |
 
 **回退点**：S0 / S1 完全独立可回退；S2 是纯新增并行路径；S3 起才切换行为，切换前保留旧路径的编译开关（`--pd_route=legacy|canonical`）以便灰度与快速回退。

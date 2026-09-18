@@ -354,6 +354,21 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
         buckets[static_cast<size_t>(edge.src_slice)];
     for (size_t block_index : bucket) {
       const int64_t block = canonical_blocks[block_index];
+      // Which slice a block belongs to on the destination side is the one
+      // thing the caller has to get right: `remote_row` below is the row this
+      // rank holds it in, so a block of another slice would be written into
+      // this rank's buffer and never reach the rank that owns it. The route
+      // derives the destination slice from the block, so a mismatch is a bug in
+      // the caller, not a shape the binder can absorb.
+      if (block % remote_split != edge.dst_slice) {
+        set_error(error,
+                  "canonical block " + std::to_string(block) +
+                      " belongs to destination slice " +
+                      std::to_string(block % remote_split) + ", not slice " +
+                      std::to_string(edge.dst_slice) + " of destination rank " +
+                      std::to_string(dst_local_rank));
+        return false;
+      }
       const uint64_t local_row =
           static_cast<uint64_t>(block) / static_cast<uint64_t>(local_split);
       const uint64_t remote_row =

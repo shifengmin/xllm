@@ -15,7 +15,7 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ☐ |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7 轮**：入口 + F8 表缓存 + 开关已落地，59 用例全绿；**生产调用点未接**（原因见第 7 轮） |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **切片契约已修正**（第 6 轮：C3 + `KvLayoutIndex` = `dcp_rank`，47 用例全绿）；地址层与请求 block id 换算未接线（与 S3-4 一起） |
 
 ## 1. 硬约束（每轮先读，别再试错）
@@ -357,4 +357,63 @@ MLA 组（`G=1`）：`D_tp = 8`、`D = cp*D_tp = 32`、`N_rep = 8`。S2 模型�
 - **S3-5 的"规范逻辑地址层"其余部分未接线**：`logical_offset` 走规范块坐标、请求 block id ↔ 规范块的换算
   （`KVShardLayout::globalize/localize`）还没有进入数据面 —— 与 S3-4 一起做。
 - S3-4 的开关（`--pd_route=legacy|canonical`，默认 legacy）与统一 `transfer(opcode)` 入口未开始。
+
+### 2026-09-18（第 7 轮）——S3-4 的入口落地：`PdRouteTransfer` + `--pd_route`，59 用例全绿
+
+**新增/改动文件**：
+
+| 文件 | 内容 |
+|---|---|
+| `xllm/core/framework/kv_cache_transfer/pd_route_transfer.{h,cpp}` | **新增**：`PdRouteMode`（`legacy`/`canonical` + 解析）、`RouteOpcode`（PULL/PUSH）、`RoutePeer`（对端实例的 addrs + 视图）、`RouteLeg`（一条 (writer rank, reader rank) 腿，含传输就绪的 `RouteRegion`）、`PdRouteCache`（按两侧形状缓存边表，F8）、`PdRouteTransfer::plan/transfer/apply` |
+| `route_binder.cpp` | **加固**：`bind` 现在校验"传入的规范块确实属于目的 rank 的切片"。此前若调用方分组错误，块会被静默写进错 rank 的缓冲（`remote_row = block / S_D` 假定块属于该 rank） |
+| `cache_directory.cpp` | **对账**（关闭第 3 轮遗留项）：MAIN 且本组 `S_eff == 配置 split` 时，`KvLayoutIndex::slice_of(cp,tp)` 必须等于 manifest 公布的 `coordinates.kv_split_rank`（= 运行时 DCP rank）。`S_eff == 1` 的组没有切片可分，跳过 |
+| `config/disagg_pd_config.{h,cpp}` | `--pd_route`（默认 `legacy`，注册进 `option_category`，flag/json/回写三处齐全） |
+| `kv_cache_transfer.cpp` | 工厂里解析并校验 `--pd_route`；非法值 `LOG(FATAL)`（不猜、不回落）；`canonical` 目前显式拒绝并说明缺什么（见下） |
+| `tests/.../pd_route_transfer_test.cpp` | **新增 12 用例**；`cache_directory_test.cpp` / `pd_route_integration_test.cpp` 的 fixture 改按真实 DCP 公式公布 `kv_split_rank` |
+
+**两个方向同时验证（这是本轮最关键的判别性设计）**：每个场景都跑两遍 —— 从 writer 侧每个 rank 各 `transfer(PUSH)` 一次，从 reader 侧每个 rank 各 `transfer(PULL)` 一次 —— 然后
+
+1. 两份目的侧内存都必须等于**独立期望值**；
+2. 两份目的侧内存必须彼此逐字节相等。
+
+期望值只由模型（`KvLayoutIndex` + `writer_of` + `CanonicalBlock`）与两侧声明的几何推出，**从不看边表或 region**，
+所以"选错 rank / 错切片 / 错 head / 错子单元"都会被抓到。PUSH/PULL 相等这条则把 `RouteBinder` 的
+"destination-last（`local` = writer）"取向与 `move_memory_regions` 的 READ/WRITE 取向钉在一起：
+PULL 的 region 就是同一对区间把两半**对调**，不是重新推导。
+
+场景（`cp4` 为 DCP 合法形状的前提）：等价锚点 `kv4→kv4`、收拢 `kv4→kv2`、发散 `kv2→kv4`、
+非 MLA 头分片 `cp4/tp8/kv4 → cp4/tp4/kv2`；每个都带一个 sequence-scoped family（checkpoint 子单元）。
+外加：单 writer 扇出到 8 个 tp 副本的腿数 golden、PULL 的多写者选择、副本 rank 不推（且不是错误）、
+表缓存复用（同形状 1 张表、换形状 2 张表）、非递增/负块号报错、对端缺视图报错、传输失败即失败、
+"另一目的切片的块"被 `bind` 拒绝、开关解析拒绝大小写/空串。
+
+**验证**（容器内，`~/pdroute_tools/s2_host_test.py`）：`kv_redundancy_test` 12/12、`pd_route_test` 12/12、
+`cache_directory_test` 19/19、`pd_route_transfer_test` 12/12、`pd_route_integration_test` 4/4 —— **59 用例全绿**。
+生产 TU 编译（S3-0 的 shim + 真实 flags，`-fsyntax-only`）：`kv_cache_transfer.cpp`、`mooncake_kv_cache_transfer.cpp`、
+`disagg_pd_config.cpp` **全部 rc=0**，即新增头文件与配置项在真实 include 环境下编得过。
+
+**为什么生产调用点还没接（诚实记录）**：canonical 路线要的输入，数据面现在拿不到：
+
+1. **本侧声明**（每个 `(namespace, role, group)` 的 `global_head_count` / `sequence_scoped` /
+   `full_sequence_replica`）。`configure_cache_layout` 有 `ModelArgs` + `ParallelArgs`，
+   `publish_cache_layout` 有全部张量的 role/group，但**role → 组几何**的映射目前只存在于
+   `pd_route_integration_test.cpp` 的手写 fixture 里，生产侧没有这个函数。写错它 = 静默搬错块，
+   而它无法在本轮验证（GLM5.3flash 不支持 PD 分离，见 §1.3）。
+2. **对端视图**：对端 manifest 有（`MooncakeTransferEngine::cache_peers_` 的 `destination_manifest`），
+   但 `TransferKVInfo.remote_instance_info` 只给 `dp_size` / `kv_split_size` / `addrs` / `cluster_ids`，
+   不含 `cp_size`、不含各 rank 的视图；`addrs` 的下标语义是"对端实例内的**全局** rank"
+   （`dp*(cp*tp) + local`），要靠对端 manifest 的 `coordinates` 才能换算成 DP 组内局部 rank。
+3. `RouteRegion` → `ByteRegion` 是**逐字段拷贝**（两者字段完全一致），这层已经是 1:1 的；
+   `RouteLeg` 已经按 `peer_addr` + opcode 组织好，接上就是 `move_memory_regions(addr, regions, opcode)`。
+
+⇒ 因此本轮把开关接成"要么 legacy、要么**显式拒绝**"，而不是让它静默退化成 legacy（那种回落会让人以为
+canonical 已经生效）。下一轮把这些输入补齐后再打开 `canonical`。
+
+**其它可做的增强（未做）**：
+- 把 `ContextParallelTopology` 本体链进单测当运行时 oracle（harness 需要加 glog 链接），
+  现在用的是"C3 + 显式断言 `slice == cp` / `== tp`"。
+- 集成测试改走 `PdRouteTransfer::transfer`（现在是直接调 `RouteBinder::bind`），
+  即把"真实张量 → manifest → 适配器 → **统一入口** → memcpy"整条链也覆盖一遍。
+- `bind` 的 `local_rank` 守卫仍只覆盖 MAIN（SPEC_DRAFT 视图 `local_rank == -1`）；
+  `plan` 用"同族只有一个未命名视图才接受"来兜底，多于一个直接报错。
 

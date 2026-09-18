@@ -75,6 +75,19 @@ cc_library(
 
 cc_library(
   NAME
+    pd_route_transfer
+  HDRS
+    pd_route_transfer.h
+  SRCS
+    pd_route_transfer.cpp
+  DEPS
+    :kv_redundancy
+    :pd_route_table
+    :route_binder
+)
+
+cc_library(
+  NAME
     pd_topology_guard
   HDRS
     pd_topology_guard.h
