@@ -50,6 +50,13 @@ struct GroupTopology {
   // Sequence-scoped groups (SSM / CONV / LINEAR / EMBEDDING slots) have no
   // block dimension: the sequence slice index is always 0 for them.
   bool sequence_scoped = false;
+  // Block-scoped groups that nevertheless keep the whole sequence on every
+  // rank. The DSA indexer pool is the example: its top-k selection reads
+  // historical gate/valid values from the whole sequence, so the pool is
+  // replicated per rank even though a redundancy budget exists. This is
+  // declared rather than derived because the reason is semantic (what the
+  // kernel must read), not a property of the redundancy.
+  bool full_sequence_replica = false;
 };
 
 // KV redundancy derived from one instance topology plus one group geometry.
@@ -73,8 +80,9 @@ class KvRedundancy final {
   // C2: 1 <= S_eff <= D, and S_eff divides D
   //
   // S_eff equals the configured kv_split_size when this group's redundancy can
-  // absorb it. It is 1 -- every rank keeps the whole sequence -- in exactly two
-  // cases: the group is sequence scoped (no block dimension to split), or its
+  // absorb it. It is 1 -- every rank keeps the whole sequence -- in exactly
+  // three cases: the group is sequence scoped (no block dimension to split), it
+  // is declared as a full-sequence replica (see GroupTopology), or its
   // redundancy is 1 (nothing to remove). Any other mismatch between the
   // configured split and the group redundancy fails instead of degrading
   // silently. Returns false and fills `error` on violation.
@@ -90,6 +98,7 @@ class KvRedundancy final {
   int32_t split() const { return split_; }
   int32_t replica_count() const { return replica_count_; }
   bool sequence_scoped() const { return sequence_scoped_; }
+  bool full_sequence_replica() const { return full_sequence_replica_; }
 
  private:
   int32_t local_head_count_ = 0;
@@ -99,6 +108,7 @@ class KvRedundancy final {
   int32_t split_ = 0;
   int32_t replica_count_ = 0;
   bool sequence_scoped_ = false;
+  bool full_sequence_replica_ = false;
 };
 
 // Maps a rank to the three orthogonal routing indices and back.

@@ -127,6 +127,29 @@ TEST(KvRedundancyTest, SequenceScopedGroupsAreNeverSplit) {
   EXPECT_EQ(decode.split(), 1);
 }
 
+TEST(KvRedundancyTest, FullSequenceReplicasKeepSplitOne) {
+  // The DSA indexer pool has a single global head, so its redundancy could
+  // absorb the configured split, but its top-k reads the whole sequence: the
+  // group declares itself a full-sequence replica instead.
+  GroupTopology indexer =
+      make_group(kMlaGlobalHeads, /*sequence_scoped=*/false);
+  indexer.full_sequence_replica = true;
+
+  const KvRedundancy prefill = derive_ok(make_topology(/*dp_size=*/1,
+                                                       1,
+                                                       /*tp_size=*/8,
+                                                       /*kv_split_size=*/4),
+                                         indexer);
+  EXPECT_EQ(prefill.split(), 1);
+  EXPECT_EQ(prefill.replica_count(), 8);
+  EXPECT_FALSE(prefill.sequence_scoped());
+  EXPECT_TRUE(prefill.full_sequence_replica());
+
+  const KvRedundancy decode = derive_ok(make_topology(4, 1, 2, 2), indexer);
+  EXPECT_EQ(decode.split(), 1);
+  EXPECT_EQ(decode.replica_count(), 2);
+}
+
 TEST(KvRedundancyTest, GroupsWithoutRedundancyKeepSplitOne) {
   // G >= TP shards the heads; there is nothing to remove, so a configured
   // split larger than 1 degrades to 1 instead of failing.

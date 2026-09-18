@@ -37,6 +37,30 @@ cc_library(
 
 cc_library(
   NAME
+    pd_route_table
+  HDRS
+    pd_route_table.h
+  SRCS
+    pd_route_table.cpp
+  DEPS
+    :kv_redundancy
+)
+
+cc_library(
+  NAME
+    route_binder
+  HDRS
+    route_binder.h
+  SRCS
+    route_binder.cpp
+  DEPS
+    :cache_layout
+    :kv_redundancy
+    :pd_route_table
+)
+
+cc_library(
+  NAME
     pd_topology_guard
   HDRS
     pd_topology_guard.h

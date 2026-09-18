@@ -61,6 +61,7 @@ bool KvRedundancy::derive(const KvTopology& topology,
 
   KvRedundancy derived;
   derived.sequence_scoped_ = group.sequence_scoped;
+  derived.full_sequence_replica_ = group.full_sequence_replica;
   // G >= TP shards the heads; G < TP replicates them.
   derived.local_head_count_ = std::max(global_heads / tp_size, 1);
   derived.tp_redundancy_ = std::max(tp_size / global_heads, 1);
@@ -70,14 +71,17 @@ bool KvRedundancy::derive(const KvTopology& topology,
   // C2: the split may never exceed this group's redundancy, and it must divide
   // it so that the redundant group decomposes into whole complete groups.
   //
-  // Two cases legitimately keep the whole sequence on every rank:
+  // Three cases legitimately keep the whole sequence on every rank:
   //   - sequence-scoped groups (SSM / CONV / linear state slots) have no block
   //     dimension to split at all;
+  //   - groups declared as full-sequence replicas (the DSA indexer pool) must
+  //     see the whole sequence by construction;
   //   - D == 1 means the group has no redundancy to remove.
   // Any other mismatch is a configuration error: silently degrading to 1 would
   // leave the operator believing a wider split is active.
   const int32_t configured_split = std::max(topology.kv_split_size, 1);
-  if (group.sequence_scoped || derived.redundancy_ == 1) {
+  if (group.sequence_scoped || group.full_sequence_replica ||
+      derived.redundancy_ == 1) {
     derived.split_ = 1;
   } else if (configured_split <= derived.redundancy_ &&
              derived.redundancy_ % configured_split == 0) {
