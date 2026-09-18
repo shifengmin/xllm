@@ -105,6 +105,39 @@ struct CacheRowBases {
   std::vector<uint64_t> row_offsets;
 };
 
+// One cache group of a request, as the scheduler addressed it.
+struct CacheGroupRequest {
+  int32_t group_id = 0;
+  std::vector<uint64_t> ids;
+};
+
+// The canonical blocks one request covers, derived from the groups the
+// scheduler addressed.
+//
+// A block-scoped group's id names one *logical* block, which spans
+// `topology.kv_split_size` canonical blocks -- one per DCP rank. That is the
+// identity KVShardLayout::globalize() inverts for the KV cache, and it is also
+// what the indexer pool expands to: its block table entry for logical block `b`
+// becomes the rows `b * dcp_size + j` for every `j`
+// (expand_kv_shard_indexer_block_table). The two views only coincide after that
+// expansion, so the expanded set is the canonical one and each family selects
+// from it with its own split and slice: the KV cache keeps the single canonical
+// block matching its sequence slice, while the indexer pool -- which keeps the
+// whole sequence -- keeps all of them.
+//
+// A sequence-scoped group has no block dimension: its slot id is already the
+// canonical unit, which is why the expansion applies to block-scoped groups
+// only.
+//
+// `local` are the declarations of this rank's families; they say which groups
+// exist and whether each is sequence scoped. Returns false, filling `error`,
+// for a group the model does not declare or whose families disagree on scope.
+bool canonical_blocks_of_request(
+    const std::vector<CacheGroupRequest>& groups,
+    const std::vector<CacheTensorDeclaration>& local,
+    std::vector<int64_t>* canonical_blocks,
+    std::string* error);
+
 // Translates the cache layout a peer published into the physical view the
 // binder addresses, and reconciles it with what the model declares.
 //

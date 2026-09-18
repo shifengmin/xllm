@@ -523,6 +523,70 @@ bool declare_cache_group(const CacheTensorLayoutContext& context,
   return false;
 }
 
+bool canonical_blocks_of_request(
+    const std::vector<CacheGroupRequest>& groups,
+    const std::vector<CacheTensorDeclaration>& local,
+    std::vector<int64_t>* canonical_blocks,
+    std::string* error) {
+  if (canonical_blocks == nullptr) {
+    set_error(error, "canonical block output must not be null");
+    return false;
+  }
+  canonical_blocks->clear();
+  for (const CacheGroupRequest& group : groups) {
+    bool declared = false;
+    bool sequence_scoped = false;
+    int32_t split = 1;
+    for (const CacheTensorDeclaration& declaration : local) {
+      if (declaration.group_id != group.group_id) {
+        continue;
+      }
+      if (!declared) {
+        declared = true;
+        sequence_scoped = declaration.group.sequence_scoped;
+        // The configured split is instance wide, which is exactly the DCP size
+        // the runtime places the logical blocks with.
+        split = std::max(declaration.topology.kv_split_size, 1);
+        continue;
+      }
+      if (declaration.group.sequence_scoped != sequence_scoped) {
+        set_error(error,
+                  "cache group " + std::to_string(group.group_id) +
+                      " has both sequence-scoped and block-scoped families, so "
+                      "its request ids have no single meaning");
+        return false;
+      }
+    }
+    if (!declared) {
+      set_error(error,
+                "the model declares no cache family for cache group " +
+                    std::to_string(group.group_id));
+      return false;
+    }
+
+    if (sequence_scoped) {
+      for (uint64_t id : group.ids) {
+        canonical_blocks->emplace_back(static_cast<int64_t>(id));
+      }
+      continue;
+    }
+    // One logical block spans one canonical block per DCP rank.
+    const int64_t factor = static_cast<int64_t>(split);
+    for (uint64_t id : group.ids) {
+      const int64_t base = static_cast<int64_t>(id) * factor;
+      for (int64_t offset = 0; offset < factor; ++offset) {
+        canonical_blocks->emplace_back(base + offset);
+      }
+    }
+  }
+
+  std::sort(canonical_blocks->begin(), canonical_blocks->end());
+  canonical_blocks->erase(
+      std::unique(canonical_blocks->begin(), canonical_blocks->end()),
+      canonical_blocks->end());
+  return true;
+}
+
 bool PeerDirectory::describe(
     const WorkerCacheLayoutManifest& manifest,
     const std::vector<CacheTensorDeclaration>& declarations,

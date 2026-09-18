@@ -54,6 +54,27 @@ cc_test(
     GTest::gtest_main
 )
 
+# Checks the routing coordinates against the runtime shard class itself
+# (KVShardLayout lives in :kv_cache), so it links :kv_cache like
+# cache_layout_builder_test does.
+cc_test(
+  NAME
+    kv_shard_contract_test
+  SRCS
+    kv_shard_contract_test.cpp
+  DEPS
+    :cache_directory
+    :kv_cache
+    GTest::gtest_main
+)
+target_link_libraries(kv_shard_contract_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 # Builds real cache tensors through the layout builder, so it links :kv_cache
 # like cache_layout_builder_test does.
 cc_test(

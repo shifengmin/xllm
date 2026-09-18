@@ -15,8 +15,8 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~8 轮**：入口 + F8 表缓存 + 开关 + **生产声明映射**已落地，61 用例全绿；生产调用点未接（缺对端视图与并集换算，接法已定案，见第 8 轮） |
-| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **切片契约已修正**（第 6 轮：C3 + `KvLayoutIndex` = `dcp_rank`，61 用例全绿）；地址层与请求 block id 换算未接线（**第 8 轮定了并集接法**） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~9 轮**：入口 + F8 表缓存 + 开关 + 生产声明映射 + **id↔规范块换算**已落地，67 用例全绿；**只剩生产调用点接线**（三项输入已齐，见第 9 轮 §5） |
+| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
 
 ## 1. 硬约束（每轮先读，别再试错）
 
@@ -33,6 +33,12 @@
 6. 构建沙箱 `~/workspace/xllm-pdroute`：base `72e0ea817`（相关目录与基线 `200939593` 无差异），
    S2 文件靠 scp 同步；**权威副本是 git 分支 `pd-routing-s0s1`（origin）**。
 7. 容器镜像：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`。
+9. **运行时本体可以链进手编 harness（第 9 轮验证）**：`kv_shard_layout.cpp` 与
+   `context_parallel_topology.cpp` 只依赖 glog，链接行加
+   `libglog.a` + `libgflags.a`（都在 `vcpkg_installed/arm64-linux/lib/`）即可；
+   harness 的 `TARGETS` 支持 `"glog": True` 与 `"defines": [...]`（`kv_shard_contract_test` 即用此）。
+   注意真仓库构建里 `context_parallel_topology` 属于很重的 `:parallel_state`（且依赖坏档案 `:common`），
+   所以该 oracle 目前只在手编 harness 里跑，用 `XLLM_HAVE_CONTEXT_PARALLEL_TOPOLOGY` 宏开关。
 8. **torch 手编链接可用**（第 4 轮验证）：真实 `describe_cache_tensor` + `torch::zeros` 在容器内能编能链：
    `-L<site-packages>/torch/lib -Wl,-rpath-link,<site-packages>/torch.libs
    -Wl,-rpath,<torch/lib>:<torch.libs> -ltorch -ltorch_cpu -lc10`。
@@ -536,3 +542,94 @@ XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash �
   index 写入寻址 + `kv_state().blocks()` 的 id 空间两条线取证（读码即可，不需要实例），并在文档里钉一条
   "id → 规范块"的显式断言（类似第 6 轮把 `slice` 钉在 `dcp_rank` 上）。
 - 第 7~8 轮已落地的部分（入口、开关、声明、加固、对账）不受此影响：它们的输入都是**规范块**，与 id 语义无关。
+
+### 2026-09-18（第 9 轮）——S3-5 的 id↔规范块语义**查清了**（有代码证据），并引入运行时 oracle，67 用例全绿
+
+上一轮把"请求 id ↔ 规范块"标成阻塞项。本轮把它查到底，结论是**可以接线了**，而且顺手把两个老欠账用
+**运行时本体**（而不是自洽公式）验掉。
+
+#### 1. 决定性证据：indexer 的 block table 就是"逻辑块 × dcp_size + j"
+
+`xllm/core/layers/common/kv_shard_batch_metadata.cpp:129-144`：
+
+```cpp
+torch::Tensor expand_kv_shard_indexer_block_table(const torch::Tensor& logical_block_table,
+                                                  const KVShardLayout& layout) {
+  torch::Tensor shard_offsets = torch::arange(layout.dcp_size(), ...);
+  torch::Tensor expanded = logical_block_table.unsqueeze(-1) * layout.dcp_size() + shard_offsets;
+  ...
+  return expanded.flatten(1);
+}
+```
+
+配合 `KVShardLayout`（`kv_shard_layout.cpp`，第 5 轮已读）：
+
+- `logical_block_size() = physical_block_size × dcp_size` = `128 × S` = **512 token**，恰好等于
+  `llm_engine.cpp:653` 把 BlockManager 的 `block_size` 放大成 `block_size × kv_split` 的结果；
+- `globalize(local_slot) = (local_block_id × dcp_size + dcp_rank) × 128 + offset`
+  ⇒ rank 的**物理行** `r` 持有规范块 `r×S + dcp_rank`；
+- `localize/owns/owner_of` 是它的逆。
+
+⇒ **两族的行空间关系彻底确定**：
+
+| 族 | 行 = 什么 | 行数 | 与请求 id 的关系 |
+|---|---|---|---|
+| KV（MLA latent；`S_eff = S`） | 物理行 `r` = 逻辑块 `r` = 规范块 `r×S + slice` | `n_blocks` = 6513 | 请求 id **就是**行号（`block.id()` 来自同一 BlockManager） |
+| INDEX / INDEX_SCALE（`full_sequence_replica`，`S_eff = 1`） | 行 = **规范块**（每 128 token 一个） | `n_blocks × S` = 26052 | 请求 id `b` 要展开成 `b×S + j, j∈[0,S)` |
+
+⇒ **S3-5 的换算规则**：请求的 id 是**逻辑块**（KV 侧行号），规范块集合 = `{id×S + j : j ∈ [0,S)}`；
+随后每个族用自己的 `split`/`slice` 从中筛选（KV 取 `canonical % S == slice` 的那一个，就是 `id` 本身；
+INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（LINEAR/EMBEDDING）没有块维度，slot id 直接是规范单位。
+
+**由此也确认了旧路径的一处隐患**（记录，不在本轮修）：`append_buffer_mappings` 把**同一份 `local_ids`**
+套到该 group 的每个 buffer 上，而 KEY 与 INDEX 同属 `BlockType::KV`。对 INDEX 而言这些 id 少乘/漏展开
+（应为 `id×S + j`），即旧路径在 DCP 分片下对 indexer 池的寻址是**可疑的**；这正是 canonical 路径要显式做对的地方。
+
+#### 2. 新增 `canonical_blocks_of_request(...)`（`cache_directory.{h,cpp}`，纯 std）
+
+签名：`(const std::vector<CacheGroupRequest>& groups, const std::vector<CacheTensorDeclaration>& local, std::vector<int64_t>* out, std::string* error)`。
+行为即上面的规则：块维度组按 `topology.kv_split_size`（实例级 = DCP size）展开，序列型组原样；
+结果排序去重；对"模型没声明的 group"与"同 group 内族之间 scope 不一致"报错。
+
+#### 3. 运行时 oracle（本轮第二个交付）
+
+手编 harness 加了 glog 链接（`libglog.a` + `libgflags.a`，见 §1.9），于是可以把**运行时本体**链进单测：
+`kv_shard_layout.cpp` + `context_parallel_topology.cpp`（两者只依赖 glog）。
+
+新测试 `tests/core/framework/kv_cache_transfer/kv_shard_contract_test.cpp`（**6 用例**）：
+
+1. `CanonicalBlockInvertsTheRuntimeShardLayout`：对 `S ∈ {1,2,4,8}`、每个 dcp_rank、每个 local row 与
+   offset ∈ {0,1,127}，断言 `CanonicalBlock::canonical_of_row/local_row/owns` 与
+   `KVShardLayout::globalize/owner_of/localize` **逐点一致**，且别的 rank 的切片 `localize` 返回
+   `kInvalidSlot`（`S=1` 时无"别的切片"，已按此收窄）。
+2. `ExpandsRequestIdsTheWayTheIndexerBlockTableDoes`：用 §1 的展开式手算期望，并逐族核对筛选结果
+   （KV 每切片恰好 1 个/逻辑块；INDEX 的 `local_row == canonical`）。
+3. `KeepsSequenceScopedIdsWhole`、4. `RejectsAGroupTheModelDoesNotDeclare`、
+   5. `RejectsAGroupWhoseFamiliesDisagreeOnScope`。
+6. `SliceIsTheDcpRankTheRuntimeBuilds`（`-DXLLM_HAVE_CONTEXT_PARALLEL_TOPOLOGY`）：
+   对 `cp ∈ {1,2,4}` × `tp ∈ {1,2,8}` × `S ∈ {1,2,4,8}` 的所有**运行时可接受形状**（C3 两分支）逐 rank 断言
+   **`KvLayoutIndex::slice_of(pcp_rank, tp_rank) == ContextParallelTopology::dcp_rank()`**，
+   并检查每个 slice 都有 rank 持有。**这就是第 5 轮"必须把 slice 钉在运行时上"的正解**，
+   等于把当年那条错公式的回归钉死了。
+
+**一处主动放弃的断言（记录理由）**：本想把"共享 slice 的 rank 集合 == `dcp_group_ranks()`"也钉上，
+但运行时 DCP 组的**组成**随形状不同（`S | cp_size` 时是对 PCP 组的划分并共享 dcp_rank；
+`S == cp_size×tp_size` 时覆盖整个 DP-local 域、每 rank 各自一个 dcp_rank），
+读码无法在本轮把两种形状的统一判据钉死，试了两版都被 oracle 打回。
+**该断言与路由契约无关**（路由只需要"每 rank 的 slice 身份" + 由冗余模型导出的副本枚举），
+故按"不做无法证实的断言"原则删除，并在测试里写明原因。
+
+#### 4. 验证
+
+容器内 `kv_redundancy_test` 12、`pd_route_test` 12、`cache_directory_test` 21、**`kv_shard_contract_test` 6**、
+`pd_route_transfer_test` 12、`pd_route_integration_test` 4 = **67 用例全绿**。
+（生产 TU 编译验证在第 8 轮为 rc=0；本轮的改动只在 `cache_directory` 与测试，不影响那四个 TU。）
+
+#### 5. 下一步（S3-4 生产接线，输入已齐）
+
+1. 注册期：用 `declare_cache_group` 造声明 → 本侧 `PeerDirectory`（顺带对账 manifest）。
+2. 传输期：对端 manifest getter（`MooncakeTransferEngine::cache_peers_`）；对端拓扑取 manifest 的
+   `ParallelCoordinates`；`InstanceInfo.addrs` 的"实例全局 rank"→"DP 组内局部 rank"下标换算。
+3. 请求侧：用 `canonical_blocks_of_request`（本轮交付）把 `mapping.local_ids` 换算成规范块，
+   交给 `PdRouteTransfer::transfer(opcode)`（第 7 轮交付）。
+4. 之后才允许把 `--pd_route=canonical` 的 `LOG(FATAL)` 换成真正的分支。
