@@ -624,7 +624,12 @@ class  PdRouteTransfer {
 `pd_route_transfer_test` 12/12、`pd_route_integration_test` 4/4 = **59 用例全绿**；
 生产 TU（`kv_cache_transfer.cpp` / `mooncake_kv_cache_transfer.cpp` / `disagg_pd_config.cpp`）真实 flags 编译 rc=0。
 
-**仍未做**：生产调用点接线（上面那两项输入）、集成测试改走统一入口、`ContextParallelTopology` 本体 oracle、
+**集成测试已改走统一入口**：`pd_route_integration_test.cpp` 现在对每个源 rank 调一次
+`PdRouteTransfer::transfer(PUSH, ...)`（真实张量 → 真实 `describe_cache_tensor` → manifest → 适配器 →
+**统一入口** → memcpy 逐字节），四个角色的搬运量与改前**逐位相同**。顺带修了夹具缺陷：buffer id 原先
+每 rank 从 0 编号，而传输层按 id 单独寻址缓冲（生产中由 Mooncake 全局唯一），已改成全局计数器。
+
+**仍未做**：生产调用点接线（上面那两项输入）、`ContextParallelTopology` 本体 oracle、
 `MixedLayers` / `DpExpansion` / XTensor `explicit_offsets` 端到端。**运行时**仍未验证（GLM5.3flash 不支持 PD 分离）。
 
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
