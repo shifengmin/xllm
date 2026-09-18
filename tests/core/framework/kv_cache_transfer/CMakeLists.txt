@@ -40,6 +40,7 @@ cc_test(
   DEPS
     :cache_directory
     :pd_route_table
+    :pd_route_transfer
     :route_binder
     GTest::gtest_main
 )

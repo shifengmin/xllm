@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "framework/kv_cache/kv_cache_tensor_role.h"
+#include "framework/kv_cache_transfer/pd_route_transfer.h"
 
 namespace xllm {
 
@@ -1243,6 +1244,158 @@ TEST(CacheDeclarationTest, RefusesRolesWhoseGeometryIsNotPinned) {
 
   EXPECT_FALSE(declare_cache_group(
       context, KVCacheTensorRole(KVCacheTensorRole::KEY), nullptr, &error));
+}
+
+// The canonical route addresses ranks inside one DP group, while the scheduler
+// publishes a peer instance's addresses by global rank. Filing them the wrong
+// way round moves bytes against another DP group's worker, so the conversion is
+// pinned here.
+TEST(CacheDeclarationTest, AssemblesThePeerInstanceOfOneDpGroup) {
+  const int32_t cp_size = 1;
+  const int32_t tp_size = 2;
+  const int32_t local_rank_count = cp_size * tp_size;
+  // The addresses of these manifests are handed out below, so the vector must
+  // not reallocate while they are being filled.
+  std::vector<WorkerCacheLayoutManifest> manifests;
+  manifests.reserve(static_cast<size_t>(tp_size));
+  std::vector<const WorkerCacheLayoutManifest*> manifest_pointers;
+  for (int32_t tp_rank = 0; tp_rank < tp_size; ++tp_rank) {
+    manifests.emplace_back(make_attention_manifest(tp_rank,
+                                                   tp_size,
+                                                   /*cp_rank=*/0,
+                                                   cp_size,
+                                                   /*kv_split_size=*/1,
+                                                   /*global_heads=*/2,
+                                                   /*tokens_per_block=*/128,
+                                                   /*rows=*/8));
+    manifest_pointers.emplace_back(&manifests.back());
+  }
+  const std::vector<CacheTensorDeclaration> declarations = {make_declaration(
+      /*role=*/kKeyRole,
+      /*group_id=*/0,
+      cp_size,
+      tp_size,
+      /*kv_split_size=*/1,
+      /*tokens_per_block=*/128,
+      /*global_head_count=*/2,
+      /*head_bytes=*/0,
+      /*sequence_scoped=*/false,
+      /*full_sequence_replica=*/false)};
+
+  // Two DP groups of two ranks each: group 1's workers must be picked out by
+  // the global rank, not by the local one.
+  const std::vector<std::string> addrs = {
+      "worker-0.dp0", "worker-1.dp0", "worker-0.dp1", "worker-1.dp1"};
+
+  RoutePeer peer;
+  std::string error;
+  ASSERT_TRUE(build_route_peer(addrs,
+                               /*dp_rank=*/1,
+                               local_rank_count,
+                               manifest_pointers,
+                               declarations,
+                               /*row_bases=*/{},
+                               &peer,
+                               &error))
+      << error;
+  ASSERT_EQ(peer.addrs.size(), 2u);
+  EXPECT_EQ(peer.addrs[0], "worker-0.dp1");
+  EXPECT_EQ(peer.addrs[1], "worker-1.dp1");
+  ASSERT_EQ(peer.views.size(), 2u);
+  EXPECT_EQ(peer.views[0].local_rank, 0);
+  EXPECT_EQ(peer.views[1].local_rank, 1);
+  for (const PeerCacheView& view : peer.views) {
+    EXPECT_EQ(view.entry.cache_namespace, CacheNamespace::MAIN);
+    EXPECT_EQ(view.entry.layer_id, 0);
+    EXPECT_EQ(view.entry.role, kKeyRole);
+    EXPECT_EQ(view.entry.group_id, 0);
+  }
+
+  // DP group 0 picks the other pair.
+  ASSERT_TRUE(build_route_peer(addrs,
+                               /*dp_rank=*/0,
+                               local_rank_count,
+                               manifest_pointers,
+                               declarations,
+                               /*row_bases=*/{},
+                               &peer,
+                               &error))
+      << error;
+  EXPECT_EQ(peer.addrs[0], "worker-0.dp0");
+  EXPECT_EQ(peer.addrs[1], "worker-1.dp0");
+}
+
+TEST(CacheDeclarationTest, RejectsAPeerInstanceThatDoesNotAddUp) {
+  const int32_t tp_size = 2;
+  const int32_t local_rank_count = tp_size;
+  // The addresses of these manifests are handed out below, so the vector must
+  // not reallocate while they are being filled.
+  std::vector<WorkerCacheLayoutManifest> manifests;
+  manifests.reserve(static_cast<size_t>(tp_size));
+  std::vector<const WorkerCacheLayoutManifest*> manifest_pointers;
+  for (int32_t tp_rank = 0; tp_rank < tp_size; ++tp_rank) {
+    manifests.emplace_back(make_attention_manifest(tp_rank,
+                                                   tp_size,
+                                                   /*cp_rank=*/0,
+                                                   /*cp_size=*/1,
+                                                   /*kv_split_size=*/1,
+                                                   /*global_heads=*/2,
+                                                   /*tokens_per_block=*/128,
+                                                   /*rows=*/8));
+    manifest_pointers.emplace_back(&manifests.back());
+  }
+  const std::vector<CacheTensorDeclaration> declarations = {make_declaration(
+      /*role=*/kKeyRole,
+      /*group_id=*/0,
+      /*cp_size=*/1,
+      tp_size,
+      /*kv_split_size=*/1,
+      /*tokens_per_block=*/128,
+      /*global_head_count=*/2,
+      /*head_bytes=*/0,
+      /*sequence_scoped=*/false,
+      /*full_sequence_replica=*/false)};
+  const std::vector<std::string> addrs = {"a", "b"};
+  RoutePeer peer;
+  std::string error;
+
+  // Not enough addresses for the DP group asked for.
+  EXPECT_FALSE(build_route_peer(addrs,
+                                /*dp_rank=*/1,
+                                local_rank_count,
+                                manifest_pointers,
+                                declarations,
+                                /*row_bases=*/{},
+                                &peer,
+                                &error));
+  EXPECT_NE(error.find("do not cover DP group 1"), std::string::npos) << error;
+
+  // A layout filed under the wrong rank.
+  std::vector<const WorkerCacheLayoutManifest*> swapped = {
+      manifest_pointers[1], manifest_pointers[0]};
+  EXPECT_FALSE(build_route_peer(addrs,
+                                /*dp_rank=*/0,
+                                local_rank_count,
+                                swapped,
+                                declarations,
+                                /*row_bases=*/{},
+                                &peer,
+                                &error));
+  EXPECT_NE(error.find("describes rank"), std::string::npos) << error;
+
+  // A rank without a layout.
+  std::vector<const WorkerCacheLayoutManifest*> missing = {manifest_pointers[0],
+                                                           nullptr};
+  EXPECT_FALSE(build_route_peer(addrs,
+                                /*dp_rank=*/0,
+                                local_rank_count,
+                                missing,
+                                declarations,
+                                /*row_bases=*/{},
+                                &peer,
+                                &error));
+  EXPECT_NE(error.find("published no cache layout"), std::string::npos)
+      << error;
 }
 
 }  // namespace
