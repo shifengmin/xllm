@@ -76,6 +76,11 @@ class MooncakeKVCacheTransferBase : public KVCacheTransfer {
   // declarations and manifest the canonical route reconciles its peers against.
   // The legacy path never reads them, so a family whose geometry the model does
   // not pin only disqualifies `canonical` (see canonical_ready_).
+  // The source instance's addresses as the engine linked them, ordered by the
+  // source's global rank (LLMEngine::link_cluster hands every worker the whole
+  // source instance). The canonical route indexes it by DP group, which is the
+  // same list `build_route_peer` expects.
+  std::vector<std::string> linked_source_addrs_;
   std::vector<CacheTensorDeclaration> declarations_;
   std::vector<CacheRowBases> row_bases_;
   std::optional<PeerDirectory> local_directory_;
