@@ -119,8 +119,11 @@ class KvLayoutIndex {
   int32_t head_end(int32_t h) const;        // (h+1) * Hl
 
   int32_t head_class(int32_t tp) const;     // tp / D_tp
-  int32_t slice(int32_t cp, int32_t tp) const;    // (cp * D_tp + tp % D_tp) % S_eff
-  int32_t replica(int32_t cp, int32_t tp) const;  // (cp * D_tp + tp % D_tp) / S_eff
+  // t 必须等于运行时的 DCP rank（见 §3.1 下方说明），只有两种形状：
+  //   (a) S <= CP 且 CP % S == 0:  t = cp / (CP/S)
+  //   (b) S == CP * TP:            t = cp * TP + tp
+  int32_t slice(int32_t cp, int32_t tp) const;
+  int32_t replica(int32_t cp, int32_t tp) const;
 
   // 写者去重：c == 0 的唯一 rank
   bool writer_of(int32_t dp, int32_t h, int32_t t, int32_t* rank) const;
@@ -129,6 +132,16 @@ class KvLayoutIndex {
                  std::vector<int32_t>* ranks) const;
 };
 ```
+
+> **修正（2026-09-18，工作日志第 5 轮）**：`slice` 原来写作 `(cp*D_tp + tp % D_tp) % S_eff`，**与运行时契约不符**。
+> 运行时的规范地址由 `KVShardLayout::globalize` 定义：`canonical = row * S + dcp_rank`
+> （`KVShardLayout::owner_of(b) = b % S`），而 `dcp_rank` 由 `ContextParallelTopology` 给出：
+> (a) `S <= cp_size && cp_size % S == 0` ⇒ DCP 划分 PCP，`dcp_rank = cp_rank / (cp_size/S)`；
+> (b) `S == cp_size*tp_size` ⇒ DCP 覆盖整个 DP-local 域，`dcp_rank = cp_rank*tp_size + tp_rank`；
+> 其它形状会让 `ContextParallelTopology` 的 `CHECK` 直接失败。
+> NPU 解码路径就是这么用的（`qwen_dcp_attention.cpp`：`KVShardLayout(block_size, dcp_group.world_size(), dcp_group.rank())`）。
+> 受影响的是"哪个 rank 属于哪个切片/副本"（pilot：`slice = cp_rank`，写者 `(cp=s, tp=0)`），
+> 不变量与规模（`N_rep = D/S`、`Hc*Hl = G`、边表条数）不变。
 
 ### 3.2 L1：规范地址
 
@@ -543,6 +556,23 @@ XTensor `explicit_offsets` 的端到端（适配器与 T4 golden 已覆盖）、
 实跑结果：`kv_redundancy_test` 11/11、`pd_route_test` 12/12、`cache_directory_test` 19/19、
 `pd_route_integration_test` 4/4。
 
+### S3-5 的前置修正（2026-09-18，定位完成、代码待改）
+
+第 5 轮把 S3-5 的阻塞项钉死了：**`slice` 必须等于运行时的 `ContextParallelTopology::dcp_rank`**，
+S2 原先的 `slice_of` 公式是另一套分组。证据、正确的两分支公式、以及要改的测试清单见
+`pd_routing_s3_worklog_20260918.md` 第 5 轮（§3.1 上方也有摘要）。
+
+要点：
+
+- `CanonicalBlock`（`canonical = row*S + slice`）与 `KVShardLayout::globalize` **完全一致**，这块不用改；
+  `N_rep = D/S`、`Hc*Hl = G`、每 `(h,t)` 单写者、边表条数也都不变。
+- 要改的是 `KvRedundancy::derive`（新增 C3：`(S ≤ cp_size && cp_size % S == 0) || (S == cp_size*tp_size)`）
+  与 `KvLayoutIndex` 的 `slice_of`/`replica_of`/`writer_of`/`replicas_of`。
+- pilot 的真实拓扑是 **`cp_size=4` + `tp_size=8`（world 32）+ `kv_split=4`**（`world/kv_split = 8 = tp_size`
+  ⇒ DCP 组 = 固定 tp、变动 cp），因此 `slice = cp_rank`、写者 `(cp=s, tp=0)`，`S_eff=4` 来自 `S | cp_size`。
+- S2 的 rank golden 需要重算；`cp=1` 配 `S=4` 之类形状在 C3 下非法，相关夹具要改成 `cp_size=4`。
+- **顺序**：先做这一步（③ 规范逻辑地址层），再做 ② 数据面切换。否则会把错块搬到对端。
+
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 
 环境：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（cmake 3.27.9 / ninja 1.11.1 / gtest 1.14.0），
@@ -582,7 +612,7 @@ sudo docker run --rm --privileged \
 | sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
 | COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2/S3-3） | 只在非 MLA 实例可达（`enable_mla == false`）；适配器显式拒绝而非静默降级。S3-4 决定"COMPOSITE 走旧 planner"还是"边表/视图增加 per-component 字节偏移" |
 | MLA 实例下的 SSM/CONV 是整资源 span，只有 `H_l == 1` 时可路由 | 适配器按 `H_l == 1` 准入并从 rank 取 head 身份；`H_l > 1` 时报错要求 producer 改成每 head 一个 span（GLM5-next `TP8` + `linear_*_head_count = 8` 落在 `H_l == 1`） |
-| 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | 适配器暂不据此判断；S3-4/S3-5 落地"规范块 ↔ 请求 block id"换算前必须先统一，否则会静默错块 |
+| 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | **已确认不一致**（`slice` 必须是 `ContextParallelTopology::dcp_rank`，见 §8.1 "S3-5 的前置修正"）。修 C3 + `KvLayoutIndex` 之前不得开始 ② 数据面接线，否则静默搬错块 |
 | 建链收敛后，运行期新增对端无法建链 | 保留 on-demand 建链路径：`PdRouteTable` 可在运行期对新的拓扑元组补算边表 |
 
 **回退点**：S0 / S1 完全独立可回退；S2 是纯新增并行路径；S3 起才切换行为，切换前保留旧路径的编译开关（`--pd_route=legacy|canonical`）以便灰度与快速回退。

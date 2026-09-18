@@ -404,6 +404,14 @@ P 侧 rank 0..7 的 `(h, t, c)`：
 | `Xtensor_ExplicitOffsets` | ⚠️ 端到端未做：适配器字段由 `cache_directory_test`、字节 golden 由 `pd_route_test` T4 覆盖 |
 | 等价锚点 `S_P = S_D` | ✅ `AnchoredEqualSplitReproducesTheSourceLayout`（MLA kv4 → kv4） |
 
+> **⚠️ 2026-09-18（工作日志第 5 轮）：这些用例目前只验证了"模型自洽"，还没钉住运行时契约。**
+> 上面的夹具用 `KvLayoutIndex::slice_of` 自己算切片，而运行时的切片是 `ContextParallelTopology::dcp_rank`
+> （`KVShardLayout::globalize` 定义 `canonical = row*S + dcp_rank`；NPU 侧 `qwen_dcp_attention.cpp` 用
+> `dcp_group.rank()`）。两者在 pilot 拓扑下不同：正确值是 `slice = cp_rank`（`cp_size=4`），
+> 而 S2 公式给的是 `tp % 4`。**修法**：给 `KvRedundancy::derive` 加 C3（DCP 形状）校验、重写 `slice_of` 等，
+> 并把集成测试的期望切片改成**用 `ContextParallelTopology` 反推**（而不是用 `KvLayoutIndex`），
+> 这样"模型与运行时不一致"会立刻变红。相关夹具的 `cp=1 + S=4` 在 C3 下也会变成非法，需改为 `cp_size=4`。
+
 ### 3.7 T6 真实 PD 验收（后续，非本次交付）
 
 GLM 5.3 flash 支持 PD 分离后：
