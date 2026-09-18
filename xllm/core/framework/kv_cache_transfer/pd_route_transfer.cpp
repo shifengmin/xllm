@@ -18,7 +18,9 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -171,6 +173,66 @@ void orient_for_pull(std::vector<RouteRegion>* regions) {
 }
 
 }  // namespace
+
+bool flatten_route_for_layers(
+    const std::vector<RouteLeg>& legs,
+    const std::unordered_map<uint64_t, int64_t>& layer_of_buffer,
+    std::vector<RouteLayerBatch>* batches,
+    std::string* error) {
+  if (batches == nullptr) {
+    set_error(error, "the layer batch output must not be null");
+    return false;
+  }
+  batches->clear();
+
+  // A batch is one (layer, peer, source rank) triple: the transport call
+  // carries a single peer address, so two legs to the same peer stay apart when
+  // they come from different ranks.
+  std::vector<RouteLayerBatch> ordered;
+  for (const RouteLeg& leg : legs) {
+    for (const RouteRegion& region : leg.regions) {
+      const auto layer_it = layer_of_buffer.find(region.local_buffer_id);
+      if (layer_it == layer_of_buffer.end()) {
+        set_error(error,
+                  "region of leg to peer rank " +
+                      std::to_string(leg.peer_local_rank) + " names buffer " +
+                      std::to_string(region.local_buffer_id) +
+                      ", which belongs to no layer");
+        return false;
+      }
+      const int64_t layer_id = layer_it->second;
+      auto batch_it =
+          std::find_if(ordered.begin(),
+                       ordered.end(),
+                       [layer_id, &leg](const RouteLayerBatch& batch) {
+                         return batch.layer_id == layer_id &&
+                                batch.peer_addr == leg.peer_addr;
+                       });
+      if (batch_it == ordered.end()) {
+        RouteLayerBatch batch;
+        batch.layer_id = layer_id;
+        batch.peer_addr = leg.peer_addr;
+        ordered.emplace_back(std::move(batch));
+        batch_it = std::prev(ordered.end());
+      }
+      batch_it->regions.emplace_back(region);
+    }
+  }
+
+  // Layer order is the order the push loop synchronizes in; the legs of one
+  // layer keep the plan's order.
+  std::stable_sort(ordered.begin(),
+                   ordered.end(),
+                   [](const RouteLayerBatch& lhs, const RouteLayerBatch& rhs) {
+                     return lhs.layer_id < rhs.layer_id;
+                   });
+  for (RouteLayerBatch& batch : ordered) {
+    if (!batch.regions.empty()) {
+      batches->emplace_back(std::move(batch));
+    }
+  }
+  return true;
+}
 
 bool build_route_peer(
     const std::vector<std::string>& instance_addrs,

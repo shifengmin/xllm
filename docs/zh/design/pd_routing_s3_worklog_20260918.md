@@ -15,7 +15,7 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~10 轮**：入口 + F8 表缓存 + 开关 + 生产声明映射 + id↔规范块换算 + **对端实例装配**已落地，69 用例全绿；**只剩把三者接进 `push_kv_blocks_async`**（步骤见第 10 轮末尾，无未知项） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~11 轮**：入口/F8 缓存/开关/声明映射/id↔规范块/对端装配/**层化发送计划**已落地，71 用例全绿；**只剩把它们串进 `push_kv_blocks_async` 的 canonical 分支并摘掉 `LOG(FATAL)`**（步骤见第 11 轮末尾，无未知项） |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
 
 ## 1. 硬约束（每轮先读，别再试错）
@@ -685,3 +685,55 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 
 **仍未验证（原因）**：真实运行时（RDMA/NPU/真实调度 block id/协商方向）——GLM5.3flash 尚不支持 PD 分离（§1.3）；
 本轮新增的 `build_route_peer` 只有 host 单测，没有装配进任何生产调用点。
+
+### 2026-09-18（第 11 轮）——S3-4 接线第 3 步：对端 manifest 保留、本侧声明/视图、层化发送计划，71 用例全绿
+
+第 10 轮列出 4 条待办，本轮做掉 1、2 和 3 里**唯一有逻辑、可单测**的那段（层化分组）。
+
+**(1) 保留对端 manifest**（`mooncake_transfer_engine.{h,cpp}`）
+
+旧路径拿到对端 manifest 后只留了由它构建的 `ReshardPlanTemplate`，manifest 本身丢弃。canonical 路线要从
+**对端自己的布局**推导边表，所以给 `CachePeerLink` 增加 `std::optional<WorkerCacheLayoutManifest> manifest;`
+（`set_cache_peer()` 里赋值，纯增量），并加取值口
+`peer_cache_layout(remote_addr)`（core + engine 各一层转发）。
+
+> ⚠️ 未验证：**哪个方向发 manifest** 由既有协商决定（`SetCachePeer` 由收到 manifest 的一方调用，
+> 于是那一方的 `cache_peer_links_` 里才有对端布局）。本轮只读码确认这条链，运行时行为未验证（§1.3）。
+
+**(2) 本侧声明 + 本侧视图**（`mooncake_kv_cache_transfer.{h,cpp}`）
+
+`publish_cache_layout()` 末尾（MAIN 与 SPEC_DRAFT 都会走到，声明按累积后的 manifest 重建）：
+
+- 对 `local_cache_layout_.tensors` 的每个族用 `declare_cache_group(context.tensor_layout, role, ...)` 造声明；
+  拓扑取自 `registration_context.coordinates`（DRAFT 用自己的 placement，与既有注释一致），
+  `tokens_per_block` 取自 `tensor_layout.block_token_capacity` —— 生产传的是 `options_.block_size()` = **128**
+  = 规范块大小，与第 9 轮的模型一致；
+- 用 `PeerDirectory::describe(local_cache_layout_, declarations_, row_bases_, ...)` 造本侧视图；
+- **两条降级路径**（都是 `LOG(WARNING)` + `canonical_ready_ = false`，**不影响 legacy**）：
+  ① 模型没钉住几何的族（WINDOW/SWA/KV_STATE 等，`declare_cache_group` 本来就会拒绝）——DSV4 实例就是这种，
+  必须不能让 legacy 起不来；② 含 `explicit_resource_offsets` 的族（XTensor）——页基点还没接，
+  显式标注而不是塞错误的基点。
+
+**(3) 层化发送计划 `flatten_route_for_layers(...)`**（`pd_route_transfer.{h,cpp}`，纯函数）
+
+`RouteRegion` 只有 buffer id，而 push 侧必须**按 layer 调 `synchronize_layer`**。`BufLayout::layers[][]` 有
+`buf_id → layer` 的映射，所以：把腿的 region 按"**缓冲所属层**"折叠成
+`RouteLayerBatch{layer_id, peer_addr, regions}`，按 **layer 升序**排序、同层内保持 plan 的腿序
+（同一 (layer, peer) 的两条腿合并成一次传输调用）。region 的 buffer 查不到层 → **报错**而不是丢弃
+（丢弃会在目的端留一个没有任何检查能发现的洞）。
+
+**验证**：`pd_route_transfer_test` 新增 2 用例（12 → **14**）：
+
+- `FlattensALegIntoAscendingLayerBatches`：2 层 × 2 peer × 4 个 region，断言输出为 4 个 batch、
+  顺序是 (layer0,peer3)、(layer0,peer5)、(layer1,peer3)、(layer1,peer5)，且每个 region 恰好出现一次；
+- `RejectsARegionWhoseBufferHasNoLayer`：查不到层的 buffer 报错且不产生 batch。
+
+容器内总计 **71 用例全绿**（12+12+23+6+14+4）。生产 TU 真实 flags 编译：`mooncake_transfer_engine.cpp`、
+`mooncake_kv_cache_transfer.cpp`、`kv_cache_transfer.cpp` 全部 rc=0。
+
+**剩下的最后一步（第 12 轮，已无未知项）**：把三者串进 `push_kv_blocks_async` 的 canonical 分支 ——
+`canonical_blocks_of_request`（第 9 轮）→ `build_route_peer`（第 10 轮，peer manifest 由本轮的
+`peer_cache_layout` 取）→ `PdRouteTransfer::plan`（第 7 轮）→ `flatten_route_for_layers`（本轮）→
+逐 batch `synchronize_layer` + `move_memory_regions(..., WRITE)`（`RouteRegion` 逐字段拷成 `ByteRegion`），
+然后把 `--pd_route=canonical` 的 `LOG(FATAL)` 换成真正分支。
+`canonical_ready_` 为假时必须显式拒绝（不能静默走 legacy）。

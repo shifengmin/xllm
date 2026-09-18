@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <optional>
 
+#include "framework/kv_cache_transfer/cache_directory.h"
 #include "framework/kv_cache_transfer/cache_layout.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/mooncake_transfer_engine.h"
@@ -70,6 +71,15 @@ class MooncakeKVCacheTransferBase : public KVCacheTransfer {
   std::optional<CacheRegistrationContext> pending_registration_context_;
   WorkerCacheLayoutManifest local_cache_layout_;
   uint64_t layout_generation_ = 0;
+
+  // Model-side view of what this rank published, derived from the same
+  // declarations and manifest the canonical route reconciles its peers against.
+  // The legacy path never reads them, so a family whose geometry the model does
+  // not pin only disqualifies `canonical` (see canonical_ready_).
+  std::vector<CacheTensorDeclaration> declarations_;
+  std::vector<CacheRowBases> row_bases_;
+  std::optional<PeerDirectory> local_directory_;
+  bool canonical_ready_ = false;
 
   void publish_cache_layout(
       const std::vector<CacheTensorManifest>& tensor_manifests,
