@@ -203,8 +203,13 @@ class CanonicalBlock final {
   int64_t token_begin(int64_t block) const;
   int64_t token_end(int64_t block) const;
 
-  // Local physical row holding `block` on a rank whose slice is `slice`.
-  // Only meaningful for blocks this rank owns; see owns().
+  // The *position* row holding `block` on a rank whose slice is `slice`,
+  // counted from the sequence's first block. A cache pool row can be one
+  // further along: the xLLM block manager reserves row 0 for its padding block,
+  // so the pool row of the same block is `local_row(block) + 1` for a split
+  // family. That offset belongs to the peer-dependent side of the route, so it
+  // is applied where a canonical block becomes a peer row (RouteBinder), not
+  // here. Only meaningful for blocks this rank owns; see owns().
   int64_t local_row(int64_t block) const;
   // Inverse of local_row().
   int64_t canonical_of_row(int64_t row, int32_t slice) const;

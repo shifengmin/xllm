@@ -219,6 +219,7 @@ inline size_t get_kv_transfer_mappings_size(
   size_t total = type_size<uint64_t>;
   for (const KVTransferMapping& mapping : mappings) {
     total += type_size<int32_t> + get_vector_size(mapping.local_ids) +
+             get_vector_size(mapping.local_positions) +
              get_vector_size(mapping.remote_ids);
   }
   return total;
@@ -798,6 +799,7 @@ inline void write_kv_transfer_mappings(
   for (const KVTransferMapping& mapping : mappings) {
     write_data(buffer, mapping.group_id);
     write_vector(buffer, mapping.local_ids);
+    write_vector(buffer, mapping.local_positions);
     write_vector(buffer, mapping.remote_ids);
   }
 }
@@ -809,6 +811,7 @@ inline void write_kv_transfer_mappings(
   for (const KVTransferMapping& mapping : mappings) {
     write_data(context.descriptor, mapping.group_id);
     write_vector(context.descriptor, mapping.local_ids);
+    write_vector(context.descriptor, mapping.local_positions);
     write_vector(context.descriptor, mapping.remote_ids);
   }
 }
@@ -1743,6 +1746,7 @@ inline void read_kv_transfer_mappings(
   for (KVTransferMapping& mapping : mappings) {
     read_data(buffer, mapping.group_id);
     read_vector(buffer, mapping.local_ids);
+    read_vector(buffer, mapping.local_positions);
     read_vector(buffer, mapping.remote_ids);
   }
 }
@@ -1756,6 +1760,7 @@ inline void read_kv_transfer_mappings(
   for (KVTransferMapping& mapping : mappings) {
     read_data(context, mapping.group_id);
     read_vector(context, mapping.local_ids);
+    read_vector(context, mapping.local_positions);
     read_vector(context, mapping.remote_ids);
   }
 }

@@ -1000,7 +1000,9 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
   sources.reserve(static_cast<size_t>(kSourceCp * kSourceTp));
   for (int32_t cp_rank = 0; cp_rank < kSourceCp; ++cp_rank) {
     for (int32_t tp_rank = 0; tp_rank < kSourceTp; ++tp_rank) {
-      // One source row per rank: four canonical blocks over a 4-way split.
+      // One source row per canonical block, plus the pool's reserved padding
+      // row 0: a split-4 source holds the four canonical positions of the
+      // request at pool rows 1 and 2.
       const WorkerCacheLayoutManifest manifest =
           make_attention_manifest(tp_rank,
                                   kSourceTp,
@@ -1009,7 +1011,7 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
                                   kSourceSplit,
                                   kGlobalHeads,
                                   kTokensPerBlock,
-                                  /*rows=*/1);
+                                  /*rows=*/2);
       PeerDirectory directory;
       std::string error;
       ASSERT_TRUE(describe(manifest, {source_declaration}, &directory, &error))
@@ -1030,7 +1032,7 @@ TEST(PeerDirectoryTest, RoutesCanonicalBlocksBetweenPublishedLayouts) {
           /*kv_split_size=*/1,
           kGlobalHeads,
           kTokensPerBlock,
-          /*rows=*/4);
+          /*rows=*/5);
   PeerDirectory destination;
   std::string error;
   ASSERT_TRUE(describe(

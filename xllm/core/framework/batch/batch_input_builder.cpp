@@ -399,6 +399,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
 
     const size_t block_count = map_end - next_transfer_idx;
     step_mapping.local_ids.reserve(block_count);
+    step_mapping.local_positions.reserve(block_count);
     step_mapping.remote_ids.reserve(block_count * remote_stride);
     std::vector<size_t> remote_idxs;
     remote_idxs.reserve(block_count * remote_stride);
@@ -431,6 +432,13 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
         remote_idxs.resize(remote_idxs_begin);
         continue;
       }
+      // `local_idx` is the block's position in the sequence, which is the one
+      // coordinate that survives the crossing: the id is a pool row (shared
+      // prefix and chunked-prefill steps make it unrelated to the position).
+      // It is recorded per id, so a dropped lane cannot shift the ones after
+      // it.
+      step_mapping.local_positions.emplace_back(
+          static_cast<uint64_t>(local_idx));
       step_mapping.local_ids.emplace_back(
           static_cast<uint64_t>(local_ids[local_idx]));
     }

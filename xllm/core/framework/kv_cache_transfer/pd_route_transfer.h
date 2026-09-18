@@ -93,6 +93,12 @@ struct RoutePeer {
 // so a peer whose published layout disagrees with the model fails here rather
 // than at the first transfer, and every view is checked to come from the rank
 // it was filed under.
+//
+// The parallel coordinates inside those declarations are taken from the
+// manifest being described, not from the caller: a peer is allowed to be
+// configured differently from us -- that is what the canonical route is for --
+// while the group geometry and the token capacity stay model-side and are still
+// checked against the published descriptor.
 bool build_route_peer(
     const std::vector<std::string>& instance_addrs,
     int32_t dp_rank,
@@ -197,10 +203,13 @@ class PdRouteTransfer final {
   // Plans one opcode of one request for the rank `local_rank`.
   //
   // `canonical_blocks` are the canonical blocks of the request, ascending. A
-  // canonical block is the only block identity both sides agree on, so it is
-  // also the only input that has to be converted from a request-local id: the
-  // caller converts its physical rows with CanonicalBlock::canonical_of_row
-  // before calling here.
+  // canonical block is a *position* -- the request's `p`-th block through
+  // sequence slice `j` -- and it is the only block identity both sides agree
+  // on, so it is also the only input that has to be converted from a
+  // request-local id: the caller converts its pool rows with
+  // CanonicalBlock::canonical_of_row before calling here, rebasing them onto
+  // the request's first block. Each side then resolves the position against its
+  // own layout, which is why the two rows differ whenever the two splits do.
   //
   // `local` holds the views this side published and `peer` the ones the peer
   // instance published; both may cover several ranks. A family is routed only

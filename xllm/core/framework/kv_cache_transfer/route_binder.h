@@ -119,6 +119,12 @@ class RouteBinder final {
   // transport below addresses peers. Sequence-scoped groups pass slot ids
   // instead: their split is 1, so the row is the id.
   //
+  // A canonical block is a position -- the request's `p`-th block through slice
+  // `j` -- not an address, so both peers turn it into a row with their own
+  // layout: the two rows differ whenever the two splits do, and that
+  // translation is the whole point of routing on canonical blocks. The rule per
+  // family is spelled out next to peer_row() in the implementation.
+  //
   // `edges` may be the whole route table: edges of another destination rank or
   // of another source rank are skipped. Skipping is safe because every
   // requested block still has to be covered by an edge of this pair, and it

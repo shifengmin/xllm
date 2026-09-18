@@ -363,9 +363,10 @@ TEST(PdRouteTest, BinderProducesTheGoldenByteRanges) {
   const PeerCacheView local = make_view(prefill, mla, local_entry);
   const PeerCacheView remote = make_view(decode, mla, remote_entry);
 
-  // local_row = block / 4, remote_row = block / 2, and the whole row moves
-  // because the head range covers the single MLA head and the token dimension
-  // compresses into one contiguous run.
+  // local_row = block / 4 + 1, remote_row = block / 2 + 1 (row 0 of a pool is
+  // the reserved padding block), and the whole row moves because the head range
+  // covers the single MLA head and the token dimension compresses into one
+  // contiguous run.
   for (int64_t block = 0; block < 8; ++block) {
     const int32_t dst_rank = static_cast<int32_t>(block % 2);
     std::vector<RouteRegion> regions;
@@ -377,9 +378,9 @@ TEST(PdRouteTest, BinderProducesTheGoldenByteRanges) {
     EXPECT_EQ(regions[0].local_buffer_id, 7u);
     EXPECT_EQ(regions[0].remote_buffer_id, 9u);
     EXPECT_EQ(regions[0].local_offset,
-              (block / 4) * static_cast<int64_t>(row_bytes));
+              (block / 4 + 1) * static_cast<int64_t>(row_bytes));
     EXPECT_EQ(regions[0].remote_offset,
-              (block / 2) * static_cast<int64_t>(row_bytes));
+              (block / 2 + 1) * static_cast<int64_t>(row_bytes));
     EXPECT_EQ(regions[0].length, row_bytes);
   }
 }
@@ -412,18 +413,19 @@ TEST(PdRouteTest, BinderFansOutWhenTheSourceIsNarrower) {
   const PeerCacheView remote = make_view(wide, mla, remote_entry);
 
   // Destination rank 0 owns slice 0, which is fed by source slice 0 (rank 0);
-  // blocks 0 and 4 are the ones it needs.
+  // blocks 0 and 4 are the ones it needs. Pool rows are one past the position
+  // row: local (split 2) rows 1 and 3, remote (split 4) rows 1 and 2.
   std::vector<RouteRegion> regions;
   std::string error;
   ASSERT_TRUE(RouteBinder::bind(
       edges, /*dst_local_rank=*/0, {0, 4}, local, remote, &regions, &error))
       << error;
   ASSERT_EQ(regions.size(), 2u);
-  EXPECT_EQ(regions[0].local_offset, 0u);
-  EXPECT_EQ(regions[0].remote_offset, 0u);
+  EXPECT_EQ(regions[0].local_offset, static_cast<int64_t>(row_bytes));
+  EXPECT_EQ(regions[0].remote_offset, static_cast<int64_t>(row_bytes));
   EXPECT_EQ(regions[0].length, row_bytes);
-  EXPECT_EQ(regions[1].local_offset, 2 * static_cast<int64_t>(row_bytes));
-  EXPECT_EQ(regions[1].remote_offset, static_cast<int64_t>(row_bytes));
+  EXPECT_EQ(regions[1].local_offset, 3 * static_cast<int64_t>(row_bytes));
+  EXPECT_EQ(regions[1].remote_offset, 2 * static_cast<int64_t>(row_bytes));
   EXPECT_EQ(regions[1].length, row_bytes);
 }
 
@@ -466,9 +468,9 @@ TEST(PdRouteTest, BinderHonoursExplicitRowBases) {
         << error;
     ASSERT_EQ(regions.size(), 1u);
     EXPECT_EQ(regions[0].remote_offset,
-              remote.row_offsets[static_cast<size_t>(block / 2)]);
+              remote.row_offsets[static_cast<size_t>(block / 2 + 1)]);
     EXPECT_EQ(regions[0].local_offset,
-              (block / 4) * static_cast<int64_t>(row_bytes));
+              (block / 4 + 1) * static_cast<int64_t>(row_bytes));
   }
 }
 
@@ -634,10 +636,11 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
   for (int32_t dst_dp = 0; dst_dp < 4; ++dst_dp) {
     for (int32_t dst_local = 0; dst_local < 2; ++dst_local) {
       const size_t dst_global = static_cast<size_t>(dst_dp * 2 + dst_local);
-      for (int64_t row = 0; row < static_cast<int64_t>(kMockRows); ++row) {
-        // Row `row` of this rank holds the canonical block that its slice owns
-        // at that position: blocks arrive in ascending order, one per row.
-        const int64_t block = row * 2 + dst_local % 2;
+      for (int64_t row = 1; row < static_cast<int64_t>(kMockRows); ++row) {
+        // Pool row `row` of this rank holds the canonical block that its slice
+        // owns at position row `row - 1`; row 0 is the reserved padding row and
+        // never carries a block.
+        const int64_t block = (row - 1) * 2 + dst_local % 2;
         const bool carries_data = block < 8;
         for (int64_t unit = 0; unit < kMockTokens; ++unit) {
           for (int32_t byte = 0; byte < kMockHeadBytes; ++byte) {
@@ -649,10 +652,11 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
                             offset_in_row];
             // The expectation is derived independently of the route table: the
             // block's writer is cp rank (block % src_split) at tp 0, i.e. local
-            // rank 8 * (block % src_split), and its row is block / src_split.
+            // rank 8 * (block % src_split), and it keeps the block at the pool
+            // row of that position, which is one past the position row.
             const uint8_t expected =
                 carries_data ? mock_pattern(static_cast<int32_t>(block % 4) * 8,
-                                            block / 4,
+                                            block / 4 + 1,
                                             offset_in_row)
                              : 0;
             if (actual != expected) {

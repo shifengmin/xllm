@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -63,6 +64,9 @@ CacheTensorDeclaration make_declaration(int32_t group_id,
 TEST(KvShardContractTest, CanonicalBlockInvertsTheRuntimeShardLayout) {
   // The runtime identity: local row `r` on DCP rank `d` holds the canonical
   // block `r * split + d`, and the token offset inside it is the local offset.
+  // The rows here are *position* rows, counted from the sequence's first block;
+  // a pool row is one further along, because the block manager's row 0 is the
+  // reserved padding block and a request never owns it.
   for (int32_t split : {1, 2, 4, 8}) {
     for (int32_t dcp_rank = 0; dcp_rank < split; ++dcp_rank) {
       const KVShardLayout layout(kPhysicalBlockSize, split, dcp_rank);
@@ -94,13 +98,16 @@ TEST(KvShardContractTest, CanonicalBlockInvertsTheRuntimeShardLayout) {
   }
 }
 
-TEST(KvShardContractTest, ExpandsRequestIdsTheWayTheIndexerBlockTableDoes) {
+TEST(KvShardContractTest, CanonicalIdsComeFromPositionsNotFromPoolRows) {
   // A block-scoped group keeps one family that is actually split (the KV cache)
   // and one that keeps the whole sequence (the DSA indexer pool). Both live in
-  // the same group and receive the same request ids, and the runtime addresses
-  // them differently: the KV cache at row `b` and the indexer pool at the rows
-  // `b * dcp_size + j`. The canonical set is the expansion, which is also what
-  // the indexer's own block table does.
+  // the same group and receive the same request ids, and the canonical block is
+  // the request's *position* through the slice -- which the ids do not encode:
+  // a prefix-cache hit hands out rows wherever the shared prefix already sits,
+  // and a later chunk of a chunked prefill starts mid-sequence. Two tempting
+  // wrong derivations are covered here: `id - 1` (right only while the request
+  // owns rows 1..n) and the index within the step's list (right only while the
+  // step starts at position 0).
   const std::vector<CacheTensorDeclaration> local = {
       make_declaration(/*group_id=*/0,
                        /*kv_split_size=*/4,
@@ -109,48 +116,97 @@ TEST(KvShardContractTest, ExpandsRequestIdsTheWayTheIndexerBlockTableDoes) {
                        /*kv_split_size=*/4,
                        /*sequence_scoped=*/true),
   };
-  const std::vector<uint64_t> kv_ids = {0, 1, 3};
   std::vector<int64_t> canonical;
   std::string error;
   ASSERT_TRUE(canonical_blocks_of_request(
-      {{/*group_id=*/0, kv_ids}, {/*group_id=*/1, {7}}},
+      {// A prefix-cache hit: rows 37, 38 and 51 hold positions 0, 1 and 2.
+       {/*group_id=*/0, /*ids=*/{37, 38, 51}, /*positions=*/{0, 1, 2}},
+       // A later chunk of the same request starts at position 7.
+       {/*group_id=*/0, /*ids=*/{60, 61}, /*positions=*/{7, 8}},
+       // Sequence-scoped ids are positions already, so they carry none.
+       {/*group_id=*/1, /*ids=*/{100}, /*positions=*/{}}},
       local,
       &canonical,
       &error))
       << error;
+  const std::vector<int64_t> positions = {0, 1, 2, 7, 8};
   std::vector<int64_t> expected;
-  for (uint64_t id : kv_ids) {
+  for (int64_t position : positions) {
     for (int64_t j = 0; j < 4; ++j) {
-      expected.emplace_back(static_cast<int64_t>(id) * 4 + j);
+      expected.emplace_back(position * 4 + j);
     }
   }
-  expected.emplace_back(7);
+  expected.emplace_back(100);
   std::sort(expected.begin(), expected.end());
   expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
   EXPECT_EQ(canonical, expected);
 
-  // Every family then selects from that set with its own split and slice. The
-  // KV cache of slice `s` keeps `canonical / 4 == id`; the indexer pool (split
-  // 1) keeps all four rows, which is exactly its row count.
+  // Every family then selects from that set with its own split and slice, and
+  // turns it into its own row: the KV cache of slice `s` keeps the positions a
+  // split-4 rank owns, the indexer pool keeps every position at row
+  // `position + dcp_size` (which is exactly the expansion its own block table
+  // applies, `id * dcp_size + j`), and a sequence-scoped family's id is already
+  // its row.
   const CanonicalBlock kv_block(kPhysicalBlockSize, /*split=*/4);
-  const CanonicalBlock index_block(kPhysicalBlockSize, /*split=*/1);
   for (int32_t slice = 0; slice < 4; ++slice) {
     int32_t selected = 0;
     for (int64_t block : canonical) {
-      if (block % 4 != slice) {
+      if (block >= 4 * positions.back() + 4 || block % 4 != slice) {
         continue;
       }
       ++selected;
-      EXPECT_TRUE(std::find(kv_ids.begin(),
-                            kv_ids.end(),
-                            static_cast<uint64_t>(kv_block.local_row(block))) !=
-                  kv_ids.end());
+      // The position a block came from is the row the KV family is addressed
+      // by, before the pool's reserved row is added.
+      EXPECT_NE(
+          std::find(
+              positions.begin(), positions.end(), kv_block.local_row(block)),
+          positions.end())
+          << "block " << block;
     }
-    EXPECT_EQ(selected, static_cast<int32_t>(kv_ids.size()));
+    // Every position contributes exactly one canonical block to each slice, so
+    // a slice keeps as many rows as the request has blocks.
+    EXPECT_EQ(selected, static_cast<int32_t>(positions.size()));
   }
-  for (int64_t block : canonical) {
-    EXPECT_EQ(index_block.local_row(block), block);
+  // The indexer family is a full-sequence replica: its rows are scaled by the
+  // instance's kv-split and sit one reserved block in, so position `h` lands on
+  // row `h + kv_split_size`. That has to be the expansion its own block table
+  // applies, `id * dcp_size + j` for `id = h / 4 + 1` and `j = h % 4`.
+  constexpr int64_t kKvSplit = 4;
+  for (int64_t position : positions) {
+    const int64_t id = position / kKvSplit + 1;
+    EXPECT_EQ(position + kKvSplit, id * kKvSplit + position % kKvSplit);
   }
+}
+
+TEST(KvShardContractTest, RejectsABlockScopedGroupWithoutPositions) {
+  // Without positions the route cannot place anything: the id is a pool row and
+  // says nothing about where the block sits. Guessing a base -- `id - 1` -- is
+  // exactly the silent misplacement this contract exists to prevent, so a
+  // mapping that forgot to carry them fails instead.
+  const std::vector<CacheTensorDeclaration> local = {
+      make_declaration(/*group_id=*/0,
+                       /*kv_split_size=*/4,
+                       /*sequence_scoped=*/false),
+  };
+  std::vector<int64_t> canonical;
+  std::string error;
+  EXPECT_FALSE(canonical_blocks_of_request(
+      {{/*group_id=*/0, /*ids=*/{1, 2}, /*positions=*/{}}},
+      local,
+      &canonical,
+      &error));
+  EXPECT_NE(error.find("positions"), std::string::npos) << error;
+
+  // A position that would overflow the canonical id is refused too, so a
+  // garbage value cannot wrap into a plausible row.
+  EXPECT_FALSE(canonical_blocks_of_request(
+      {{/*group_id=*/0,
+        /*ids=*/{1},
+        /*positions=*/{std::numeric_limits<uint64_t>::max()}}},
+      local,
+      &canonical,
+      &error));
+  EXPECT_NE(error.find("out of range"), std::string::npos) << error;
 }
 
 TEST(KvShardContractTest, KeepsSequenceScopedIdsWhole) {

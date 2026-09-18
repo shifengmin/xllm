@@ -565,15 +565,48 @@ bool canonical_blocks_of_request(
     }
 
     if (sequence_scoped) {
+      // A sequence-scoped id is already the canonical unit: one sequence slot,
+      // and a slot id is a position in the sequence, not a pool row.
       for (uint64_t id : group.ids) {
         canonical_blocks->emplace_back(static_cast<int64_t>(id));
       }
       continue;
     }
-    // One logical block spans one canonical block per DCP rank.
+    // One logical block spans one canonical block per DCP rank, and the
+    // canonical id counts them from the sequence's first block -- so it is the
+    // request's *position*, through the slice.
+    //
+    // The position has to come from the caller: an id is a pool row, and
+    // nothing about it says which position it covers. Under a prefix-cache hit
+    // the rows come from wherever the shared prefix already sits, and a later
+    // chunk of a chunked prefill starts mid-sequence, so inferring the position
+    // from the id (the first version's `(id - 1)`) is right only for a request
+    // that happens to own rows 1..n -- and wrong silently for every other one.
+    if (group.positions.size() != group.ids.size()) {
+      set_error(error,
+                "cache group " + std::to_string(group.group_id) + " supplies " +
+                    std::to_string(group.ids.size()) + " block ids but " +
+                    std::to_string(group.positions.size()) +
+                    " positions; a block-scoped group has to say where each id "
+                    "sits in the sequence, because its id does not");
+      return false;
+    }
     const int64_t factor = static_cast<int64_t>(split);
-    for (uint64_t id : group.ids) {
-      const int64_t base = static_cast<int64_t>(id) * factor;
+    // The largest position whose canonical id still fits: a garbage position
+    // must not wrap into a plausible row.
+    const uint64_t max_position =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / factor);
+    for (size_t index = 0; index < group.positions.size(); ++index) {
+      const uint64_t position = group.positions[index];
+      if (position > max_position) {
+        set_error(error,
+                  "cache group " + std::to_string(group.group_id) +
+                      " reports position " + std::to_string(position) +
+                      " for block " + std::to_string(group.ids[index]) +
+                      ", which is out of range for a canonical block");
+        return false;
+      }
+      const int64_t base = static_cast<int64_t>(position) * factor;
       for (int64_t offset = 0; offset < factor; ++offset) {
         canonical_blocks->emplace_back(base + offset);
       }
