@@ -1013,3 +1013,66 @@ A2（便宜且修的是"静默走错路径"）→ A1 → A3 → E1（受资源�
 tp-invariant kv cache` 两个提交。⇒ **"验证 P/D DCP 异构 + indexer full sequence"到底验哪条实现**：
 (a) 我这条 `--pd_route=canonical`；(b) 主线 `push_route` + link_cluster gating；(c) 只验这个**配置/语义**本身（不绑实现）。
 **未定，下一步先问清再动手**（编译 + 部署成本高，走错方向代价大）。
+
+### 2026-09-18（第 16 轮）——运行时验证的执行计划与当前停点（**压缩上下文后的续接点**）
+
+**用户裁决（第 15 轮的三个问题）**
+
+1. 端到端验证目标 = **(a) 我这条分支的 `--pd_route=canonical`**（不是主线 `push_route`，也不是"只验配置语义"）。
+2. 通过判据 = **字节级比对 KV 传输结果**（不是"输出不乱码"）。
+3. 用户补充指令：**编译成功后先停下**，等用户压缩上下文再继续。
+
+**(1) 本轮已完成**
+
+| 事项 | 状态 / 位置 |
+|---|---|
+| 83 侧容器准备 | 已创建容器 **`fengmin-pdroute-83`**（83 上，`--network=host --privileged`），挂载：`/export/home`、`/mnt/cfs/9n-das-admin/llm_models`、`/etc/hccn.conf`、Ascend driver/add-ons、`npu-smi`、`/var/log/npu`、`/runtime`、`/var/queue_schedule`。镜像 `quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260801` |
+| 容器内已核实 | `hccn address_0=11.83.191.11` ✅；CFS 4 层模型可读（5 shard）✅；`npu-smi info -l` 8 NPU/16 chip ✅；`torch 2.9.0 + torch_npu post2`，`device_count=16` ✅；etcd / `xllm_master_serving` 二进制在 `/export/home/shifengmin.3/workspace/{xllm-pack-probe-one-20260805/xllm_pack, xllm-service/build/xllm_service}/` ✅；**镜像里没有 xllm python 包**（必须装 wheel）|
+| 模型完整性 | CFS `GLM-5.2-W8A8-EcoTech-4layers`：index 2472 个张量，引用 **5 个 shard 全在**，共 **20.48GB**；layers=[0,1,2,3]；非层键只有 `lm_head/embed_tokens/norm`；`indexer_types=['full','full','full','shared']`；**无 MTP**（`num_nextn_predict_layers=0`）⇒ 必须 `num_speculative_tokens=0` |
+| 98 侧构建树 | `xllm-pdroute` 已通过 **git bundle**（本地 `72e0ea817..pd-routing-s0s1`，541K）切到我的分支 **`d68d7eda2`**，工作区干净；`push_route.*` 已不在磁盘上 |
+| 构建流水线 | 容器 `fengmin-cann9-20260801`（98）内后台跑 `/tmp/build_and_wheel.sh` → 先 `ninja -C build/cmake.linux-aarch64-cpython-311 xllm`，成功后 `SKIP_TEST=1 python setup.py bdist_wheel --device npu`。日志 `/tmp/xllm_build2.log`，标记 `NINJA_EXIT=` / `WHEEL_EXIT=`；wheel 落 `xllm-pdroute/dist/*.whl` |
+
+**(2) 关键接线事实（本轮查清，后续直接用）**
+
+- **python 模型开关**：`--model_impl=python` + 环境变量 `XLLM_PYTHON_MODEL_PATH=<site-packages>`（即包含 `xllm` 包的那层目录；`launch_server.py:_ensure_python_model_path` 就是这么设的）。
+  证据：`model_config.cpp:143 is_python_model_impl()`、`glm_5_3_flash.md:151 --model_impl=python`。
+  ⇒ 直接调 ELF 时要显式给这两个。
+- **`kv_cache_transfer_type` 在我这条线里不存在**（`grep` 全树无此符号）——那是 README 那棵 b448eb5a 树的开关。我的树里 `KVCacheTransferFactory::create` 在 NPU 分支**无条件**造 Mooncake transfer
+  ⇒ 启动命令**不要**传 `--kv_cache_transfer_type`（传了会因未知 flag 出问题），canonical 只走 Mooncake。
+- 管控面端口占用：83 上 **4389 / 48889 已被别人的 `fengmin-cann9-0801` 占用**（`--network=host`）⇒ 我用**独立端口**：etcd `5389`、master `58888/58889`；P brpc `28994+`、D brpc `29994+`；transfer `46100+/47100+`；disagg_pd `9877/9878`。
+
+**(3) 计划拓扑（单机 83，16 chip 足够）**
+
+| 角色 | ranks | 并行 | 结果 S（DCP 切片数） | 设备 |
+|---|---|---|---|---|
+| Prefill | 4 | `dp=1 cp=2` ⇒ tp=2，`--kv_split_size=2` | **S_P=2**（形状 (a)：`S \| cp`） | chip 0–3 |
+| Decode | 2 | `dp=1 cp=1` ⇒ tp=2，`--kv_split_size=1` | **S_D=1**（形状 (a)） | chip 4–5 |
+
+⇒ **S_P=2 vs S_D=1 = DCP 异构**（prefill 两切片 → decode 单份，属"折叠"方向）。后续可加做 D `kv_split=2`（`cp=2, tp=1`，S_D=2 == cp*tp）作为**同构对照**。
+
+**(4) 下一步（压缩上下文后从这里继续）**
+
+1. 等 `WHEEL_EXIT=0`；记录 wheel 路径与大小。
+2. `docker cp` wheel 到 `fengmin-pdroute-83`，`pip install --force-reinstall --no-deps`；
+   校验 `python3 -c "import xllm; print(xllm.__file__)"` 与 `site-packages/xllm/xllm`（ELF）存在。
+3. 在容器内起 etcd(`5389`) + `xllm_master_serving`（`--etcd_addr=11.87.191.83:5389 --http_server_port 58888 --rpc_server_port 58889 --tokenizer_path=<4 层模型>`）。
+4. 先起 Decode（2 ranks）再起 Prefill（4 ranks），都带：`--model_impl=python`、`XLLM_PYTHON_MODEL_PATH=<site-packages>`、
+   `--enable_disagg_pd=true --instance_role={DECODE,PREFILL}`、`--pd_route=canonical`、`--num_speculative_tokens=0`、
+   `--model=/mnt/cfs/9n-das-admin/llm_models/GLM-5.2-W8A8-EcoTech-4layers`、`--npu_kernel_backend=ATB`。
+   就绪判据：各 rank 日志出现 `Brpc Server started`，`58888` 在 P+D 齐了之后 listen。
+5. Smoke：`/v1/models` + 短 chat（4 层模型输出不会正常，只看**是否报错/乱码崩溃**与日志）。
+6. **字节级验证**（用户要的判据，设计待定）：初步方案 = 在 canonical push 前后加**临时诊断**（env 门控），
+   P 侧把每个 `RouteRegion` 的**源字节**按 `(role, canonical_block, slice, offset)` 落盘；
+   D 侧在 KV 传输完成后把本地物理缓存按同一坐标落盘；两边文件拿到 Mac 上逐字节比对。
+   注意：D 侧没有 canonical 传输动作（PUSH 方向由 P 发起），所以 D 侧的取样点要挂在传输完成之后
+   （候选：`kv_transfer_completion.*`，或 decode worker 收到完成信号处）；PULL 已按 A2 显式拒绝（loud），
+   若运行中出现 canonical PULL 会立刻在日志里暴露 —— 这本身也是一条要观察的信息。
+7. 所有结论（含失败原因）回写本文件并 `git push origin pd-routing-s0s1`。
+
+**(5) 待澄清/风险**
+
+- 我的基线 200939593（+本分支）**是否支持 GLM-5.2 python + PD 端到端**尚未验证；72e0ea817 明显更旧（连 `kv_cache_transfer_type` 都没有）。
+  若 EP/PD 在 python 模型路径上编译或运行失败，**下一步的兜底**是：把这 21 个文件的 delta 移到 83/98 上那棵已验证的 b448eb5a 树
+  （`xllm_coding/xllm`，仅 root 可见）或 `xllm-coding/xllm`，用它们的 runtime + 我的 routing。
+- 4 层模型 `layer3` 是 MoE（`n_routed_experts=256`，`first_k_dense_replace=3`）⇒ 小 tp（2）时要注意 `--ep_size` 是否需要显式给。
+- 83 是共享机（别人有容器在跑，但卡是空的）：我只用 chip 0–5，绝不 kill 别人的进程。
