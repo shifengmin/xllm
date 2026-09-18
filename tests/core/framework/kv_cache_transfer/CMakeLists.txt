@@ -34,6 +34,18 @@ cc_test(
 
 cc_test(
   NAME
+    cache_directory_test
+  SRCS
+    cache_directory_test.cpp
+  DEPS
+    :cache_directory
+    :pd_route_table
+    :route_binder
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     pd_topology_guard_test
   SRCS
     pd_topology_guard_test.cpp

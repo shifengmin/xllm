@@ -236,6 +236,16 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
                   " is outside the remote instance");
     return false;
   }
+  // A view that names its rank has to be the rank being bound, otherwise the
+  // remote offsets below would address another rank's buffer. (A source view
+  // that names its rank only filters the edges, so it is checked per edge.)
+  if (remote.local_rank >= 0 && remote.local_rank != dst_local_rank) {
+    set_error(error,
+              "the destination view belongs to rank " +
+                  std::to_string(remote.local_rank) + " but rank " +
+                  std::to_string(dst_local_rank) + " was requested");
+    return false;
+  }
 
   // Bucket the request's canonical blocks by source slice, so that each edge
   // walks only the blocks it owns instead of the whole request (F7).
@@ -271,6 +281,12 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
                 "edge source rank " + std::to_string(edge.src_local_rank) +
                     " is outside the local instance");
       return false;
+    }
+    if (local.local_rank >= 0 && local.local_rank != edge.src_local_rank) {
+      // The table may cover every source rank; the work of the other ranks is
+      // carried by their own bind calls. Coverage below still fails if a
+      // requested block has no writer of this rank.
+      continue;
     }
     if (edge.src_slice < 0 || edge.src_slice >= local_split) {
       set_error(error,

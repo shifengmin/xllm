@@ -85,6 +85,11 @@ struct PeerCacheView {
   KvTopology topology;
   GroupTopology group;
   BufferDirectoryEntry entry;
+  // Local rank of the peer that published this view (cp_rank * tp_size +
+  // tp_rank), or -1 when it is unknown. Every region bind() emits is addressed
+  // in this rank's buffer, so a view that knows its rank makes bind() reject an
+  // edge of another source rank instead of addressing the wrong bytes.
+  int32_t local_rank = -1;
   // Page bases indexed by physical row; used only when entry.explicit_offsets
   // is set, and therefore empty otherwise.
   std::vector<uint64_t> row_offsets;
@@ -113,6 +118,12 @@ class RouteBinder final {
   // work by (source rank, destination rank) pair, which is also how the
   // transport below addresses peers. Sequence-scoped groups pass slot ids
   // instead: their split is 1, so the row is the id.
+  //
+  // `edges` may be the whole route table: edges of another destination rank or
+  // of another source rank are skipped. Skipping is safe because every
+  // requested block still has to be covered by an edge of this pair, and it
+  // keeps a rank-aware view from addressing another rank's buffer. A
+  // destination view that names a rank must be the rank being bound.
   //
   // Emits one region per (edge, canonical block, sub-unit) and then merges
   // regions that are adjacent in both buffers, so the output shape does not

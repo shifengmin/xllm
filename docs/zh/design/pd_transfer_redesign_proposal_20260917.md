@@ -489,6 +489,31 @@ S <= D 且 D % S == 0       => S_eff = S
 
 边表规模口径：F3 去掉 DP 维后，目标场景的边表本体是 **MLA 4 条 / KDA 8 条**；把同一张表套到 4 个 `dst_dp` 上才是交接文档所说的 **16 / 32 条有效边**。两者都在测试中固定。
 
+### S3-2 已完成（2026-09-18）：manifest → `PeerCacheView` 适配器
+
+新增 `cache_directory.{h,cpp}`，即 wire 表示（manifest）与 L3 物理视图之间的那道缝：
+
+| 类型 | 作用 |
+|---|---|
+| `CacheTensorDeclaration` | 模型侧声明：`(cache namespace, role, group id)` + 该族的 `KvTopology` + `GroupTopology`。manifest 只描述字节，表达不了 `G` / `head_bytes` / `sequence_scoped` / `full_sequence_replica` / `B_token`，这些必须声明后与描述符对账 |
+| `CacheRowBases` | 页映射（XTensor）张量的按物理行基点；非页映射张量给了就报错 |
+| `PeerDirectory::describe` | 解释 manifest 并对账，产出每张 cache tensor 的 `PeerCacheView` |
+
+对账项（每项都有负例）：坐标与声明拓扑一致；`resource_scope` 与 `sequence_scoped` 一致；`units_per_resource`（BLOCK 取 `block_token_capacity`、SEQUENCE 取 `physical_rows_per_resource`）与声明一致；span 的 `bytes_per_region` 即 `head_bytes`；span 数等于派生的 `H_l`；span 的 global head 区间恰是一个 head class（`owner_tp_rank == class × D_tp`，且 MAIN 下必须就是该 rank 的 class）；`head_bytes` 声明值非 0 时必须相符；页映射与 `row_bases` 一一对应。
+
+**两个实现层面的发现**：
+
+1. **COMPOSITE（CONV）描述符无法用"每条边一个 head 区间"表达**：`describe_conv` 把 `conv_key_a` / `conv_key_b` / `conv_value` 打进同一行，各 component 的 head 空间彼此独立、物理偏移还带 component 偏移，而 `RouteBinder` 的寻址只认"一个 head 区间 × 单元步长"。适配器**显式拒绝**（不静默降级）。S3-4 需要二选一：COMPOSITE 组继续走旧 planner，或给 `RouteEdge` / `PeerCacheView` 增加 per-component 字节偏移。
+2. **整资源（whole-resource）描述符只对单 head 组可路由**：`describe_replicated_tensor` 只给一个覆盖整行的 span、不带 head 轴。适配器仅在 `G == 1` 时接受（MLA latent、indexer kPool 及其它无 head 轴 role 都满足），更宽的组必须改成每 head 一个 span。
+
+顺带给 `PeerCacheView` 增加了 `local_rank`（`cp_rank * tp_size + tp_rank`，未知为 `-1`）：`bind` 据此跳过不属于本源 rank 的边，并拒绝与 `dst_local_rank` 不符的目的视图，避免把区间落到别的 rank 的 buffer。S2 既有单测不受影响（默认 `-1` 即不校验）。
+
+验证：`tests/core/framework/kv_cache_transfer/cache_directory_test.cpp` **18/18 PASSED**，与 S2 的 11 + 12 在容器内一并复跑全绿（共 41 个用例）。其中 MLA 夹具（`6513` 行 × `128` token、`TP8`、`kv_split=4`、`G=1`）派生 `S_eff=4`、`replica=2`，与实测 `index 26052 = 6513 × 4` 的分配几何一致；indexer 夹具的 `head_bytes = 514 = 257 × 2` 与 §6.2 实测的打包宽度一致。
+
+夹具是**照 `cache_layout_builder.cpp` 公式手写的约定夹具**（host 侧手编回路不链接 torch），builder 本身由既有 `tests/core/framework/kv_cache/cache_layout_builder_test.cpp` 覆盖。真实构建里可再用 `torch::zeros` + `describe_cache_tensor` 生成 manifest 喂给适配器，属后续增强。
+
+**未决项**：manifest 里的 `coordinates.kv_split_rank`（运行时取 DCP 分组 rank）尚未与 `KvLayoutIndex::slice_of(cp_rank, tp_rank)` 对账。两者必须在"规范块 ↔ 请求 block id"换算落地前统一，否则无法判断请求里的 id 属于哪个 rank 的切片 —— 属 S3-4/S3-5。
+
 ### 在开发机上的构建与验证（jd-node-98，aarch64 + Ascend）
 
 环境：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`（cmake 3.27.9 / ninja 1.11.1 / gtest 1.14.0），
@@ -526,6 +551,8 @@ sudo docker run --rm --privileged \
 | 两侧独立推导边表出现分歧（实现/版本不一致） | `PdRouteTable::validate` 作为两侧互相断言；拓扑元组进 `fingerprint`，不一致直接拒链 |
 | XTensor 页映射与规范块语义冲突 | `explicit_offsets` 作为 `BufferDirectoryEntry` 的一个标志位，规范层不感知；S1/S2 单测覆盖 XTensor 形态 |
 | sequence-scoped 缓存被误纳入 `t` 规则 | §6 明确边界；`t` 规则只对 `CacheResourceScope::BLOCK` 生效 |
+| COMPOSITE（CONV）组不在规范路由的表达范围内（§8.1 S3-2） | 适配器显式拒绝而非静默降级；S3-4 决定"COMPOSITE 走旧 planner"还是"边表/视图增加 per-component 字节偏移" |
+| 发布侧 `coordinates.kv_split_rank` 与派生切片 `slice_of` 可能不一致 | 适配器暂不据此判断；S3-4/S3-5 落地"规范块 ↔ 请求 block id"换算前必须先统一，否则会静默错块 |
 | 建链收敛后，运行期新增对端无法建链 | 保留 on-demand 建链路径：`PdRouteTable` 可在运行期对新的拓扑元组补算边表 |
 
 **回退点**：S0 / S1 完全独立可回退；S2 是纯新增并行路径；S3 起才切换行为，切换前保留旧路径的编译开关（`--pd_route=legacy|canonical`）以便灰度与快速回退。
