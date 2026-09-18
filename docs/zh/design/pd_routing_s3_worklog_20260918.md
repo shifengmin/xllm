@@ -16,7 +16,7 @@
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
 | S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ☐ |
-| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ☐ |
+| S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ 前置阻塞已定位（第 5 轮）：**物理切片 = `ContextParallelTopology::dcp_rank`**，S2 的 `slice_of` 必须改；修法已定案，代码待改 |
 
 ## 1. 硬约束（每轮先读，别再试错）
 
@@ -271,4 +271,51 @@ MLA 实例里 CONV 走整资源路径，`H_l == 1` 时正确、`H_l > 1` 时被�
 **验证汇总**（容器内，`~/pdroute_tools/s2_host_test.py`）：`kv_redundancy_test` 11/11、`pd_route_test` 12/12、
 `cache_directory_test` 19/19、`pd_route_integration_test` 4/4 **全绿**。
 搬运量打印：MLA kv4→kv4 6.6 MB、kv4→kv2 8.9 MB、kv2→kv4 6.6 MB、非 MLA 12.6 MB（含 indexer 全副本扇出）。
+
+### 2026-09-18（第 5 轮）——S3-5 前置：**物理切片 = DCP rank**，S2 的 `slice_of` 与之不一致
+
+> 本轮只做定位与定案（代码未改，保持全绿）。**这是 S3-4 接线前必须修的正确性问题**：不修就会静默搬错块。
+
+**问题**：`KvLayoutIndex::slice_of(cp, tp) = (cp*D_tp + tp % D_tp) % S_eff`（proposal §3.1 原文）。
+它假设"一个 DCP 组 = 同一 head class 的 `D_tp` 个 TP 副本"，于是把切片分配给 `tp % S_eff`。
+
+**事实（三处独立证据）**：
+
+| 证据 | 内容 |
+|---|---|
+| `kv_shard_layout.cpp:63-70` | `globalize(local_slot) = (local_block_id * dcp_size + dcp_rank) * block_size + offset` ⇒ **规范块 = 行 × S + `dcp_rank`**（这正是 `CanonicalBlock` 的公式，`CanonicalBlock` 本身没错），且 `owner_of(b) = b % S` |
+| `context_parallel_topology.cpp:43-73` | DCP 只有两种合法形状：(a) `S ≤ cp_size && cp_size % S == 0` ⇒ DCP 组是 PCP 组的划分，`dcp_rank = cp_rank / (cp_size/S)`；(b) `S == cp_size*tp_size` ⇒ DCP 覆盖整个 DP-local 域，`dcp_rank = cp_rank*tp_size + tp_rank`。**其它形状直接 `CHECK` 失败** |
+| `layers/npu_torch/qwen_dcp_attention.cpp:121-125` | NPU 路径就是 `KVShardLayout(block_size, dcp_group.world_size(), dcp_group.rank())`，而 `parallel_args.kv_split_rank()` 返回 `dcp_group_->rank()` ⇒ **NPU 的物理切片就是 `ContextParallelTopology::dcp_rank`** |
+| 归档（`glm5-next-dcp-session/_remote/glm5_3_flash_dcp_analysis.md:250`） | "DCP group 为 strided 分组（`global_rank % (world/kv_split)`）" ⇒ 组 = `{r : r % (world/kv) = g}` |
+
+**对 pilot 的影响**：`world/kv_split = 8` 且 `tp_size = 8` ⇒ 组 = 固定 tp、变动 cp ⇒ **`cp_size = 4`（PCP=4），`dcp_rank = cp_rank`**。
+所以 §6.5 里"P: TP8 + kv_split4"的写法应更正为 **`cp_size=4` + `tp_size=8`（world 32，`kv_split_size` 不设 ⇒ effective = cp_size = 4）**；
+`S_eff = 4` 的来源是 `S | cp_size`（case a，`pcp_per_dcp = 1`），不是"TP 冗余里挤出来的"。
+MLA 组（`G=1`）：`D_tp = 8`、`D = cp*D_tp = 32`、`N_rep = 8`。S2 模型给的 `slice = tp % 4`、写者 `tp ∈ {0,1,2,3}`（cp=0）**都是错的**；
+正确是 `slice = cp_rank`、写者 `(cp=s, tp=0)` ⇒ 局部 rank `s*8`。
+
+**不受影响的部分（好消息）**：`CanonicalBlock`（`canonical = row*S + slice`）与 `owner_of` 的**数值口径完全正确**；
+`N_rep = D/S`、`Hc*Hl = G`、每 `(h,t)` 恰一个写者、边表规模（`Hc_pairs × S × period × N_rep`）**都不变**。
+变的只是"哪个 rank 属于哪个切片/副本"，因此 S2 的**边表 golden 里的具体 rank 需要重算**，
+而所有不变量型断言（`kv_redundancy_test` 的穷举矩阵）保持不变。
+
+**修法（下一轮执行，已定案）**：
+
+1. `KvRedundancy::derive` 增加 C3 校验：`(S ≤ cp_size && cp_size % S == 0) || (S == cp_size*tp_size)`，否则报错
+   （报错信息要点名 DCP 拓扑，因为绕过它会在 `ContextParallelTopology` 里 `CHECK` 崩溃）。
+2. `KvLayoutIndex` 的 `slice_of` / `replica_of` 改成按 (a)/(b) 两分支：
+   - (a) `w = cp_size/S`：`slice = cp_rank / w`，序列副本组 `j = cp_rank % w`；
+     `replicas_of(h,t) = {(cp = t*w + j, tp = h*D_tp + k) : j∈[0,w), k∈[0,D_tp)}`，`writer_of` 取序首；
+   - (b) `slice = cp_rank*tp_size + tp_rank`，`replicas_of(h,t)` 只有 `dp_local == t` 那一个 rank（此时必有 `G=1`）。
+3. 受影响的测试与夹具（同一批改完再提交）：
+   - `pd_route_test`：T3 的两张 golden 表（MLA 4 条 / KDA 8 条）与 T4 字节 golden 的 rank 需按新规则重算；
+   - `kv_redundancy_test`：穷举矩阵要按 C3 过滤（并把被拒形状写成负例）；
+   - `cache_directory_test` 的 e2e 用例、`pd_route_integration_test` 的 MLA 场景（当前 `cp=1` 配 `S=4` 在 C3 下**非法**）
+     要改成 `cp_size=4`（如 `cp4/tp2/kv4` 或 `cp4/tp8/kv4`）；顺带让集成测试变成"运行时忠实"的拓扑。
+4. 文档：proposal §3.1 的 `slice/replica` 公式、handover §6.5 的目标场景描述、验证文档 F4 的行↔块映射说明。
+
+**教训**：S2 的三层只验证了"自洽"（同一条公式在两侧一致就过），没有任何一条断言把公式钉在
+`ContextParallelTopology` / `KVShardLayout` 这个运行时契约上。补 C3 与上述夹具时，应把"`slice` 必须等于
+`ContextParallelTopology::dcp_rank`"写成一条**显式断言**（在集成测试里用 `ContextParallelTopology` 算出期望切片，
+而不是用 `KvLayoutIndex` 反推），这样下次不一致会立刻暴露。
 

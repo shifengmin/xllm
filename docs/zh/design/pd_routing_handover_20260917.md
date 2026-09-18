@@ -275,8 +275,14 @@ mock 应对两种各出一例。
 | 两端都开、**k 相同** | ✅ **唯一可用** | 强制 `same_partition`（cp_rank + kv_split_rank 全等），D 只把 rank 对齐的 P 设为 ACTIVE |
 | 两端都开、k 不同 | ❌ | `supports_partition_pair` 假 ⇒ 建链期报错 |
 
-**前置条件：`kv_split == cp_size × tp_size == world / dp`。** 目标场景 `P: TP8 + kv_split4`（`S=4 ≠ cp*tp=8`）
-正好在此范围之外 —— 这正是重构要打开的新形状。⇒ **S3-4 不能只"换一条算路"**，必须同时替换
+**前置条件：`kv_split == cp_size × tp_size == world / dp`。** 目标场景正好在此范围之外 —— 这正是重构要打开的新形状。
+
+> **⚠️ 2026-09-18 更正（工作日志第 5 轮）**：目标场景的准确描述是 **`cp_size = 4`（PCP 4）+ `tp_size = 8`（world 32，dp 1），
+> `kv_split_size` 未设置 ⇒ effective = `cp_size` = 4**。理由：`world / kv_split = 8 = tp_size` 正是归档里"DCP 组为
+> `global_rank % (world/kv_split)` 的 strided 组"（= 固定 tp、变动 cp），而 `ContextParallelTopology` 只允许
+> "DCP 划分 PCP"或"DCP 覆盖整个 DP-local 域"两种形状，`cp=1 + S=4` 会直接 `CHECK` 崩溃。
+> 因此 `slice = dcp_rank = cp_rank`，**不是** `tp % 4` —— S2 的 `KvLayoutIndex::slice_of` 需要按此修正（详见工作日志第 5 轮）。
+> 旧前提 `kv_split == cp*tp`（这里 4 ≠ 32）依然不成立，所以"目标形状在旧路径支持范围之外"的结论不变。⇒ **S3-4 不能只"换一条算路"**，必须同时替换
 `filter_kv_split_infos` / `rotate_dst_rank` 那套 "`S == TP` 且两侧 rank 1:1 对齐" 的隐含前提；
 另外 `fingerprint` 不含 `kv_split`，跨实例的 `kv_split` / `B_token` 一致性必须由新校验兜住（S5）。
 
@@ -354,9 +360,15 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 - **S3-3 已完成**：链路 `真实张量 → describe_cache_tensor → manifest → PeerDirectory → PdRouteTable → bind → memcpy`
   在 4 个场景（MLA kv4→kv4/kv4→kv2/kv2→kv4、非 MLA 头分片 cp4/tp8/kv4→cp4/tp4/kv2）逐字节正确。
 - 探针全部关闭（§6.1/6.2/6.3 见 §6），S3-0（torch_npu include shim）也已完成，生产 TU 可编译验证。
-- 未决：`coordinates.kv_split_rank`（运行时 DCP rank）与 `KvLayoutIndex::slice_of` 尚未对账，必须在
-  "规范块 ↔ 请求 block id"换算落地前统一。
-- ② 数据面切换与 ③ 规范逻辑地址层**未开始**（S4/S5 的前置都已就绪）。
+- **S3-5 前置阻塞已定位（第 5 轮，必须先修）**：物理切片 = `ContextParallelTopology::dcp_rank`（NPU 侧
+  `qwen_dcp_attention.cpp` 用 `dcp_group.rank()` 构造 `KVShardLayout`），而 S2 的
+  `KvLayoutIndex::slice_of = (cp*D_tp + tp%D_tp) % S_eff` 是另一套分组。pilot 下正确值是 `slice = cp_rank`
+  （`cp_size=4`），写者是 `(cp=s, tp=0)`。**不修就会静默搬错块**，因此 S3-4 接线前必须完成：给
+  `KvRedundancy::derive` 加 C3（DCP 形状）校验 + 重写 `slice_of`/`replica_of`/`writers_of` + 重算 S2 的
+  rank golden（不变量与边表规模不变）。修法与测试清单见工作日志第 5 轮。
+- 未决：`coordinates.kv_split_rank`（= `dcp_rank`）与 `slice_of` 的对账即上述修正；`bind` 的 `local_rank` 校验
+  只覆盖 MAIN 命名空间。
+- ② 数据面切换与 ③ 规范逻辑地址层**未开始**（③ 的阻塞项已定案，先做 ③ 再做 ②）。
 
 **下一个会话的第一件事（建议顺序）**：
 
