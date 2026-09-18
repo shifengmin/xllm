@@ -369,7 +369,17 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
   `pd_route_integration_test` 4/4。**因此 ② 数据面切换现在可以开始**（先 PULL 后 PUSH）。
 - 未决：`coordinates.kv_split_rank`（= `dcp_rank`）与 `slice_of` 的对账即上述修正；`bind` 的 `local_rank` 校验
   只覆盖 MAIN 命名空间。
-- ② 数据面切换与 ③ 规范逻辑地址层**未开始**（③ 的阻塞项已定案，先做 ③ 再做 ②）。
+- **S3-4 入口已落地（第 7 轮）**：`pd_route_transfer.{h,cpp}` 提供统一入口
+  `PdRouteTransfer::transfer(cache, opcode, local_rank, canonical_blocks, local, peer, move, legs, error)`
+  （`opcode` = PULL/PUSH，`RouteLeg` 已按 opcode 取向、直接喂 `move_memory_regions`），
+  `PdRouteCache` 按两侧形状缓存边表（F8）。`--pd_route=legacy|canonical` 已注册（默认 `legacy`），
+  工厂里解析、非法值 `LOG(FATAL)`；`canonical` 现在**显式拒绝**，因为数据面还拿不到（a）role → 组几何的生产声明映射、
+  （b）对端各 rank 的视图与 `cp_size`（`InstanceInfo` 不含，`addrs` 的下标是"对端实例内全局 rank"）。
+  顺带加固 `RouteBinder::bind`（拒绝不属于目的切片的块）并把 `coordinates.kv_split_rank` 与 `slice_of` 的对账
+  加进适配器。容器内 **59 用例全绿**（含新增 `pd_route_transfer_test` 12/12，PUSH/PULL 双向逐字节对照模型期望），
+  三个生产 TU 真实 flags 编译 rc=0。**runtime 仍未验证**（§1.3）。
+- ② 数据面**生产调用点**与 ③ 规范逻辑地址层（请求 block id ↔ 规范块）仍未接线；下一轮的入口是把上面
+  （a）（b）两项输入补齐后打开 `canonical`，并把集成测试改走统一入口。
 
 **下一个会话的第一件事（建议顺序）**：
 

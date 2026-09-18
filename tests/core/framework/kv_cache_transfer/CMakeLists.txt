@@ -44,6 +44,16 @@ cc_test(
     GTest::gtest_main
 )
 
+cc_test(
+  NAME
+    pd_route_transfer_test
+  SRCS
+    pd_route_transfer_test.cpp
+  DEPS
+    :pd_route_transfer
+    GTest::gtest_main
+)
+
 # Builds real cache tensors through the layout builder, so it links :kv_cache
 # like cache_layout_builder_test does.
 cc_test(

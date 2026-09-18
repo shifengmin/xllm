@@ -168,7 +168,10 @@ void set_coordinates(WorkerCacheLayoutManifest* manifest,
   manifest->coordinates.cp_rank = cp_rank;
   manifest->coordinates.cp_size = side.cp_size;
   manifest->coordinates.kv_split_rank =
-      (cp_rank * side.tp_size + tp_rank) % side.kv_split_size;
+      side.kv_split_size <= side.cp_size &&
+              side.cp_size % side.kv_split_size == 0
+          ? cp_rank / (side.cp_size / side.kv_split_size)
+          : cp_rank * side.tp_size + tp_rank;
   manifest->coordinates.kv_split_size = side.kv_split_size;
   manifest->layout_family = "token_head_dim";
   manifest->backend = "npu";
