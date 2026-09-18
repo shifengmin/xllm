@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_utils.h"
+#include "framework/kv_cache_transfer/pd_route_transfer.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
 #include "util/net.h"
@@ -96,6 +97,19 @@ void append_mappings(std::vector<KVTransferMapping>& dst,
                           src_mapping.remote_ids.begin(),
                           src_mapping.remote_ids.end());
   }
+}
+
+// The binder's region and the transport's region are the same five fields; the
+// canonical route keeps its own type so the routing layer does not depend on
+// the legacy planner that also declares ByteRegion.
+ByteRegion to_byte_region(const RouteRegion& region) {
+  ByteRegion converted;
+  converted.local_buffer_id = region.local_buffer_id;
+  converted.local_offset = region.local_offset;
+  converted.remote_buffer_id = region.remote_buffer_id;
+  converted.remote_offset = region.remote_offset;
+  converted.length = region.length;
+  return converted;
 }
 
 void merge_kv_info(
@@ -776,6 +790,192 @@ bool MooncakeKVCacheTransferDefault::push_kv_blocks(
   VLOG(1) << "[Mooncake][PDTransfer] direction=push, destinations="
           << keys.size() << ", layers=" << num_layers << ", success=" << result;
   return result;
+}
+
+bool MooncakeKVCacheTransferDefault::push_kv_blocks_canonical(
+    const std::vector<TransferKVInfo>& transfer_kv_infos,
+    const ParallelArgs& parallel_args,
+    std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+    bool is_spec_draft) {
+  if (!canonical_ready_ || !local_directory_.has_value()) {
+    LOG(ERROR) << "pd_route=canonical cannot serve this instance: this rank's "
+                  "published cache layout was not declared or could not be "
+                  "interpreted. Use pd_route=legacy.";
+    return false;
+  }
+  const BufLayout& layout = is_spec_draft ? spec_layout_ : main_layout_;
+  CHECK(layout.registered) << "KV cache is not registered.";
+
+  // Which layer a region's buffer belongs to decides when it may be sent, so
+  // the flattening below can synchronize a layer once and then emit every
+  // peer's bytes for it.
+  std::unordered_map<uint64_t, int64_t> layer_of_buffer;
+  for (int64_t layer_id = 0; layer_id < layout.num_layers; ++layer_id) {
+    for (const RegisteredBufferDesc& buffer :
+         layout.layers[static_cast<size_t>(layer_id)]) {
+      layer_of_buffer.emplace(static_cast<uint64_t>(buffer.buf_id), layer_id);
+    }
+  }
+
+  // One push moves one namespace: the draft body publishes its own tensors
+  // under SPEC_DRAFT, and a draft push must not also move the main cache (the
+  // main push runs on the same worker).
+  const CacheNamespace cache_namespace =
+      is_spec_draft ? CacheNamespace::SPEC_DRAFT : CacheNamespace::MAIN;
+  std::vector<CacheTensorDeclaration> namespace_declarations;
+  namespace_declarations.reserve(declarations_.size());
+  for (const CacheTensorDeclaration& declaration : declarations_) {
+    if (declaration.cache_namespace == cache_namespace) {
+      namespace_declarations.emplace_back(declaration);
+    }
+  }
+  std::vector<PeerCacheView> local_views;
+  local_views.reserve(local_directory_->size());
+  for (size_t index = 0; index < local_directory_->size(); ++index) {
+    const PeerCacheView& view = local_directory_->at(index);
+    if (view.entry.cache_namespace == cache_namespace) {
+      local_views.emplace_back(view);
+    }
+  }
+
+  const int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size() /
+                          parallel_args.cp_size();
+  const int32_t local_rank_count = parallel_args.cp_size() * tp_size;
+  const int32_t local_rank = parallel_args.rank() % local_rank_count;
+
+  bool success = true;
+  PdRouteCache cache;
+  for (const TransferKVInfo& info : transfer_kv_infos) {
+    std::vector<CacheGroupRequest> groups;
+    groups.reserve(info.mappings.size());
+    for (const KVTransferMapping& mapping : info.mappings) {
+      groups.push_back(CacheGroupRequest{mapping.group_id, mapping.local_ids});
+    }
+    std::vector<int64_t> canonical_blocks;
+    std::string error;
+    if (!canonical_blocks_of_request(
+            groups, namespace_declarations, &canonical_blocks, &error)) {
+      LOG(ERROR) << "Cannot convert the request's cache ids into canonical "
+                    "blocks, request_id="
+                 << info.request_id << ": " << error;
+      return false;
+    }
+    if (canonical_blocks.empty()) {
+      continue;
+    }
+
+    const InstanceInfo& instance = info.remote_instance_info;
+    const int32_t destination_dp_size = instance.dp_size;
+    const int32_t destination_world_size =
+        static_cast<int32_t>(instance.cluster_ids.size());
+    if (destination_dp_size <= 0 || destination_world_size <= 0 ||
+        destination_world_size % destination_dp_size != 0 || info.dp_rank < 0 ||
+        info.dp_rank >= destination_dp_size ||
+        instance.addrs.size() != instance.cluster_ids.size()) {
+      LOG(ERROR) << "Invalid destination topology on the canonical route, "
+                    "request_id="
+                 << info.request_id;
+      return false;
+    }
+    const int32_t destination_local_rank_count =
+        destination_world_size / destination_dp_size;
+
+    // The peer's own published layout is what the route is derived from. The
+    // storage is reserved first so the addresses handed to build_route_peer
+    // stay valid while it is filled.
+    std::vector<WorkerCacheLayoutManifest> manifests;
+    manifests.reserve(static_cast<size_t>(destination_local_rank_count));
+    std::vector<const WorkerCacheLayoutManifest*> manifest_pointers;
+    manifest_pointers.reserve(
+        static_cast<size_t>(destination_local_rank_count));
+    for (int32_t local = 0; local < destination_local_rank_count; ++local) {
+      const std::string& peer_addr = instance.addrs[static_cast<size_t>(
+          info.dp_rank * destination_local_rank_count + local)];
+      std::optional<WorkerCacheLayoutManifest> manifest =
+          mooncake_te_->peer_cache_layout(peer_addr);
+      if (!manifest.has_value()) {
+        LOG(ERROR) << "The canonical route has no published cache layout for "
+                      "destination worker "
+                   << peer_addr << ", request_id=" << info.request_id;
+        return false;
+      }
+      manifests.emplace_back(std::move(*manifest));
+      manifest_pointers.emplace_back(&manifests.back());
+    }
+
+    RoutePeer peer;
+    if (!build_route_peer(instance.addrs,
+                          info.dp_rank,
+                          destination_local_rank_count,
+                          manifest_pointers,
+                          declarations_,
+                          row_bases_,
+                          &peer,
+                          &error)) {
+      LOG(ERROR) << "Cannot assemble the destination instance on the canonical "
+                    "route, request_id="
+                 << info.request_id << ": " << error;
+      return false;
+    }
+
+    // The peer may publish several namespaces in one layout; only this push's
+    // namespace moves here.
+    std::vector<PeerCacheView> peer_views;
+    peer_views.reserve(peer.views.size());
+    for (const PeerCacheView& view : peer.views) {
+      if (view.entry.cache_namespace == cache_namespace) {
+        peer_views.emplace_back(view);
+      }
+    }
+    peer.views = std::move(peer_views);
+
+    std::vector<RouteLeg> legs;
+    if (!PdRouteTransfer::plan(&cache,
+                               RouteOpcode::PUSH,
+                               local_rank,
+                               canonical_blocks,
+                               local_views,
+                               peer,
+                               &legs,
+                               &error)) {
+      LOG(ERROR) << "Cannot plan the canonical route, request_id="
+                 << info.request_id << ": " << error;
+      return false;
+    }
+
+    std::vector<RouteLayerBatch> batches;
+    if (!flatten_route_for_layers(legs, layer_of_buffer, &batches, &error)) {
+      LOG(ERROR) << "Cannot order the canonical route by layer, request_id="
+                 << info.request_id << ": " << error;
+      return false;
+    }
+    for (const RouteLayerBatch& batch : batches) {
+      if (!layer_synchronizer->synchronize_layer(batch.layer_id)) {
+        LOG(ERROR) << "Synchronize KV cache layer failed, layer="
+                   << batch.layer_id << ", request_id=" << info.request_id;
+        success = false;
+        continue;
+      }
+      std::vector<ByteRegion> regions;
+      regions.reserve(batch.regions.size());
+      for (const RouteRegion& region : batch.regions) {
+        regions.emplace_back(to_byte_region(region));
+      }
+      if (!mooncake_te_->move_memory_regions(
+              batch.peer_addr,
+              regions,
+              MooncakeTransferEngine::MoveOpcode::WRITE)) {
+        LOG(ERROR) << "The canonical route failed to write to "
+                   << batch.peer_addr << " at layer " << batch.layer_id
+                   << ", request_id=" << info.request_id;
+        success = false;
+      }
+    }
+  }
+  VLOG(1) << "[Mooncake][PDTransfer] direction=push, plane=canonical, "
+             "requests="
+          << transfer_kv_infos.size() << ", success=" << success;
+  return success;
 }
 
 // ============================================================================

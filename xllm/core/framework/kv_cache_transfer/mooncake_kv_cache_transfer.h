@@ -119,6 +119,12 @@ class MooncakeKVCacheTransferDefault final
       int32_t kv_split_rank,
       int32_t kv_split_size) override;
 
+  bool push_kv_blocks_canonical(
+      const std::vector<TransferKVInfo>& transfer_kv_infos,
+      const ParallelArgs& parallel_args,
+      std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+      bool is_spec_draft) override;
+
  private:
   struct RegisteredBufferDesc {
     int64_t buf_id = 0;

@@ -15,7 +15,7 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 7~11 轮**：入口/F8 缓存/开关/声明映射/id↔规范块/对端装配/**层化发送计划**已落地，71 用例全绿；**只剩把它们串进 `push_kv_blocks_async` 的 canonical 分支并摘掉 `LOG(FATAL)`**（步骤见第 11 轮末尾，无未知项） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ✅ **第 12 轮**：canonical 已是可选生产数据面（默认 legacy），PUSH 方向全链路接线；71 用例全绿 + 三个生产 TU rc=0。**PULL 方向未接**（pull 侧拿不到源实例信息，见第 12 轮末尾④）；**运行时未验证**（§1.3） |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
 
 ## 1. 硬约束（每轮先读，别再试错）
@@ -33,6 +33,13 @@
 6. 构建沙箱 `~/workspace/xllm-pdroute`：base `72e0ea817`（相关目录与基线 `200939593` 无差异），
    S2 文件靠 scp 同步；**权威副本是 git 分支 `pd-routing-s0s1`（origin）**。
 7. 容器镜像：`quay.io/jd_xllm/xllm-ai:xllm-dev-a3-arm-cann9-20260911`。
+7b. **probe 必须"先解包再编译"（第 12 轮踩坑）**：`stage.sh` 只把 tarball scp 到 `/tmp/s2sync.tgz`，
+   解包+拷进 worktree 是远端脚本的事；而 `probe_compile.py` 从 **worktree** 读源文件。
+   若只 stage 不 unpack，"编译通过"其实编译的是上次留下的旧文件。
+   现在 `run_probe3.sh` / `remote_stage_and_test.sh` 都先 `tar xzf` + `cp` 再编译；
+   并且 **`config/disagg_pd_config.{h,cpp}`、`kv_cache_transfer.{h,cpp}` 必须进 staging**
+   （第 7~11 轮漏了 config，导致 `kv_cache_transfer.cpp` 的 rc=0 不可信）。
+   自检：`tar tzf /tmp/s2sync.tgz | grep -c config` 应为非 0。
 9. **运行时本体可以链进手编 harness（第 9 轮验证）**：`kv_shard_layout.cpp` 与
    `context_parallel_topology.cpp` 只依赖 glog，链接行加
    `libglog.a` + `libgflags.a`（都在 `vcpkg_installed/arm64-linux/lib/`）即可；
@@ -737,3 +744,64 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 逐 batch `synchronize_layer` + `move_memory_regions(..., WRITE)`（`RouteRegion` 逐字段拷成 `ByteRegion`），
 然后把 `--pd_route=canonical` 的 `LOG(FATAL)` 换成真正分支。
 `canonical_ready_` 为假时必须显式拒绝（不能静默走 legacy）。
+
+### 2026-09-18（第 12 轮）——S3-4 接线**完成**：canonical 走生产数据面，并修掉一个会让验证失真的 harness 缺陷
+
+第 11 轮列的"最后一步"本轮做完：canonical 已经是一个**可选的生产数据面**（默认仍是 legacy）。
+
+**(1) 开关变成真分支**（`kv_cache_transfer.{h,cpp}`）
+
+- 工厂不再 `LOG(FATAL)`：解析 `--pd_route` 后 `transfer->set_canonical_route(route_mode == CANONICAL)`；
+- `push_kv_blocks_async` 开头分流：canonical ⇒ 直接调新虚函数并返回，**完全跳过**
+  `validate_transfer_mappings` / `filter_kv_split_infos` / `rotate_dst_rank` / `merge_kv_blocks`
+  —— 那套"rank 1:1 对齐"的前提对 canonical 不成立；
+- 新增虚函数 `push_kv_blocks_canonical(infos, parallel_args, layer_synchronizer, is_spec_draft)`：
+  **基类默认实现报错拒绝**（"this backend has no canonical data plane"），
+  `MooncakeKVCacheTransferDefault` 覆盖，`MooncakeKVCacheTransferXTensor` 不覆盖（XTensor 本来就是
+  `canonical_ready_ = false`）。**没有任何静默回落**。
+
+**(2) canonical push 实现**（`mooncake_kv_cache_transfer.cpp`）
+
+链路：`canonical_blocks_of_request`（第 9 轮）→ `peer_cache_layout` 取对端每个局部 rank 的 manifest（第 11 轮）
+→ `build_route_peer`（第 10 轮）→ `PdRouteTransfer::plan(PUSH)`（第 7 轮）→ `flatten_route_for_layers`（第 11 轮）
+→ 逐 batch `synchronize_layer(layer)` 后 `move_memory_regions(peer_addr, regions, WRITE)`，
+其中 `RouteRegion` 用文件内 `to_byte_region()` **逐字段**转换（字段若被改名会编译失败，不会静默错位）。
+
+三处防御按"响亮失败"写：
+
+1. `canonical_ready_ == false` ⇒ 直接报错并说明用 legacy；
+2. 对端某个局部 rank 没有公布的布局 / 地址表不覆盖该 DP 组 / manifest 与模型不符 ⇒ 请求失败（不猜、不跳）；
+3. **命名空间隔离**（本轮发现并修的真实缺口）：一次 push 只搬一个命名空间。draft body 的 tensor 注册在
+   SPEC_DRAFT 下且与 MAIN 共用 group id，而 `plan` 会遍历全部本地族 —— 不隔离就会让 draft push 顺手把主缓存也搬一遍。
+   现在按 `cache_namespace` 过滤 `declarations_` / `local_views` / `peer.views` 三处。
+   （SPEC_DRAFT 视图 `local_rank == -1`，`plan` 仍按"同族只有一个未命名视图"兜底，多于一个直接报错。）
+
+**(3) 修掉一个会让验证失真的 harness 缺陷（重要，影响此前若干轮的结论）**
+
+`stage.sh` 只把 tarball **scp 到 `/tmp/s2sync.tgz`**，真正解包并拷进 worktree 的是另一个脚本；
+而 `run_probe_compile.py` 是**从 worktree 读源文件**编译的。于是"先 stage 再跑 probe"实际编译的是**上一次解包留下的旧文件**。
+本轮首次真正验证时立刻暴露：
+
+- `mooncake_kv_cache_transfer.cpp` 报 `PdRouteTransfer has not been declared`（新代码根本没被编译）；
+- 补上 include 后 `kv_cache_transfer.cpp` 报 `DisaggPDConfig has no member pd_route`
+  —— 因为 **`config/` 目录从来没进过 staging**（`stage.sh` 里加 config 的补丁被 `if 'config' not in s` 误判跳过，
+  文件里 `~/.ssh-xllm-config` 就含 "config" 子串）。
+
+修法：`stage.sh` 增加 `lib/kv_cache_transfer.{h,cpp}` 与 `config/disagg_pd_config.{h,cpp}`；
+`run_probe3.sh` 与 `remote_stage_and_test.sh` 都先**解包+拷贝**再编译；并用 `tar tzf | grep -c config` 自检。
+
+**结论**：此前各轮"生产 TU 编译 rc=0"的结论里，`kv_cache_transfer.cpp` 那一条在
+**第 7 轮（引入 `--pd_route` 读配置）之后到本轮之前是不可信的**（旧 config 头 + 旧源文件）。
+`mooncake_kv_cache_transfer.cpp` / `cache_layout_builder.cpp` / host 单测不受影响（后者一直从 staged `lib/`、`kvcache/` 编译）。
+**本轮已用修好的流程重新验证全部三个 TU：rc=0。**
+
+**验证汇总**：容器内 **71 用例全绿**（12+12+23+6+14+4）；
+生产 TU 编译（修好的流程）：`mooncake_transfer_engine.cpp`、`mooncake_kv_cache_transfer.cpp`、`kv_cache_transfer.cpp` **全部 rc=0**。
+
+**仍未验证（必须标注）**：canonical 分支**没有运行时验证** ——
+① GLM5.3flash 尚不支持 PD 分离（§1.3）；② 协商方向（谁给谁发 manifest）只读码确认；
+③ `push_kv_blocks_canonical` 没有 host 单测（它直接依赖 Mooncake 引擎与 NPU layer synchronizer），
+其可单测的部分（`canonical_blocks_of_request` / `build_route_peer` / `plan` / `flatten_route_for_layers`）已各自覆盖；
+④ **canonical PULL 未接**：`pull_kv_blocks_async` 只拿到**单个源 rank 的地址**与 mappings，
+   没有源实例的 `InstanceInfo`（addrs/dp_size），所以接 PULL 需要额外把源实例信息带到 pull 侧。
+   这与 S3-4 原计划的"先 PULL 后 PUSH"顺序相反，原因是**数据可得性**而不是偏好，已在文档标注。

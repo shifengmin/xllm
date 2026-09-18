@@ -225,6 +225,15 @@ folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
                         layer_synchronizer,
                         is_spec_draft,
                         promise = std::move(promise)]() mutable {
+    if (canonical_route_) {
+      // The canonical route derives the writer and the reader of every
+      // canonical block from the two peers' layouts, so the rank-aligned stride
+      // remap below does not apply to it at all.
+      const bool canonical_success = this->push_kv_blocks_canonical(
+          transfer_kv_infos, parallel_args, layer_synchronizer, is_spec_draft);
+      promise.setValue(canonical_success);
+      return;
+    }
     std::unordered_map<std::string, KVCacheInfo> merged_kv_infos;
     std::vector<TransferKVInfo> filtered_kv_infos;
     const std::vector<TransferKVInfo>* kv_infos = &transfer_kv_infos;
@@ -286,18 +295,6 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
                << pd_route_mode_name(PdRouteMode::LEGACY) << "` or `"
                << pd_route_mode_name(PdRouteMode::CANONICAL) << "`.";
   }
-  if (route_mode == PdRouteMode::CANONICAL) {
-    // The canonical planner and its host verification exist, but the data plane
-    // still reaches the peers through the legacy plan negotiation, which does
-    // not publish the cache views (or the group geometry) the canonical route
-    // is derived from. Refusing here keeps `canonical` from silently behaving
-    // like `legacy`.
-    LOG(FATAL) << "pd_route=canonical is not wired into the transfer path yet: "
-                  "the canonical route needs the peer cache views and the "
-                  "model-side group declarations, which the transfer path does "
-                  "not publish yet. Use pd_route=legacy.";
-  }
-
   LOG(INFO) << "Create Mooncake KVCacheTransfer, pd_route="
             << pd_route_mode_name(route_mode) << ".";
   std::shared_ptr<MooncakeKVCacheTransferBase> mooncake_transfer;
@@ -320,6 +317,7 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
       device_id, transfer_listen_port, device, model_type);
 #endif
   transfer = mooncake_transfer;
+  transfer->set_canonical_route(route_mode == PdRouteMode::CANONICAL);
 #endif
 
   return transfer;
