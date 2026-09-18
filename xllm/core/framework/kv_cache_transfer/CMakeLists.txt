@@ -61,6 +61,20 @@ cc_library(
 
 cc_library(
   NAME
+    cache_directory
+  HDRS
+    cache_directory.h
+  SRCS
+    cache_directory.cpp
+  DEPS
+    :cache_layout
+    :kv_redundancy
+    :pd_route_table
+    :route_binder
+)
+
+cc_library(
+  NAME
     pd_topology_guard
   HDRS
     pd_topology_guard.h

@@ -13,7 +13,7 @@
 |---|---|---|---|
 | S3-0 | **解除生产 TU 的编译阻塞**：镜像里 `<torch_npu/torch_npu.h>` 路径不符（真身在 `torch_npu/include/torch_npu/csrc/libs/torch_npu.h`）。做一个 include shim 后，让 `kv_cache_transfer.cpp` / `mooncake_kv_cache_transfer.cpp` 能在容器内编过 | 两个 TU 用真实 flags 编译成功（或证明失败发生在无关的第三方头） | ✅ 第 1 轮 |
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
-| S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ☐ |
+| S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具按 builder 公式手写，未链 torch；见第 3 轮说明） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ☐ |
 | S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ☐ |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ☐ |
@@ -94,6 +94,9 @@
 
 ### 2026-09-18（暂停点，S3-2 进行中）
 
+> ⚠️ 本节是**暂停时的设计稿**，其中的 API 草案（`CacheGroupGeometry` + 单个 `KvTopology` + 扁平 `page_bases`）
+> 已在第 3 轮按下面的实现调整；结论与待办仍然有效。实现结果见「第 3 轮」。
+
 **用户要求暂停以便压缩上下文**（目标已 pause，未推进到下一轮）。S3-2 的设计已经定下来，但**代码尚未落盘**，
 下次从这里继续（重新 resume 目标即可）：
 
@@ -144,3 +147,67 @@ component 偏移 ⇒ 适配器对分片组的"span 数 == local_heads"校验**�
 **未验证事项**：S3-2 现在只是设计；`describe_cache_tensor` 的 **torch 链接测试**是否可行尚未验证
 （若可行，比手工 fixture 更强；若不可行，按既有 `reshard_planner_test.cpp` 的 fixture 约定写，并在文档标注
 "约定一致、非 builder 实测"）。
+
+### 2026-09-18（第 3 轮）——S3-2 ✅ 适配器落地
+
+**新增/改动文件**：
+
+| 文件 | 内容 |
+|---|---|
+| `xllm/core/framework/kv_cache_transfer/cache_directory.h` | `CacheTensorDeclaration`（模型侧声明：`(namespace, role, group_id)` + `KvTopology` + `GroupTopology`）、`CacheRowBases`（页映射按行基点）、`class PeerDirectory final`（`describe` / `find` / `size` / `at`） |
+| `xllm/core/framework/kv_cache_transfer/cache_directory.cpp` | 解释 manifest + 对账，产出 `PeerCacheView`（含 `local_rank`） |
+| `xllm/core/framework/kv_cache_transfer/route_binder.{h,cpp}` | `PeerCacheView::local_rank`（默认 `-1` = 不校验）；`bind` 跳过异源 rank 的边、拒绝目的视图与 `dst_local_rank` 不符 |
+| `tests/core/framework/kv_cache_transfer/cache_directory_test.cpp` | 18 个用例（8 正例 + 10 负例），含"S3-3 迷你版"：两个真实 manifest → 建表 → 绑定 → 逐字节覆盖断言 |
+| 两处 `CMakeLists.txt` | `cc_library(cache_directory)` / `cc_test(cache_directory_test)` |
+
+**与暂停稿设计的差异（都是被实现逼出来的）**：
+
+1. `CacheGroupGeometry` → `CacheTensorDeclaration`：声明里带上该族的 `KvTopology`。理由：SPEC_DRAFT 的
+   manifest 坐标描述的是 MAIN 的拓扑，draft body 有自己的 TP；同时 MAIN 的声明必须与 manifest 坐标一致（已校验）。
+2. 扁平 `page_bases` → `CacheRowBases` 列表（按 `(namespace, layer, role, group_id)` 查）。理由：页基点是按张量
+   给的，XTensor 下 `buffer_id = 0`、`buffer_bytes` 是整个全局区，一张表无法表达多张张量。
+3. 检查项比设计多了三条：`layout` 必须是 binder 真正寻址的那种（每 head 一个 span、head 在资源内连续、
+   `repeat_count == units`）、`owner_tp_rank == class × D_tp`、`local_rank` 与坐标一致。前两条把"约定"
+   变成"可证明"，第三条顺带补上了 S2 的一个洞（详见下）。
+
+**本轮确认的两个实现约束**（已写进 proposal §8.1 与 handover §7.4）：
+
+1. **COMPOSITE（CONV）不在规范路由的表达范围内**。读完 `describe_conv` 后确认：三个 component 共用一个
+   descriptor，`logical_offset` 是 **component 局部**的 head 索引，`physical_offset` 带 component 偏移，而
+   `RouteBinder` 只会按 `(head - rank_head_begin) × head_bytes` + `unit × local_heads × head_bytes` 寻址。
+   适配器**显式拒绝**（错误信息里点名 composite），S3-4 需要决定：COMPOSITE 组继续走旧 planner，还是给
+   `RouteEdge` / `PeerCacheView` 增加 per-component 字节偏移。
+2. **整资源（whole-resource）描述符只对 `G == 1` 可路由**。`describe_replicated_tensor` 只给一个覆盖整行的
+   span、不带 head 轴；`G > 1` 时无法说明自己持有哪些 head。生产三个来源（MLA latent、INDEX/INDEX_SCALE、
+   无 head 轴 role）都是 `G == 1`，所以不影响现状。唯一需要小心的歧义：`units == 1 && H_l == 1 && G > 1`
+   （例如 `checkpoint_stride = 1` 的 SSM）时，单 span 既像整资源又像"一个 head 一行"，代码按**每 head**解释
+   （`whole_resource` 分支要求 `G == 1`），并在该分支之外保留了这一退化路径。
+
+**顺带补的 S2 洞**：`PeerCacheView` 之前不携带 rank，`bind` 无法判断传入的 `local` 是哪个源 rank —— 传入
+整张边表时，属于别的源 rank 的边会用**本视图的 buffer** 配上**那条边的源 rank 几何**算出区间，静默错字节。
+现在 `local_rank >= 0` 时跳过异源边（覆盖校验仍会抓住"没有写者"），`remote.local_rank` 则必须等于
+`dst_local_rank`。默认 `-1` 保持 S2 既有单测不变。
+
+**验证**（容器内，`~/pdroute_tools/s2_host_test.py`，已加 `cache_directory_test` 目标）：
+
+```
+kv_redundancy_test  11/11 PASSED
+pd_route_test       12/12 PASSED
+cache_directory_test 18/18 PASSED
+```
+
+夹具与实测的交叉验证：MLA 夹具（`6513` 行 × `128` token、`TP8`、`kv_split=4`、`G=1`）派生
+`S_eff=4`、`replica=2`，与实测 `index 26052 = 6513 × 4`（§6.1）的分配几何一致；indexer 夹具
+`head_bytes = 514 = 257 × 2` 与 §6.2 的打包宽度一致。
+
+**仍未做的**：
+
+- 夹具是照 builder 公式手写的，没有链 torch 跑真实 `describe_cache_tensor`。仓库里
+  `tests/core/framework/kv_cache/cache_layout_builder_test.cpp` 已证明"torch 张量 + builder"在真实构建下可行
+  （它链接 `:kv_cache` + ascendcl），所以真实构建的 `cache_directory_test` 可以同样用 `torch::zeros` 造 manifest；
+  host 手编回路要链 torch 才行，本轮没做。
+- `coordinates.kv_split_rank`（运行时 DCP rank）与 `KvLayoutIndex::slice_of` 尚未对账。**这是 S3-4/S3-5 的前置**：
+  在"规范块 ↔ 请求 block id"换算落地前必须统一，否则无法判断请求里的 id 属于哪个 rank 的切片。
+- `bind` 的 `local_rank` 校验只覆盖 MAIN 命名空间；SPEC_DRAFT 视图填 `-1`（其描述符自带 placement，而坐标是
+  MAIN 的），调用方需自行过滤边。
+

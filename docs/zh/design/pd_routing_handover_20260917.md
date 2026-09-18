@@ -344,11 +344,21 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
 | **探针** | §6.1 index 行数比、§6.2 kPool 打包宽度（128 / 257）、§6.3 `filter_kv_split_infos` 是否真被跳过 | 需要真实实例 |
 | **T6** | 真实 PD 逐 `(block, group)` 字节/校验和验收 | **GLM5.3flash 尚不支持 PD 分离** |
 
+**S3 进展（2026-09-18，详见 `pd_routing_s3_worklog_20260918.md` 与 proposal §8.1）**：
+
+- ① **已完成**：`cache_directory.{h,cpp}` + `cache_directory_test.cpp`（18/18），并给出两条实现约束——
+  **COMPOSITE（CONV）描述符不在"每条边一个 head 区间"的表达范围内**（适配器显式拒绝，S3-4 需要决定走旧 planner
+  还是给边表加 per-component 偏移）；**整资源描述符只对 `G == 1` 的组可路由**。
+- 探针全部关闭（§6.1/6.2/6.3 见 §6），S3-0（torch_npu include shim）也已完成，生产 TU 可编译验证。
+- 未决：`coordinates.kv_split_rank`（运行时 DCP rank）与 `KvLayoutIndex::slice_of` 尚未对账，必须在
+  "规范块 ↔ 请求 block id"换算落地前统一。
+- ② 数据面切换与 ③ 规范逻辑地址层**未开始**。
+
 **下一个会话的第一件事（建议顺序）**：
 
 1. 复跑一次 S2 的 host 测试，确认环境仍然可用（命令见 §7.3）。若 `s2_host_test.py` 不在，
    用 §5.11 的规则重建（`compile_commands.json` 取 flags + 最小链接 gtest）。
-2. 写适配器：从 `CacheTensorManifest` 生成 `BufferDirectoryEntry` + `PeerCacheView`。字段对应关系：
+2. ~~写适配器~~ **✅ 已完成（2026-09-18，`cache_directory.{h,cpp}`，18/18 单测）**。落地时的字段对应关系：
 
     | L3 字段 | 来源 |
     |---|---|
@@ -357,13 +367,17 @@ MLA 走 `describe_replicated_tensor`（整行、`owner_tp_rank=0`、REPLICATED�
     | `explicit_offsets` | `CacheTensorManifest::explicit_resource_offsets` |
     | `units_per_resource` | BLOCK 组取 `block_token_capacity`；SEQUENCE 组取 `physical_rows_per_resource` |
     | `topology.{cp,tp,kv_split}_size`、`tokens_per_block` | `ParallelCoordinates` / `options_.block_size()` |
-    | `group.global_head_count` | MLA/indexer 为 1；CONV/SSM 取 `linear_*_head_count`；KV 取 `kv_head_count` |
-    | `group.head_bytes` | 由 `bytes_per_head`（`describe_*` 里已算好）或 shape/stride 推导 |
-    | `group.sequence_scoped` | `CacheResourceScope::SEQUENCE` |
-    | `group.full_sequence_replica` | `enable_mla` 分支（MLA/indexer）当前都应声明 |
-    | `row_offsets` | 仅 `explicit_offsets` 时填，来自 `GlobalXTensor` 的页基点 |
+    | `group.global_head_count` | MLA/indexer 为 1；SSM 取 `linear_value_head_count`；KV 取 `kv_head_count`。**CONV 无法表达**（见下） |
+    | `group.head_bytes` | 由描述符的 `bytes_per_region` 推出（整资源 span 则 `resource_stride_bytes / units`）；声明值非 0 时必须相符 |
+    | `group.sequence_scoped` | `CacheResourceScope::SEQUENCE`，且必须与声明一致 |
+    | `group.full_sequence_replica` | **只有 indexer kPool 声明 `true`**；MLA latent 声明 `false`（实测 KV 行数 `6513 = 26052/4` ⇒ `S_eff=4`）。此处原表格把二者混为一谈，已更正 |
+    | `row_offsets` | 仅 `explicit_offsets` 时填，来自 `GlobalXTensor` 的页基点；非页映射张量给出基点即报错 |
 
-   注意：适配器是"S3 的第一块砖"，它一旦落地，S2 的三层就真正进入生产路径。
+    **落地时新发现的两条约束**（详见 proposal §8.1）：
+    - `describe_conv` 的 **COMPOSITE 描述符**（`conv_key_a` / `conv_key_b` / `conv_value` 混在一行）不落在
+      "每条边一个 head 区间"的表达范围内，适配器**显式拒绝**；S3-4 需决定 COMPOSITE 组继续走旧 planner
+      还是给边表加 per-component 字节偏移。
+    - **整资源（whole-resource）描述符只对 `G == 1` 的组可路由**（它不带 head 轴）。
 3. 然后按 S3 → S4 → S5 推进；每一步都保持 `S_P = S_D` 的退化配置作为等价锚点。
 
 **已锁定的决策（不要再翻）**：
