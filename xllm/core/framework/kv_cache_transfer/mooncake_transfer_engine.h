@@ -77,8 +77,15 @@ class MooncakeTransferEngineCore {
   // The cache layout a peer published, for the canonical route. The legacy path
   // keeps only the plan it built from this layout; the canonical route derives
   // its own tables, so it needs the layout itself.
+  //
+  // Both directions of the negotiation write here: a peer that pushed its
+  // layout to us over SetCachePeer, and a peer whose layout we fetched while
+  // linking (link_sessions). The canonical pull needs the second case, because
+  // the pulling side is the one that fetched.
   std::optional<WorkerCacheLayoutManifest> peer_cache_layout(
       const std::string& remote_addr) const;
+  void set_peer_cache_layout(const std::string& remote_addr,
+                             const WorkerCacheLayoutManifest& manifest);
   Status bind_outgoing_regions(const std::string& remote_addr,
                                const std::vector<KVTransferMapping>& mappings,
                                CacheNamespace cache_namespace,
@@ -132,14 +139,12 @@ class MooncakeTransferEngineCore {
     uint64_t destination_layout_generation = 0;
     CachePeerMode mode = CachePeerMode::PLAN_ONLY;
     std::optional<ReshardPlanTemplate> plan;
-    // Retained for the canonical route, which builds its tables from the peer's
-    // own layout instead of from a plan.
-    std::optional<WorkerCacheLayoutManifest> manifest;
     bool holds_session = false;
   };
   std::unordered_map<std::string, SessionInfo> handles_;
   std::optional<WorkerCacheLayoutManifest> local_cache_layout_;
   std::unordered_map<std::string, CachePeerLink> cache_peer_links_;
+  std::unordered_map<std::string, WorkerCacheLayoutManifest> peer_layouts_;
   std::unordered_map<uint64_t, proto::MooncakeTransferEngineService_Stub*>
       stub_map_;
 };

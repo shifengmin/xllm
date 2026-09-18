@@ -15,7 +15,7 @@
 | S3-1 | **探针 §6.1 / §6.2 / §6.3**：index 行数比（切/复制）、kPool 打包宽度、`filter_kv_split_infos` 是否被跳过 | 有可复现的实测输出（日志或探针打印），结论写回 `pd_route_verification_plan` | ✅ 第 2 轮（靠既有实测存档） |
 | S3-2 | **适配器**：`CacheTensorManifest`/`ParallelCoordinates` → `BufferDirectoryEntry` / `PeerCacheView`，字段映射见 handover §7.4 | host 单测：用**真实 `describe_cache_tensor`** 造 manifest，再与手算期望逐字段比对 | ✅ 第 3 轮（夹具手写）；真实 builder 输出由 S3-3 覆盖（第 4 轮） |
 | S3-3 | **host 集成测试**：manifest → 适配器 → `PdRouteTable::build` → `RouteBinder::bind` → memcpy 端到端 | 目标场景逐字节正确（T5 的"真实 manifest"版本） | ✅ 第 4 轮（4 个场景，真实 `describe_cache_tensor`） |
-| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ✅ **第 12 轮**：canonical 已是可选生产数据面（默认 legacy），PUSH 方向全链路接线；71 用例全绿 + 三个生产 TU rc=0。**PULL 方向未接**（pull 侧拿不到源实例信息，见第 12 轮末尾④）；**运行时未验证**（§1.3） |
+| S3-4 | **数据面切换**：`transfer(edges, canonical_blocks, opcode)` 统一入口，先 PULL 后 PUSH；用 `--pd_route=legacy\|canonical` 开关，默认 legacy | 编译通过 + 单测；运行时行为未验证（见约束） | ⚠️ **第 12~13 轮**：canonical 已是可选生产数据面（默认 legacy），PUSH 全链路接线；71 用例全绿 + 三个生产 TU rc=0。**PULL 只差把 `src_dp_rank` 带到 pull 侧**（其余输入第 13 轮已留存，无未知项）；**运行时未验证**（§1.3） |
 | S3-5 | **规范逻辑地址层**：`logical_offset` 改规范块坐标，`bind` 只做物理换算 | `S_P = S_D` 等价锚点 + `S_P ≠ S_D` 折叠用例 | ⚠️ **换算规则已查清并落地**（第 9 轮：`canonical_blocks_of_request` + 运行时 oracle，67 用例全绿）；**尚未接进数据面** |
 
 ## 1. 硬约束（每轮先读，别再试错）
@@ -805,3 +805,53 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
 ④ **canonical PULL 未接**：`pull_kv_blocks_async` 只拿到**单个源 rank 的地址**与 mappings，
    没有源实例的 `InstanceInfo`（addrs/dp_size），所以接 PULL 需要额外把源实例信息带到 pull 侧。
    这与 S3-4 原计划的"先 PULL 后 PUSH"顺序相反，原因是**数据可得性**而不是偏好，已在文档标注。
+
+### 2026-09-18（第 13 轮）——查清 manifest 协商方向（此前标为"未验证"），并为 canonical PULL 备好两处数据
+
+第 12 轮把 canonical PUSH 接进生产，并在末尾标了三条未验证项，其中"**谁给谁发 manifest**"本轮查清了，
+顺带发现 canonical PULL **不需要改 RPC**，只差两处"取到却丢掉"的数据。
+
+**(1) 协商方向（读码确认，不再是猜）**
+
+- `LLMEngine::link_cluster(...)`（`distributed_runtime/llm_engine.cpp:936-991`）把**源实例的全部 rank**
+  （`cluster_ids/addrs/ports`）交给**每一个** D worker ⇒ 每个 D worker 在 `link_clusters` 时就拿到
+  **源实例的地址表，且下标就是源实例的全局 rank**（`cluster_ids[source_rank]` 顺序构造）。
+- `MooncakeTransferEngine::link_sessions`（`mooncake_transfer_engine.cpp:759-841`）对**每个**源 rank
+  `fetch_cache_layout(...)`（即 `GetCacheLayoutManifest` RPC）拿到对端 manifest，用它跑
+  `planner.select_sources` 选出 ACTIVE，然后对每个 rank 调 `set_remote_peer(..., *local_manifest, mode)`
+  —— **把本侧（D）的 manifest 通过 `SetCachePeer` 发给源（P）**。
+
+⇒ 结论：
+
+- **PUSH（P→D）的数据来源是成立的**：`SetCachePeer` 收端是 P，因此 P 的 `cache_peer_links_`
+  才会持有 D 的 manifest ⇒ 第 12 轮的 `peer_cache_layout(D_addr)` 在 PUSH 侧能取到值。
+  （第 11/12 轮标注的 ⚠️"协商方向未验证"由此**关闭**。）
+- **PULL（D←P）的数据也已经在手上，只是被丢掉了**：D 在 `link_sessions` 里 fetch 了**全部**源 manifest，
+  但只用于 `select_sources`，函数结束就释放；而 `link_clusters` 拿到的源地址表也没有留存。
+
+**(2) 本轮把两处数据留下来**（纯增量，编译验证 rc=0）
+
+- `MooncakeTransferEngineCore` 新增 `peer_layouts_`（addr → manifest）与
+  `set_peer_cache_layout(addr, manifest)`；`peer_cache_layout(addr)` 改为读它。
+  **两个方向都写这里**：入站 `SetCachePeer`（P 侧知道 D 的布局）与 `link_sessions` 的 fetch（D 侧知道 P 的布局）。
+  `CachePeerLink::manifest`（第 11 轮加的第二个真相源）已删除，避免两处状态不一致；
+  ABSENT 模式会同时擦除 `peer_layouts_`。
+- `MooncakeKVCacheTransferBase` 新增 `linked_source_addrs_`，在 `link_clusters` 成功后保存源实例地址表
+  （顺序 = 源实例全局 rank），正是 `build_route_peer` 需要的形态。
+
+**(3) canonical PULL 还差什么（已无未知项）**
+
+`pull_kv_blocks_async` 的调用链只把**单个源 rank 的 addr** 传到 transfer 层
+（`worker_service.cpp:795` → `WorkerClient` → `WorkerImpl` → `KVCacheTransfer::pull_kv_blocks_async`），
+缺的是 **`src_dp_rank`（DP 配对）**：它在 `LLMEngine::pull_kv_blocks(src_dp_size, src_dp_rank, src_cluster_ids, src_addrs, dst_dp_rank, mappings)`
+里是参数，但转发到 worker 时只传了 `addrs[src_worker_rank]`。
+其余输入都已具备：源实例地址表（本轮的 `linked_source_addrs_`）、源实例 dp_size/cp/tp（任一源 manifest 的
+`ParallelCoordinates`）、对端视图（本轮的 `peer_layouts_`）。
+⇒ 下一轮把 `src_dp_rank` 沿调用链带下来（或在 pull 请求里带上）即可接通 canonical PULL。
+
+**验证**：容器内 **71 用例全绿**；三个生产 TU（`mooncake_transfer_engine.cpp`、`mooncake_kv_cache_transfer.cpp`、
+`kv_cache_transfer.cpp`）用修好的"先解包再编译"流程全部 rc=0。
+
+**仍未验证（原因）**：真实运行时（§1.3，GLM5.3flash 不支持 PD 分离）；
+`src_dp_rank` 的取值语义（读码是 `LLMEngine::pull_kv_blocks` 的入参，来自 `disagg_pd_scheduler.cpp:1210` 的
+`src_dp_rank`，其与 `dst_dp_rank` 的配对规则未在运行时验证）。

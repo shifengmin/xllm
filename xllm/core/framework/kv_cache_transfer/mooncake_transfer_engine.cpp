@@ -381,6 +381,7 @@ Status MooncakeTransferEngineCore::set_cache_peer(
         release_session_locked(peer_manifest.addr);
       }
       cache_peer_links_.erase(existing);
+      peer_layouts_.erase(peer_manifest.addr);
       return Status();
     }
     if (identity_matches) {
@@ -461,12 +462,12 @@ Status MooncakeTransferEngineCore::set_cache_peer(
   link.destination_layout_generation = peer_manifest.layout_generation;
   link.mode = mode;
   link.plan = std::move(plan);
-  link.manifest = peer_manifest;
   link.holds_session = holds_session;
   if (existing != cache_peer_links_.end() && existing->second.holds_session) {
     release_session_locked(peer_manifest.addr);
   }
   cache_peer_links_[peer_manifest.addr] = std::move(link);
+  peer_layouts_[peer_manifest.addr] = peer_manifest;
   return Status();
 }
 
@@ -489,11 +490,18 @@ std::optional<WorkerCacheLayoutManifest>
 MooncakeTransferEngineCore::peer_cache_layout(
     const std::string& remote_addr) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  const auto link_it = cache_peer_links_.find(remote_addr);
-  if (link_it == cache_peer_links_.end()) {
+  const auto layout_it = peer_layouts_.find(remote_addr);
+  if (layout_it == peer_layouts_.end()) {
     return std::nullopt;
   }
-  return link_it->second.manifest;
+  return layout_it->second;
+}
+
+void MooncakeTransferEngineCore::set_peer_cache_layout(
+    const std::string& remote_addr,
+    const WorkerCacheLayoutManifest& manifest) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  peer_layouts_[remote_addr] = manifest;
 }
 
 bool MooncakeTransferEngineCore::has_reshard_plan(
@@ -829,6 +837,12 @@ bool MooncakeTransferEngine::link_sessions(
       close_local_session(remote_addrs[index]);
     }
     return false;
+  }
+
+  // Keep the layouts this link fetched: the canonical pull is driven by the
+  // pulling side, which is the side that fetched them.
+  for (size_t index = 0; index < remote_manifests.size(); ++index) {
+    core_.set_peer_cache_layout(remote_addrs[index], remote_manifests[index]);
   }
 
   std::lock_guard<std::mutex> lock(session_mutex_);

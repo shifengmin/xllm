@@ -255,7 +255,11 @@ bool MooncakeKVCacheTransferBase::link_clusters(
     LOG(ERROR) << "MoonCake link endpoint and port counts differ.";
     return false;
   }
-  return mooncake_te_->link_sessions(cluster_ids, remote_addrs);
+  if (!mooncake_te_->link_sessions(cluster_ids, remote_addrs)) {
+    return false;
+  }
+  linked_source_addrs_ = remote_addrs;
+  return true;
 }
 
 bool MooncakeKVCacheTransferBase::unlink_cluster(const uint64_t& cluster_id,
