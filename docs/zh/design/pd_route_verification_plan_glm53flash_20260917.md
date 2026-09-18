@@ -163,7 +163,12 @@ SEQUENCE 类                   : 无 canonical block 概念，用 slot id
 
 若成立，则 **indexer 的 `S_eff` 应为 1**（每 rank 持完整序列），而**不是**与 MLA latent 相同的 4。这会改变 T3 的 indexer 用例与边表。**必须用一次探针实测确认**（见第六部分）。
 
-**S2 的处理**：建模上已按"复制"落地 —— indexer 组由 `GroupTopology::full_sequence_replica` 声明，`S_eff=1`、`N_rep=D`，行映射仍是统一公式 `row = canonical / S_eff`（`S_eff=1` 退化为 `row = canonical`，正好对应 index 张量行数 `= n_blocks × S`）。探针仍待做，但它只影响"这组是否真的该声明"，不再阻塞 L1/L2/L3 的形状。
+**S2 的处理**：建模上已按"复制"落地 —— indexer 组由 `GroupTopology::full_sequence_replica` 声明，`S_eff=1`、`N_rep=D`，行映射仍是统一公式 `row = canonical / S_eff`（`S_eff=1` 退化为 `row = canonical`，正好对应 index 张量行数 `= n_blocks × S`）。
+
+**✅ 2026-09-18 已用生产实测确认（不再是推断）**：启动日志
+`kv_cache_shape.cpp:195 Initializing indexer cache with shape: [26052 128 1 257]`，同一实例 `blocks: 6513`、`kv_split=4`，
+`26052 = 6513 × 4` = **全部规范块** ⇒ index cache 在 DCP 下确实是**复制**，`S_eff = 1` 成立。
+来源：`~/work/glm5-next-dcp-session/DCP4容量实测-中断存档.md`（生产配置，`util=0.62`）。
 
 ---
 
@@ -438,6 +443,8 @@ add_tensor(KVCacheTensorRole::SSM,         get_ssm_cache(),            BlockType
 
 **问题含义有两层**：
 
+**✅ 2026-09-18 已实测确定：宽度 257（`index_kpool_compress = true`）。** 上文那条 `[26052 128 1 257]` 的最后一维就是它。
+
 **(a) packed 宽度**：`init_index_cache_shape`（`kv_cache_shape.cpp:399-402`）
 
 ```cpp
@@ -502,4 +509,4 @@ S2 原定的验收是"新边表与旧 `select_sources` 的 ACTIVE 集合逐边�
 | 3 | indexer 的 `group_id` | ✅ **已查实**：与 MLA latent 同属 `group_id = 0`（`kv_cache_impl.cpp:147`）⇒ 需新增「同组内 role 的 `(G, S_eff)` 一致」断言 |
 | 4a | kPool packed 宽度 | ⚠️ **代码默认 `index_kpool_compress = false`（宽度 128），但注释与 `use_kpool_indexer_` 表明真实 checkpoint 预期为 true（宽度 257）** ⇒ mock 两种各出一例 |
 | 4b | index cache 是否随 `S` 放大 | ⚠️ **两处 ×S 均已定位且目标平台生效**；推断为「复制而非切分」⇒ indexer 的 `S_eff` 为 1。**S2 已按此建模**（`full_sequence_replica` 显式声明，见 F4′）；探针只需确认"该不该声明"，不再阻塞实现 |
-| 5 | kv_split 划分发生在哪一层 | ⚠️ `has_rank_preserving_kv_groups` 在 GLM5-next 的分组集合上恒为 true ⇒ `filter_kv_split_infos` 被跳过 ⇒ 划分可能已在 D 侧分配 block id 时完成。**这决定 S3 应在传输层还是分配层引入 canonical block**，需探针确认 |
+| 5 | kv_split 划分发生在哪一层 | ✅ **已确认在 D 侧分配 block id 时完成**：`rank_local_mapping = kv_split_size > 1 && has_rank_preserving_kv_groups(resp)`，对 GLM5-next 的普通 KV 组恒真 ⇒ `filter_kv_split_infos` 的 remap 整体跳过 ⇒ 传输层只做 1:1 块映射。**S3 应在契约/分配层引入 canonical block**（来源：`_resume/DCP×PD兼容性与linear-cache静态审查-20260915.md`） |
