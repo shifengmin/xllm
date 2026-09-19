@@ -674,6 +674,7 @@ void DisaggPDScheduler::dispatch_requests() {
             mapping.remote_ids.assign(proto_group.ids().begin(),
                                       proto_group.ids().end());
             mapping.remote_shared_num = proto_group.remote_shared_num();
+            mapping.remote_kv_split = proto_group.remote_kv_split();
             info.mappings.emplace_back(std::move(mapping));
           }
           info.dp_rank = resps.resps()[i].dp_rank();

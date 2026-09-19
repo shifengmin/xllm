@@ -307,6 +307,12 @@ struct KVTransferMapping {
   // cache under this group. P uses this to compress its per-group transfer
   // cursor to the first block D actually needs (no shared -> zero, no-op).
   uint32_t remote_shared_num = 0;
+  // D-side (destination) sequence-split width M for this group. P expands each
+  // logical block into M canonical slices when rebuilding the D-ordered
+  // layout. Per group so indexer and MLA groups can differ. Zero means unset;
+  // callers fall back to the instance kv-split width, leaving the homogeneous
+  // N==M path byte-for-byte unchanged.
+  uint32_t remote_kv_split = 0;
 };
 
 struct TransferKVInfo {

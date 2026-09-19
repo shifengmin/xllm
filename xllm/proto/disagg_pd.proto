@@ -134,6 +134,12 @@ message KVTransferGroup {
   // starts pushing at the first block that D actually needs. Zero when D
   // has no shared prefix (e.g. DECODE-side SWA prefix cache is off by role).
   uint32 remote_shared_num = 4;
+  // D-side (destination) sequence-split width M for this cache group. P uses
+  // it to expand each logical block into M canonical slices when reconstructing
+  // the D-ordered layout. Per group so an indexer group and an MLA group can
+  // carry different widths. Zero means "unset"; consumers treat it as the
+  // instance kv-split width so the homogeneous N==M case is unchanged.
+  uint32 remote_kv_split = 5;
 }
 
 // Deprecated: Use DisaggGenerationsRequest instead

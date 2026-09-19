@@ -312,6 +312,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     KVTransferMapping step_mapping;
     step_mapping.group_id = full_mapping.group_id;
     step_mapping.remote_shared_num = full_mapping.remote_shared_num;
+    step_mapping.remote_kv_split = full_mapping.remote_kv_split;
     if (block_type.value() == BlockType::LINEAR ||
         block_type.value() == BlockType::EMBEDDING) {
       const int32_t local_id = block_type.value() == BlockType::LINEAR

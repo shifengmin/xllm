@@ -242,6 +242,15 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
           // return >0 and let P skip the leading shared blocks.
           group->set_remote_shared_num(static_cast<uint32_t>(
               sequence->kv_state().shared_blocks_num(block_type)));
+          // D-side sequence-split width M for this group. Split-eligible
+          // groups (KV / SWA / C4 / C128) carry the instance kv-split width;
+          // sequence-scoped groups carry 1. P reads it to expand each logical
+          // block into M canonical slices. Homogeneous deployments have M
+          // equal to P's own width, so the stride is unchanged.
+          group->set_remote_kv_split(
+              static_cast<uint32_t>(is_kv_split_cache_block_type(block_type)
+                                        ? util::kv_split_size_effective()
+                                        : 1));
           group->mutable_ids()->Reserve(blocks_ptr->size());
           for (const auto& block : *blocks_ptr) {
             // Invalid placeholders are legitimate for SWA: the sliding
@@ -273,6 +282,9 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         proto::KVTransferGroup* group = resp->add_groups();
         group->set_group_id(cache_group_id(BlockType::KV));
         group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
+        // Flat KV is split-eligible; carry D's instance kv-split width M.
+        group->set_remote_kv_split(
+            static_cast<uint32_t>(util::kv_split_size_effective()));
         group->mutable_ids()->Reserve(blocks.size() - shared_num);
         for (size_t i = shared_num; i < blocks.size(); i++) {
           int32_t block_id = blocks[i].id();
@@ -286,6 +298,8 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
             << "Decode did not allocate a linear-state slot.";
         proto::KVTransferGroup* group = resp->add_groups();
         group->set_group_id(cache_group_id(BlockType::LINEAR));
+        // Linear state is sequence-scoped, never sequence-split: width 1.
+        group->set_remote_kv_split(1);
         group->add_ids(static_cast<uint64_t>(linear_state_id));
       }
       // XTensor mode: calculate and return GlobalXTensor offsets
