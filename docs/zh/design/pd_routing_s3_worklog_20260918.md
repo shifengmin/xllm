@@ -3256,3 +3256,108 @@ row 0 作为池子保留的 padding 块按约定不参与。
   同 md5 `b8f18e66baeafc287eba93e2ba3f28ff`。
 * 下一步候选：`p4d2` 长 prompt 的 `3480` 交给模型侧（CP4 × 长序列的 index 越界）；
   canonical 侧的遗留债见第 32 轮清单（`pull_kv_blocks_canonical` 桩、A1/A3/A4、C1/C2/C3）。
+
+## 第 34 轮（2026-09-19 18:00–）：index 族「replica」的真实语义 —— 只有不切序列的实例才是副本
+
+### (48) 需求（用户给定，作为本轮的设计前提）
+
+* **只开 kv split**：index 池是 **replica**（每个 rank 持有整条序列的 index）。
+* **同时开 CP 和 kv split**：index 池是 **切分存的**（每个 rank 只持有自己那一片）。
+* 所以路由必须兼容 **prefill = CP + kv split、decode = 仅 kv split** 这种**两侧语义不同**的异构对。
+
+这条把第 33 轮留下的疑问（「源端 index 每片不同是 CP 导致的吗」）钉成了设计输入：
+**是**，而且路由必须按「源端分片、目的端副本」来搬。
+
+### (49) 实测：index 池的物理 row 公式（本轮把语义钉死的证据）
+
+tracer 新增 `XLLM_PD_TRACE_SCAN=N`（`_pd_trace.py`）：把**绝对 row 0..N-1** 全哈希一遍，
+而不是只哈希从 batch 元数据推出的 row 集合。理由：**用与传输同一个假设构造出来的比较器，
+永远只会同意传输**。跑 `p2d4`（P cp2/tp2/kv2 → D cp1/tp4/kv4，3492 token，14 个 logical block），
+归档 `pdroute83/runs/p2d4-scan64-183843`：
+
+| 侧 | 元数据 | index 非零 row | key 非零 row |
+|---|---|---|---|
+| 源 P（rank 0..3） | `has_kv_shard=1`、`kv_split=2`、`kv_split_rank=0,0,1,1` | **0..14**（row 0 = 未拥有 token 被 `clamp_min(0)` 写进来的垃圾；1..14 = 请求的 14 个 block） | 1..14 |
+| 目的 D（rank 0..3） | `has_kv_shard=0`、`kv_split=1`、`kv_split_rank=0` | **4..16**（canonical 0..12） | 1..7 |
+
+由此得到两侧的 row 公式（S = 该实例的 kv_split，c = canonical block）：
+
+```
+源（CP 实例，index 走 local_slot_mapping，被 owner 掩码裁过）  row = c / S + 1     ← 与 K/V 同 row 空间（紧凑）
+目的（无 CP 实例，index 直写 pool slot / 128）                row = c + S         ← 每个 canonical 块一行（副本）
+```
+
+四个源 rank 的非零 row 集合**完全相同**，但内容按 DCP group 分成两类（{0,1} 与 {2,3}，
+`kv_split_rank` 也是 0,0,1,1）：**同一个 row 在不同 rank 上装的是不同 slice 的 token**
+——即「切分存」的物理形态。目的地四个 rank 的 index 内容则**完全一致**（真副本）。
+
+### (50) 用 owner 检查把旧行为钉成可判定的失败
+
+比较器原来的 replicated 分支只问「这一行的字节在源端出现过吗」，一个 writer 的分片和正确的搬运
+**同样满足**它 —— 这正是第 33 轮 `p2d4` 判 PASS 而 index 实际是错的机制。
+新增 `pdtrace/index_owner_check.py`：按上面的公式要求
+`dst[row = c + S_D]` 必须等于**拥有 c 的那个源 rank** 的 `src[row = c / S + 1]`。
+在**修复前**的 scan 归档上：
+
+```
+source ranks [0,1,2,3] slices [0,0,1,1]
+request canonical blocks: 28 (14 logical x 2)
+destination rows checked=52 match=0 mismatch=52      ← 52 = 13 行 × 4 rank
+  block 0: want 9a694d63 (owner row 1) got cf5b9f3c
+  block 1: want ae11b904 (owner row 1) got d6e7a547
+destination blocks with no row at all: n=15 [13..27]  ← 一半请求根本没到
+```
+
+`got` 的字节正是源端 row 2/3/4 的内容 —— 旧路由把 replica 公式**同时**用在两侧
+（源 row = c + S_P、目的 row = c + S_D），并且每个 canonical 块只挑一个 writer，
+于是目的地拿到「错位的行 + 一个分片冒充整条序列」，而且 `c ≥ 13` 的块一个都没到。
+
+### (51) 修法：让**实例**决定这族是不是副本（两处 gate，共享一个判定）
+
+* `group_keeps_whole_sequence(topology, group) = group.full_sequence_replica && topology.cp_size <= 1`。
+  声明说的是「模型需要池子里有什么」（DSA top-k 要读整条序列）；**只有不切序列的实例（CP=1）才能这样持有**。
+* `KvRedundancy::derive`：`full_sequence_replica_` 改用该判定 ⇒ CP 实例上 index 族按
+  **split = 配置的 kv_split** 派生（与 K/V 完全一样：`owns(c, slice) = c % split == slice`，
+  `replicas_of` = 同 slice 的 TP 副本）。
+* `RouteBinder::peer_row`：replica row 公式（`block + kv_split`）只在判定为真时使用，
+  否则落到 split 族的 `block / split + 1`。
+
+于是异构对自然成立：**源端从「拥有该 canonical 块的那个 rank」取紧凑 row，
+目的地把每个块写进自己的副本 row（`c + kv_split`），而目的地每个 replica rank 都要收全**
+（`replicas_of` 本来就 fan-out）。这条路径不需要新的传输语义：两侧的 row 公式各按自己的实例算，
+正是 `peer_row(local/remote)` 的既有设计。
+
+单测（98 上跑）：
+`KvRedundancyTest.FullSequenceReplicasSplitOnAShardedInstance`、
+`PdRouteTest.IndexerPoolIsAShardedSourceAndAReplicaDestination`、
+`PdRouteTest.MockIndexTransferCopiesCanonicalBlocksByteForByte` +
+`MockIndexTransferIsDiscriminating`（后者把目的端 row 基址挪一行时必须报错，否则测试是空的）。
+`kv_redundancy_test` 12/12、`cache_directory_test` 23/23、`pd_route_test` 14/14 通过。
+
+### (52) 环境侧三件事（都影响可复现性，值得写下来）
+
+1. **模型存储掉了**：83 上 `/mnt/cfs/9n-das-admin/llm_models` 的 NFS 挂载在 14:13 消失
+   （容器里看到的是本地空目录），cfs 上 `GLM-5.2-W8A8-EcoTech-4layers` 变成 `1080:1080 drwxr-x---`
+   （我们读不到，容器 root 能读）。已按 98 的挂载参数把 NFS 挂回来（`11.88.0.24:/cfs/9n-das-admin/llm_models`），
+   并**重启容器**让 bind mount 重新指向 NFS —— bind mount 抓的是目录 inode，只重挂宿主机**不会**进容器。
+2. **NPU「被抢占」其实是自己的残留**：prefill 在 `load_weights` 抛
+   `torch.OutOfMemoryError ... 1.90 GiB free`（61 GiB 卡），`npu-smi` 里 0–9 全是 60+ GiB；
+   而 `hard_reset.sh` 杀不干净（它自己报「端口 5389/58889 仍 LISTEN」）。**重启容器后 NPU 0–7 立刻
+   `No running processes`** —— 那些显存是我自己上一轮/上上轮留下的 worker 占的。
+   结论：**新的 hard reset = 容器 restart（~10 s）**，比 pkill 可靠；应接进 `remote_loop.sh run`。
+3. **构建树的 git 是坏的 worktree**：`xllm-dcp-fp32/.git` 指向
+   `/export/home/shifengmin.3/workspace/xllm-coding/xllm/.git/worktrees/...`，该主仓已不在，
+   所以构建树里 `git status/diff` 全部 `fatal: not a git repository`。
+   单测那次输出里看到的 22 files/892 insertions 是**相对它自己那个陈旧 HEAD**的差，
+   不代表有未提交改动。结论：**提交只能以本机 clone（`~/work/xllm`，分支 `pd-routing-s0s1`）为准**。
+
+### (53) 本轮改动的文件与恢复点
+
+产品代码（3 个）：`kv_redundancy.h`（新增判定声明 + 文档）、`kv_redundancy.cpp`（判定实现与
+`derive` 的 C2 分支）、`route_binder.cpp`（`peer_row` 选公式 + 注释）。
+测试（2 个）：`tests/core/framework/kv_cache_transfer/{kv_redundancy_test.cpp,pd_route_test.cpp}`。
+工具（本机 + 98 + 83）：`pdtrace/{_pd_trace.py(新增 SCAN 模式),index_owner_check.py,index_fill_pattern.py,
+index_rank_classes.py,inspect_dump.py,raw_rows.py}`、`remote/{remote_loop.sh(可传 XLLM_PD_TRACE_SCAN),
+apply_index_sharded.py,fix_canonical4.py,unit_index_sharded.sh}`。
+
+修复后的 ELF：98 构建 `1325c61d5d43772cfb93d233a024ce96`（strip 后 111 MB）。
