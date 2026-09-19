@@ -3507,3 +3507,173 @@ cp1 源端（replica 2..5）、无命令行时回退到 metadata 的 4（replica
      第 34 轮刚加进去的 owner 检查，且完全不留痕迹）。
 * 仍然开放（模型侧，未动）：p4d2 **长 prompt**（3492 token）prefill forward 的
   `[ASSERT] gather_v3_base.h:137 ... Index 3480 out of range[0 3480)` → `aclnnIndexSelect failed, error code is 507035`。
+
+## 第 36 轮（2026-09-19 20:00–）：新增 **两侧都不开 CP** 的纯 kv-split 异构场景，并把 `3480` 的触发条件钉死
+
+第 35 轮已经证明「prefill 开 CP + kv split、decode 只开 kv split」这条异构对是对的（p2d4）。
+本轮按用户要求把 **prefill 的 CP 也关掉**，先跑通「纯 kv split 异构」（两侧都只有 kv split，
+只是宽度不同），因为它正是「只开 kv split 时 index 是 replica」这条设计前提的直接检验。
+
+### (62) 新场景 `kv4kv2`：P cp1/tp4/kv4 → D cp1/tp2/kv2
+
+| 场景 | Prefill | Decode | 设备 | 与 `p4d2` 的差别 |
+|---|---|---|---|---|
+| `p4d2` | 4 ranks **cp4**/tp1/kv4 | 2 ranks cp1/tp2/kv2 | P 0-3 / D 4-5 | — |
+| `kv4kv2` | 4 ranks **cp1**/tp4/kv4 | 2 ranks cp1/tp2/kv2 | P 0-3 / D 4-5 | **只有 `P_CP`（4 → 1）** |
+
+所以 `kv4kv2` 与 `p4d2` 构成一对干净的 A/B：rank 数、设备、kv split、prompt 长度全同，唯一变量是
+prefill 有没有 CP。
+
+改动（都在 83/98 的运行时脚本里，产品代码零改动）：
+
+* `pdroute83/env.sh`：新增 `kv4kv2)` 分支（`P_NNODES=4 P_CP=1 P_KVSPLIT=4` / `D_NNODES=2 D_CP=1
+  D_KVSPLIT=2`，端口与设备沿用默认值）、注释表加一行、`unknown PD_SCENARIO` 的提示补上新名字；
+* `pdroute83/run_trace_kv4kv2.sh`：由 `run_trace_p4d2.sh` 生成（同设备分配，便于对照）；
+* `handoff/remote/remote_loop.sh` 的 `geometry()` 加 `kv4kv2) echo "1 4 4 1 2 2"`；
+* `handoff/remote/scenarios.txt` 加一行 → 标准矩阵入口 `run_one98.sh` 从此覆盖四个场景；
+* 应用脚本 `remote/apply_scenario_kv4kv2.py`（带断言的替换，和 `apply_index_sharded.py` 同一套写法）。
+
+两个坑（都值得记）：
+
+1. apply 脚本第一版把 `p2d4)` 分支**替换**掉了 —— 断言只检查「匹配到 1 处」，没检查「结果是增量」，
+   于是 `p2d4` 变成 `unknown PD_SCENARIO`。修法：替换写成 `ARM → ARM + NEW_ARM`，并用一个一次性的
+   `fix_p2d4.py` 把分支补回来；教训是**增量型替换要断言「结果仍包含原文本」**。
+2. `sync_tools.sh` 原来只同步 tracer/比较器，**不同步 `remote_loop.sh`**，于是 98 上跑新场景得到
+   `unknown scenario kv4kv2`。已把 `remote_loop.sh` 加入同步清单（它承载场景表，必须跟着工具走）。
+
+### (63) `kv4kv2` 结果：**长 prompt（3492 token）一次全绿**
+
+归档 `runs/kv4kv2-201508`（首次运行，20:15）：
+
+| 族 | 结果 |
+|---|---|
+| key / value（split） | **56/56 字节一致**（14 logical block × 4 layer），`mismatch=0 absent_in=0` |
+| index（replicated） | **84/84 字节一致**（28 canonical × 3 layer），且在**四个 prefill rank 上完全相同**（`present on every one of the 4 prefill ranks=84`） |
+| owner 检查 | `checked=56 match=56`，无缺行、无未观测、无 padding、**源端副本无分歧** |
+| 判定 | `VERDICT: PASS` + `OWNER VERDICT: PASS` |
+
+这同时把用户给的设计前提**实测确认**了：只开 kv split（无 CP）时，源端 index 池就是
+「whole sequence on every rank（`row = c + S`）」的副本 —— 工具按 trace 里的 `has_kv_shard=0`
+自己识别出这个形状（输出行 `source indexer pool: whole sequence on every rank`）。
+
+顺带把工具里三处**读起来会误导**的地方改准：
+
+* `index_owner_check.py`：源端是副本实例时不再打印 `source slices [0,0,0,0]`（那只是 DCP rank，
+  副本实例的切片在 TP 轴上），改印 `source slices n/a (the source keeps the whole sequence)`；
+* 副本源端新增**副本一致性**口径：`want` 取各 rank 的交集，只在部分 rank 命中时单独报
+  `source replicas disagree`（判负）—— 一个副本实例在不同 rank 上持有不同字节，本身就是要抓的错，
+  而不是「模糊匹配上了就算过」；
+* `compare_kv.py` 的提示文案从「a full-sequence pool holds different values per DCP slice」改成
+  「a source **that shards the sequence** holds different values per slice」（原文案在副本源端是反的）。
+
+### (64) `kv4kv2` vs `p4d2` 的 A/B：`3480` 的触发条件就是 **prefill 的 CP**
+
+`p4d2` 长 prompt（同一 4 个 prefill rank、同一设备、同一 `kv4`、同一 3492 token）在 prefill forward 崩：
+
+```
+[ASSERT] gather_v3_base.h:137 Assertion `(0 <= val && val < this->gxSize_)' Index 3480 out of range[0 3480)!
+[rank0] NPU function error: call aclnnIndexSelect failed, error code is 507035
+        Kernel task happen error, retCode=0x31, [vector core exception]
+```
+
+`kv4kv2` 把 `P_CP` 从 4 改成 1，其余全同，**同一个长 prompt 一次通过**。所以：
+
+* 触发条件是 **prefill 的 CP（cp4）× 长 sequence**，与 kv split、与 canonical 路由、与数据面都无关；
+* 代码路径（容器 site-packages，`glm5_2.py` 的 MLA/indexer forward）：只有 `cp_context is not None`
+  时才走
+  `query_index = cp_context.query_index` + `hidden/q_c/positions.index_select(0, query_index)`；
+  `query_index` 由 C++ op `xllm_ops::build_cp_context` 产出（`model_executor/cp_utils.py:109-153`），
+  语义是「本 rank 真正持有的 query 行在本地打包 buffer 里的行号」；
+* 观测形状：失败张量的 dim0 = 3480、越界值也 = 3480（**恰好等于 size**，闭区间端点被当索引的典型形状），
+  即 `query_index` 里出现了一个等于「本地 token 数」的行号（合法范围 0..3479）——与第 33 轮
+  `3480 = 4 × 870`「CP 分片边界」的猜测一致，现在有了 A/B 和调用点两重证据。
+* 下一步（模型侧）：看 `build_cp_context` 里 `total_real_local` / 段边界（`(cp_rank+1)*chunk`）的计算，
+  以及 3492 token 下最后一段的 `query_count` 是否把端点算了进去。
+
+### (65) 四场景矩阵全绿（20:17–20:30），出厂工具复核一致
+
+`handoff/remote/run_one98.sh` + `scenarios.txt`（四行：base / p2d4 / kv4kv2 / p4d2:canonical:20）串行跑，
+日志 `/tmp/matrix_round36.log`，结果 **`MATRIX DONE: 0 failure(s) of 4`**（4 个 `VERDICT: PASS` + 4 个
+`OWNER VERDICT: PASS`）：
+
+| 场景 | 归档 | K/V | index | 比较器 | owner 检查 |
+|---|---|---|---|---|---|
+| `base` | `base-202042` | 112/112 | 84/84 | PASS | PASS（56/56） |
+| `p2d4` | `p2d4-202406` | 28/28 | 84/84（28 canonical × 3 layer） | PASS | PASS（112/112） |
+| `kv4kv2` | `kv4kv2-202700` | 56/56（14 block × 4 layer） | 84/84（四个源 rank 完全一致） | PASS | PASS（56/56） |
+| `p4d2` r20 | `p4d2-canonical-r20-202954` | 12/12、8/8 + 4 padding | 15/15（+3 `abs_oos` padding） | PASS | PASS（10/10，1 padding） |
+
+离线用**出厂版本**的检查脚本（`index_owner_check.py=c5942ff8e6a92ed2a33f4ead0d01b50c`、
+`compare_kv.py=9c9207adaf9ac11d7ef9fb44ef1c7833`）复核（`remote/validate_final36.sh`）：
+pre-fix scan 归档仍 FAIL（canonical 2 字节不等 + 15 块 `not written while the source holds it`），
+post-fix scan 112/112，四个最新归档与在线判定逐项一致（含 `kv4kv2` 被识别为
+`whole sequence on every rank (row = c + S)`）。
+
+### (66) 复核：prefill 开 CP 时 indexer 按 kv split 切分，「prefill 切分 / decode 不切分」已正确实现
+
+用户问「prefill 开 CP 后 indexer 是否也按 kv split 切分、当前处理是否正确、是不是没处理好 prefill 切分而
+decode 不切分的场景」。按仓库 `code-review` skill 走了一遍（含 `custom-code-style.md`），结论：
+
+**确认切分**（代码证据）：
+
+| 层 | 证据 |
+|---|---|
+| 池大小 | `kv_cache_shape.cpp:387-393`：`index_block_count *= kv_split_size_effective()` |
+| 写哪一行 | `npu_paged_attention.py:940`：`local_slot_mapping if has_kv_shard else slot_mapping` |
+| 标志来源 | `py_attention_metadata.cpp:275-283`（`has_kv_shard` ≡ batch 带 shard metadata）、`kv_shard_batch_metadata.cpp:145-147`（`kv_split_size = dcp_size()`） |
+| 展开表 | `kv_shard_batch_metadata.cpp:129-141`：`logical*dcp + shard` |
+| CP 约束 | `npu_paged_attention.py:566-571`（`cp_size % kv_split_size == 0`）、`collective_communicator.cpp:582-583` |
+
+**处理正确**（对已验证形状）：`group_keeps_whole_sequence()`（`kv_redundancy.cpp:46-53`）→
+`derive()`（`:87-124`）→ `peer_row()`（`route_binder.cpp:160-180`，且 `:398-401` 两个 peer 各按自己的形状取行）
+三层自洽；manifest 的 `kv_split_size` 取 `kv_split_size_effective()`（`mooncake_kv_cache_transfer.cpp:509-512`）
+且 `cache_directory.cpp:704-705` 校验 declaration 与 manifest 一致。
+
+**两条仍未验证的形状（review 的主要发现，落档待办）**：
+
+1. **`kv_split_size < cp_size`（`sequence_groups > 1`）**：`KvLayoutIndex::replicas_of`
+   （`kv_redundancy.cpp:255-263`）会把同一 slice 的多个 **CP rank** 当序列副本，`writer_of`（`:221-223`）
+   只让 replica-0 推。K/V 有 `_materialize_cp_cache`（`npu_paged_attention.py:1029+`，CP all-gather）保证
+   同 slice 内容一致，但**索引池只做本 rank 的 scatter 写**，没有任何 materialize。我们只实测过
+   `sequence_groups == 1`（此时 slice 内的额外 rank 是 TP 副本）。若该假设不成立，每个 slice 会有一半块
+   从不推送。→ 行动：跑一个 `P cp4/tp1/kv2 → D cp1/tp2/kv2` 场景；若不一致，修法是在 `derive` 里
+   对 `full_sequence_replica && cp_size > 1` 追加 `split == cp_size` 的约束（明确报错），或让索引池也 materialize。
+2. **`layerwise_split_size > 1` + index-page elision**（`platform.h:71-74`）：共享 DSA 层不写索引池，
+   路由是否该给这些层推索引行未验证（C1 MixedLayers 欠账）。
+
+另有一个测试缺口：`pd_route_test.cpp:207` 只钉了**分片源端**的不对称对（`:730/766` 断言两侧 row），
+**副本源端**（`block + S_P`，即 `kv4kv2` 形状）只在端到端覆盖，缺单测。
+
+### (67) 更正：`xllm_ops::build_cp_context` 的源码就在主树里 —— 我先前两次误判为「只在 .so 注册」
+
+第 66 轮末尾我把 `3480` 的根因分析停在了「op 源码不在我能访问的任何树里」。这是**错的**，
+用户提出质疑后逐项复核：
+
+| 事实 | 证据 |
+|---|---|
+| Python 调用 | `xllm/python/model_executor/cp_utils.py:137` `= torch.ops.xllm_ops.build_cp_context(...)`（docstring `:39/:120` 明确写 "the `xllm_ops::build_cp_context` C++ op and validated by its gtest"） |
+| schema | `xllm/core/kernels/npu/npu_ops_library.cpp:829`（与 .so 里 `strings` 到的签名逐字一致） |
+| 注册 | 同文件 `:664` `TORCH_LIBRARY(xllm_ops, m)`、`:974` `m.impl("build_cp_context", TORCH_FN(xllm::build_cp_context_npu))`（`TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, …)`，注释 `:968`：纯 host index math、无 Tensor 入参，故不按 device 派发） |
+| 实现 | 同文件 `:504` `build_cp_context_npu(...)`，`TORCH_CHECK(cp_size > 1, …)` 在 `:509` |
+| 调用方 | `xllm/python/model_executor/runners/eager.py:88`（`_per_seq_lens_from_metadata` + `self.cp_size`） |
+| gtest | `tests/core/kernels/npu/cp_context_builder_test.cpp`（`:96-98` 镜像 `cp_utils.cp_shard_rows`，`:233` `q_local.index_select(0, ctx.query_index)`） |
+| V4 的模型侧 plan | `xllm/core/layers/npu_torch/deepseek_v4_cp_context.h`（+ MLU 版 `xllm/core/layers/mlu/deepseek_v4/deepseek_v4_cp_context.{h,cpp}`） |
+| 本机 clone = 98 构建树 | `npu_ops_library.cpp=de65c11ac83edab28b11e6c0e0c8f970`、`cp_utils.py=c2b41d63a84379d1d89a78d751a56bdd`、`deepseek_v4_cp_context.h=965270e1c523c5a39dc4461b22cff91a`（三份 md5 相同） |
+
+**误判原因**（三条都是工具/权限问题，不是"源码不在"）：
+
+1. 我用的第一条本机命令是 `timeout 60 grep … build_cp_context` —— macOS 没有 `timeout`，
+   命令直接报 `command not found`，等于**根本没执行**；
+2. 之后在 98 上做的宽范围 `timeout 90/120 grep -rl`，被 `timeout` 杀掉时**管道里的块缓冲 stdout 一起丢失**，
+   我看到的是空输出，就当成"无匹配"；
+3. 98 上这些源文件是 `root:root 0640`，不加 `sudo -n` 的 `grep/sed/wc` 静默失败（stderr 被重定向掉了）。
+
+**更正后的分析收窄**（不再是"源码不可得"，而是"算子不可能是越界来源"）：
+`build_cp_context_npu` 只为真实行 push（`pos_in_seq < length`），且
+`seg_local_base + j < total_local`，故恒有 `0 <= query_index < total_local`；gtest 的用法是先
+`cp_shard_rows(global)` 得到 `total_local` 行的本地张量再 `index_select(0, query_index)`。
+因此 `dim0 = 3480` 且 `index = 3480` 意味着**被索引的张量比 CP plan 的本地行空间小**，
+即 CP plan 与被施加的 buffer 不匹配（未做 CP 分片的全局张量，或 ctx 与 buffer 属于不同 batch），
+而不是 packing 循环里的 off-by-one。下一步：在 `glm5_2.py` 的三个 `index_select` 之前断言/打印
+`hidden.shape[0] == cp_context.total_local`，并把 `cp_size/cp_rank/q_seq_lens/kv_seq_lens/total_local/
+query_index.max()` 记下来。
