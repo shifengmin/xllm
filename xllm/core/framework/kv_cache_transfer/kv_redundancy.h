@@ -56,8 +56,26 @@ struct GroupTopology {
   // replicated per rank even though a redundancy budget exists. This is
   // declared rather than derived because the reason is semantic (what the
   // kernel must read), not a property of the redundancy.
+  //
+  // Only an instance that does not shard the sequence can honour it: with
+  // context parallelism every rank computes just its own sequence shard and
+  // writes only that shard into its pool. See group_keeps_whole_sequence().
   bool full_sequence_replica = false;
 };
+
+// Whether this group really keeps every canonical block on every rank of one
+// instance.
+//
+// The declaration above says what the model needs the pool to hold; only an
+// instance that computes every token on every rank can hold it. With context
+// parallelism each rank computes, and therefore writes, just its own sequence
+// shard: the indexer pool is scattered through the same KV-shard slot mapping
+// the K/V cache uses, so a rank's pool holds the slice of the canonical blocks
+// its DCP rank owns, in the K/V pool's compact row space, exactly like a split
+// family. Routing such a pool as a replica hands the peer one writer's shard as
+// if it were the whole sequence.
+bool group_keeps_whole_sequence(const KvTopology& topology,
+                                const GroupTopology& group);
 
 // KV redundancy derived from one instance topology plus one group geometry.
 //
@@ -86,10 +104,11 @@ class KvRedundancy final {
   // S_eff equals the configured kv_split_size when this group's redundancy can
   // absorb it. It is 1 -- every rank keeps the whole sequence -- in exactly
   // three cases: the group is sequence scoped (no block dimension to split), it
-  // is declared as a full-sequence replica (see GroupTopology), or its
-  // redundancy is 1 (nothing to remove). Any other mismatch between the
-  // configured split and the group redundancy fails instead of degrading
-  // silently. Returns false and fills `error` on violation.
+  // is declared as a full-sequence replica and the instance honours it (see
+  // group_keeps_whole_sequence), or its redundancy is 1 (nothing to remove).
+  // Any other mismatch between the configured split and the group redundancy
+  // fails instead of degrading silently. Returns false and fills `error` on
+  // violation.
   static bool derive(const KvTopology& topology,
                      const GroupTopology& group,
                      KvRedundancy* redundancy,

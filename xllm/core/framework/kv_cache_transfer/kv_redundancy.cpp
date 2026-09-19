@@ -43,6 +43,15 @@ bool dcp_spans_domain(const KvTopology& topology, int32_t split) {
 
 }  // namespace
 
+bool group_keeps_whole_sequence(const KvTopology& topology,
+                                const GroupTopology& group) {
+  // CP is what shards the sequence across ranks: every rank then computes only
+  // its own shard of it and writes just that shard into the pool. A DCP split
+  // without CP does not do that -- every rank still sees every token -- so the
+  // pool really is a replica there.
+  return group.full_sequence_replica && topology.cp_size <= 1;
+}
+
 bool KvRedundancy::derive(const KvTopology& topology,
                           const GroupTopology& group,
                           KvRedundancy* redundancy,
@@ -73,9 +82,13 @@ bool KvRedundancy::derive(const KvTopology& topology,
     return false;
   }
 
+  // The declaration says what the model needs the pool to hold; the instance
+  // decides whether it can hold it.
+  const bool whole_sequence = group_keeps_whole_sequence(topology, group);
+
   KvRedundancy derived;
   derived.sequence_scoped_ = group.sequence_scoped;
-  derived.full_sequence_replica_ = group.full_sequence_replica;
+  derived.full_sequence_replica_ = whole_sequence;
   // G >= TP shards the heads; G < TP replicates them.
   derived.local_head_count_ = std::max(global_heads / tp_size, 1);
   derived.tp_redundancy_ = std::max(tp_size / global_heads, 1);
@@ -88,14 +101,14 @@ bool KvRedundancy::derive(const KvTopology& topology,
   // Three cases legitimately keep the whole sequence on every rank:
   //   - sequence-scoped groups (SSM / CONV / linear state slots) have no block
   //     dimension to split at all;
-  //   - groups declared as full-sequence replicas (the DSA indexer pool) must
-  //     see the whole sequence by construction;
+  //   - groups whose instance really does keep it (the DSA indexer pool without
+  //     CP; with CP the same pool is written per shard and splits like the K/V
+  //     cache -- see group_keeps_whole_sequence);
   //   - D == 1 means the group has no redundancy to remove.
   // Any other mismatch is a configuration error: silently degrading to 1 would
   // leave the operator believing a wider split is active.
   const int32_t configured_split = std::max(topology.kv_split_size, 1);
-  if (group.sequence_scoped || group.full_sequence_replica ||
-      derived.redundancy_ == 1) {
+  if (group.sequence_scoped || whole_sequence || derived.redundancy_ == 1) {
     derived.split_ = 1;
   } else if (configured_split <= derived.redundancy_ &&
              derived.redundancy_ % configured_split == 0) {

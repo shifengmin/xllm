@@ -153,13 +153,15 @@ void compact_regions(std::vector<RouteRegion>* regions) {
 //     j` therefore lands on row `canonical / split + 1` -- the same one-based
 //     row space the request's ids live in, which is why the source side of a
 //     homogeneous pair got this right by accident.
-//   - A family that keeps the whole sequence on every rank packs each slice of
-//   a
-//     logical block as its own row, exactly as the runtime expands the indexer
-//     block table (`row = id * dcp_size + slice`). Its rows are scaled by the
-//     instance's *configured* kv-split -- its own effective split is 1, since
-//     every rank keeps everything -- and sit one reserved block further along,
-//     so the row is `canonical + kv_split_size`.
+//   - A family that keeps the whole sequence on every rank packs each canonical
+//     block as its own row, exactly as the runtime expands the indexer block
+//     table into the pool: `row = id * dcp_size + slice`, scaled by the
+//     instance's *configured* kv-split -- the family's own effective split is
+//     1, since every rank keeps everything -- and sitting one reserved block
+//     further along, so the row is `canonical + kv_split_size`. Only an
+//     instance that computes every token on every rank can hold that pool; on a
+//     sharded one the same family lands on the split row above, because each
+//     rank wrote just its own shard of it (see group_keeps_whole_sequence).
 //   - A sequence-scoped family has no block dimension at all: its canonical id
 //     is a sequence slot, which is already a row.
 //
@@ -170,7 +172,7 @@ uint64_t peer_row(const PeerCacheView& view, int32_t split, int64_t block) {
   if (view.group.sequence_scoped) {
     return static_cast<uint64_t>(block);
   }
-  if (view.group.full_sequence_replica) {
+  if (group_keeps_whole_sequence(view.topology, view.group)) {
     const int32_t width = std::max(view.topology.kv_split_size, 1);
     return static_cast<uint64_t>(block) + static_cast<uint64_t>(width);
   }

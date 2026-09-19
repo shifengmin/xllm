@@ -158,27 +158,33 @@ TEST(KvRedundancyTest, SequenceScopedGroupsAreNeverSplit) {
   EXPECT_EQ(decode.split(), 1);
 }
 
-TEST(KvRedundancyTest, FullSequenceReplicasKeepSplitOne) {
+TEST(KvRedundancyTest, FullSequenceReplicasSplitOnAShardedInstance) {
   // The DSA indexer pool has a single global head, so its redundancy could
-  // absorb the configured split, but its top-k reads the whole sequence: the
-  // group declares itself a full-sequence replica instead.
+  // absorb the configured split, and its top-k reads the whole sequence: the
+  // group declares itself a full-sequence replica. That holds on an instance
+  // without CP, where every rank sees every token -- but with CP each rank
+  // computes only its own sequence shard and writes just that shard into the
+  // pool, so the family has to split exactly like the K/V cache. Routing it as
+  // a replica there shipped one writer's shard to the peer as if it were the
+  // whole sequence.
   GroupTopology indexer =
       make_group(kMlaGlobalHeads, /*sequence_scoped=*/false);
   indexer.full_sequence_replica = true;
 
-  const KvRedundancy prefill = derive_ok(make_topology(/*dp_size=*/1,
+  const KvRedundancy sharded = derive_ok(make_topology(/*dp_size=*/1,
                                                        /*cp_size=*/4,
                                                        /*tp_size=*/8,
                                                        /*kv_split_size=*/4),
                                          indexer);
-  EXPECT_EQ(prefill.split(), 1);
-  EXPECT_EQ(prefill.replica_count(), 32);
-  EXPECT_FALSE(prefill.sequence_scoped());
-  EXPECT_TRUE(prefill.full_sequence_replica());
+  EXPECT_EQ(sharded.split(), 4);
+  EXPECT_EQ(sharded.replica_count(), 8);
+  EXPECT_FALSE(sharded.sequence_scoped());
+  EXPECT_FALSE(sharded.full_sequence_replica());
 
-  const KvRedundancy decode = derive_ok(make_topology(4, 1, 2, 2), indexer);
-  EXPECT_EQ(decode.split(), 1);
-  EXPECT_EQ(decode.replica_count(), 2);
+  const KvRedundancy replica = derive_ok(make_topology(4, 1, 2, 2), indexer);
+  EXPECT_EQ(replica.split(), 1);
+  EXPECT_EQ(replica.replica_count(), 2);
+  EXPECT_TRUE(replica.full_sequence_replica());
 }
 
 TEST(KvRedundancyTest, GroupsWithoutRedundancyKeepSplitOne) {
