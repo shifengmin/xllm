@@ -3361,3 +3361,149 @@ index_rank_classes.py,inspect_dump.py,raw_rows.py}`、`remote/{remote_loop.sh(�
 apply_index_sharded.py,fix_canonical4.py,unit_index_sharded.sh}`。
 
 修复后的 ELF：98 构建 `1325c61d5d43772cfb93d233a024ce96`（strip 后 111 MB）。
+
+## 第 35 轮（2026-09-19 19:25–）：修好的是**验证链**，不是数据面 —— 三处工具 bug 让「已修好」看起来仍然是坏的
+
+第 34 轮把产品代码修好（`037539cae`）并且用 SCAN 模式实测到 `match=112/mismatch=0`，但三场景矩阵重跑仍然
+`MATRIX DONE: 3 failure(s) of 3`。本轮的全部工作是把这条**验收链**修到可信：三处 bug 都在工具里，一处
+让判定根本不可见，两处让判定用错了 row 空间。
+
+### (54) 症状：`VERDICT: FAIL` 的签名换了，而且**没有** `OWNER VERDICT` 行
+
+19:15–19:22 三场景串行重跑，每个场景都 FAIL，签名是
+`index: rows found=0 byte-identical on all 4 prefill ranks=0`（p2d4 / p4d2）与
+`index ... mismatch=81`（base）。K/V 侧 `mismatch=0` 没有变。最关键的一点：日志里**一次都没有出现**
+第 34 轮刚接进循环的 `OWNER VERDICT` 行 —— 也就是说，那个专门用来抓「比较器抓不到」的 gate，
+在这三次运行里**根本没有执行**，而报告里完全看不出来。
+
+### (55) 工具 bug 1：`compare_inner.sh` 顶上的 `set -e` 把 owner 检查吞掉了
+
+`compare_kv.py` 判 FAIL 时 `exit 1`；脚本第 4 行是 `set -eu`，于是第 9 行那条命令一返回非零，
+整个脚本**当场结束**，后面第 21 行起的 owner 检查从未运行。而 `do_run` 用 `|| true` 收输出，
+所以既没有报错也没有痕迹。教训很具体：**新加的判定如果挂在旧判定之后，就必须确认旧判定失败时它还会跑**。
+
+修法（`remote/compare_inner.sh`）：去掉 `set -e`，两个检查都跑、各自记 `rc`，最后
+`[ "$kv_rc" = 0 ] && [ "$owner_rc" = 0 ]` 作为脚本退出码；`OWNER VERDICT: PASS|FAIL` 一定打印。
+
+### (56) 工具 bug 2：目的端 index 池的 row 空间 = **命令行配置**的 kv_split，不是 metadata 的
+
+把三份归档的 row 空间做了一次普查（`remote/extent83.sh`，只打印每 rank 非零 row 的区间）：
+
+| 场景 | 源 P（分片，compact） | 目的 D（副本） | D 的 metadata.kv_split | D 的 `--kv_split_size` |
+|---|---|---|---|---|
+| base | K/V + index 1..14 | index 1..28 | 1 | 1 |
+| p2d4 | 1..14 | index 写入 **4..31**，trace 只 hash 了 **1..7** | 1 | **4** |
+| p4d2 | 1..2 | index 写入 **2..7**，trace 只 hash 了 **1..3** | 1 | **2** |
+
+结论：目的端 index 行 = `logical_block * S_cfg + slice`，`S_cfg` 来自**进程命令行**的 `--kv_split_size`。
+decode 侧 metadata 报 1 是因为那一侧的 split 骑在 TP 上（`has_kv_shard=0`），而池子是按配置的 S 分配并写入的。
+旧 tracer 用 metadata 的 1 展开，于是在 p2d4 上只看 rows 1..7 —— 真正被填的 4..31 里只观测到 4..7，
+比较器于是打印 `rows found=0`，**看起来像路由坏了**，其实是被观测的行选错了。
+
+修法（`pdtrace/_pd_trace.py`）：新增 `_configured_kv_split()`（读 `/proc/self/cmdline`，`kv_split_size`
+本来就在 `_CMDLINE_KEYS` 里）；非分片实例的 replica 行集改为
+`{base * S_cfg + slice}`（不再与 logical 行求并，避免把 K/V 的行混进 index 的 row 集）；
+probe 里记录 `kv_split_cfg` 供下游核对。
+
+单测（新增 `pdtrace/test_pd_trace_rows.py`，纯 python3、不需要 worker）：钉住 6 组断言 ——
+p2d4 目的端（split 1..7 / replica 4..31）、base 目的端（两者都是 1..28）、p2d4 分片源端（两者都是 1..14）、
+cp1 源端（replica 2..5）、无命令行时回退到 metadata 的 4（replica 4..11）。`ROWS: PASS`。
+
+### (57) 工具 bug 3：比较器的 replicated 分支只会**一种**源端形状
+
+旧公式 `want_row = half + S_P` 假设源端也是「整条序列副本」。但 prefill 开了 CP 时源端是**分片**的：
+正确的源行是 `half // S_P + 1`，而且只在该 canonical 块的 owner slice 的 rank 上。这正是第 34 轮
+产品修复所确立的契约，比较器没有跟上，于是把**正确的字节**判成 `mismatch`。
+
+修法（`pdtrace/compare_kv.py`）：
+* 新增 `prefill_shards_index(records, prefill)`：**从 trace 里读** `has_kv_shard`（模型自己用的那个标志），
+  只有在 trace 早于该探针时才回退到声明的 `cp_size > 1`；
+* 分片源端走 owner 公式（row + owner slice 双条件），与 `key/value` 的 slice 语义一致；
+* **目的端在请求范围内全零 = 丢块**，不再只记 `zero` 而不判负 —— 但只在该行**源端确实写过**时才算丢失
+  （新增 `source_rows()` 提供 (rank,row) 非零集合）。否则它是尾部半块的两侧 padding：
+  p4d2 短 prompt 的 canonical 5 就是这种（592 token 落在 canonical 4 里，canonical 5 谁都没写）。
+
+离线复跑三份归档的**传输前** dump（`remote/validate83.sh`，强制 `--decode-tag before --decode-call 0`）：
+
+| 场景 | index | K/V | 结论 |
+|---|---|---|---|
+| base | 84/84 match | 112/112 match | `VERDICT: PASS` |
+| p2d4 | 12/12 match | 28/28 match | `VERDICT: PASS` |
+| p4d2 | 6/6 match | 12/12 + 4 padding | `VERDICT: PASS` |
+
+（p2d4 / p4d2 这里只有旧 tracer 观测到的行参与评分；补齐观测是 (56) 的事。）
+
+### (58) 工具改进 4：owner 检查的范围改由**目的端自己的 block table** 定义
+
+旧版把范围算成源端的 `block_table_len × S_P`，并且只比「dump 里已经有的行」。旧 tracer 只 hash 了 4..7 时，
+它会报「16/16 全对」而**放过 24 个根本没观测到的 canonical 块** —— 一个无法确认的检查比没有检查更危险。
+
+新版（`pdtrace/index_owner_check.py` 重写）：对目的端 `block_table` 的每个条目 × 每个 slice 都要求有行，
+按下面几类报，**除 padding 外都判负**：
+* `mismatch`：有行但字节不等于 owner 的 `c // S_P + 1`；
+* `not written while the owner holds it`：hash 到了但全零，而**源端 owner 行有数据** → 传输丢块；
+* `not hashed by the trace`：trace 根本没观测这一行（无法确认，不算通过）；
+* `source row absent`：源端 owner 行本身不存在；
+* `empty on both sides (padding)`：**两侧都是零** —— 尾部没填满的块。p4d2 的 592 token 落在 canonical 4 里，
+  canonical 5 谁都没写过；这类只报告、不判负（否则会把一次正确运行判死）。
+源端 dump 取 `after` 的所有 call 求并（chunked prefill 一次 prompt 分多次），目的端取最早的 `before`。
+
+离线结果：
+
+| 归档 | 结果 |
+|---|---|
+| `p2d4-scan64-183843`（**pre-fix**） | canonical 2 字节不等 + 15 个块 `not written while the owner holds it` → FAIL（能判死旧行为） |
+| `p2d4-scan64-184539`（post-fix） | `checked=112 match=112` → PASS |
+| `base-191544` | `checked=56 match=56` → PASS |
+| `p2d4-191909` / `p4d2-canonical-r20-192203`（旧 tracer） | 已观测的行 16/16、4/4 全 match，但 24 / 4 行 `not hashed` → FAIL（等新 tracer 观测补齐，见 (60)） |
+
+### (59) 本轮改动的文件与恢复点
+
+* 工具：`pdtrace/{_pd_trace.py,compare_kv.py,index_owner_check.py,test_pd_trace_rows.py(新)}`、
+  `remote/{compare_inner.sh,matrix35.sh(新),validate83.sh,extent83.sh,rows83.sh,state98.sh,state83.sh,elf83.sh,ports83.sh}`。
+  同步到 98 `handoff/remote/` 与 83 `tracefiles/` 的 md5：
+  `_pd_trace.py=b625f8f0d5a0520d6c2b468b0b1a953d`、`compare_kv.py=fb3d996187ed0a4a004c664d19994c9a`、
+  `index_owner_check.py=f44e4737b8fce4af93c70f199b632011`、`compare_inner.sh=14798f6c7003c78347bbd8585d04bffa`。
+* 产品代码：**本轮无改动**。容器内 ELF 仍是第 34 轮那份
+  `1325c61d5d43772cfb93d233a024ce96`（111,643,224 字节），marker
+  `destination cp_size must be divisible by kv_split_size` 计数 1。
+* 另记：`trace_install.sh` 每次 run 都会把 `$BASE/tracefiles/_pd_trace.py` 覆盖安装到
+  site-packages 的 `xllm/python/_pd_trace.py`，所以**换了 tracer 不需要重编、只需要重跑**；
+  19:37:18 的安装时间戳就是本轮 base 场景用上新 tracer 的证据。
+
+### (60) 在线验收：三场景 `VERDICT: PASS` **且** `OWNER VERDICT: PASS`
+
+`remote/matrix35.sh`（98 上串行、每个场景前 restart 容器）19:36:56–19:46:23 跑完 base / p2d4 / p4d2-canonical-r20，
+19:52–19:55:58 单独重跑 p4d2：
+
+| 场景 | 归档（83 `pdroute83/runs/`） | K/V | index | 比较器 | owner 检查 |
+|---|---|---|---|---|---|
+| base | `base-194004` | 112/112 match | 84/84 match | PASS | PASS（56/56） |
+| p2d4 | `p2d4-194329` | 28/28 match | 112/112 match（28 canonical × 4 rank） | PASS | PASS（112/112） |
+| p4d2 (r20) | `p4d2-canonical-r20-195558` | 12/12、8/8 + 4 padding | 15/15 | PASS | PASS（10/10，1 padding） |
+
+两点口径说明（都写进比较器/检查的输出里，避免下次误读）：
+
+* 比较器最终的 verdict 取**最早通过的那个 dump** = `before call=0`，即传输刚落下、decode 引擎还没走第一步。
+  之后的 dump 会因为 decode 自己写的行而 `absent_in`（base：每个 rank index 3 行 + K/V 4 行/layer 的
+  `after call=0` 就是这种），那不是传输的责任。
+* p4d2 的第一次在线跑（`p4d2-canonical-r20-194623`）owner 检查报 `not written [5]`：592 token 的 prompt
+  让 canonical 5 两侧都是零。这不是丢块而是尾部 padding，于是 owner 检查也对齐成
+  「源端 owner 行也没数据 → `empty on both sides (padding)`，只报告不判负」（与 (57) 里比较器的口径一致），
+  再单独重跑 p4d2 得 `VERDICT: PASS` + `OWNER VERDICT: PASS`；base / p2d4 无需重跑（新口径对它们是同一范围）。
+  **判据强弱没有被削弱**：同一份 pre-fix scan 归档在新口径下仍然 FAIL（canonical 2 字节不等 +
+  15 个块 `not written while the owner holds it`）。
+
+### (61) 第 35 轮的结论（写给下一次）
+
+* 产品代码：第 34 轮的修复经三场景字节级验收成立，**本轮没有再改产品代码**；容器里仍是
+  `1325c61d…` 那份 ELF。
+* 三条验证器口径：
+  1. **row 空间要从实例的配置（命令行 `--kv_split_size`）读**，metadata 是模型的视角 —— decode 侧
+     那里是 1，按它展开会少观测 24/28 个块，并把「观测不到」误报成路由错误；
+  2. 一个判定说「不通过」时，必须能分清 **mismatch / 该写没写 / 没观测到 / 两侧都空(padding)** 四件事，
+     否则「无法确认」会被读成通过、「padding」会被读成失败；
+  3. 新加的判定挂在旧判定之后时，先确认旧判定失败时它还会执行（`compare_inner.sh` 的 `set -e` 就吃掉了
+     第 34 轮刚加进去的 owner 检查，且完全不留痕迹）。
+* 仍然开放（模型侧，未动）：p4d2 **长 prompt**（3492 token）prefill forward 的
+  `[ASSERT] gather_v3_base.h:137 ... Index 3480 out of range[0 3480)` → `aclnnIndexSelect failed, error code is 507035`。
