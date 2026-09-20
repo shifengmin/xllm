@@ -3857,3 +3857,40 @@ cache_directory_test  23 passed
 另外发现构建树 `route_binder.cpp` 与仓库只差一行注释折行（md5 不同、代码相同），已把仓库版本
 stage 回树里保持一致（不改变行为）。
 
+### (77) 第 37 轮收尾：layerwise 按决定暂不兼容；下一轮做**异构 TP** 兼容性验证
+
+**决定（用户 2026-09-20）**：`layerwise_split_size > 1`（共享 DSA 层的 index-page elision）
+**暂不验证、不做兼容** —— 第 66 轮复核项 2 挂起，不是"已验证没问题"的结论。线索留在此处备查：
+`platform.h:71-74` `supports_dsa_indexer_cache_elision()`（"Shared DSA layers reuse the previous
+full layer's top-k and never write indexer cache, so those layers skip indexer-page allocation"）
+配合 `glm5_2.py` 的 layerwise 分支（只在 `owns_layer_cache` 时调 `select_qli`，也就是只在属主
+rank 上写索引池）。真要做时先查：PD 传输是否给被 elide 的层推/收索引行、decode 侧的非 layerwise
+路径能否读到它们。
+
+**下一轮目标：异构 TP 兼容性。** 已有矩阵里的 TP 变化都绑在 kv-split reshard 上（`p2d4` 2→4、
+`p4d2` 1→2、`kv4kv2` 4→2），所以新增三个把 TP 变化单独拎出来 / 放大的场景。机器只有 8 卡，
+两侧 rank 数之和 ≤ 8：
+
+| 场景 | Prefill | Decode | 变的是什么 |
+|---|---|---|---|
+| `tp2tp1` | 4 ranks cp2/tp2/kv2（0-3） | **1** rank cp1/tp1/kv1（4） | TP 2→1，kv 2→1，decode 退化成单 rank |
+| `p4d4` | 4 ranks cp4/tp1/kv4（0-3） | 4 ranks cp1/tp4/kv4（4-7） | TP 1→4，kv 4→4（**只变 TP**） |
+| `kv4kv1` | 4 ranks cp1/tp4/kv4（0-3） | **1** rank cp1/tp1/kv1（4） | TP 4→1，kv 4→1，两侧都不开 CP |
+| `p2d4`（对照） | cp2/tp2/kv2 | cp1/tp4/kv4 | 第 37 轮矩阵已绿，用来对齐可比性 |
+
+**已经就绪但还没跑**（下一轮直接开跑即可）：
+
+* `env.sh` 三个 case 臂（脚本 `apply_scenario_heterotp.py`，已在 83 应用并实测可求值）；
+  `run_trace_{tp2tp1,p4d4,kv4kv1}.sh` 已生成。
+* `remote_loop.sh` 几何表三行（`tp2tp1) 2 2 2 1 1 1`、`p4d4) 4 1 4 1 4 4`、`kv4kv1) 1 4 4 1 1 1`），
+  md5 `62c74da388ab2d49639231656eaaa7c1`（本机 = 98）。
+* `scenarios_heterotp.txt`（四行）+ `matrix_heterotp.sh`：98 上 `setsid nohup` 起，
+  日志 `/tmp/matrix_heterotp.log`，避免再被 ssh 掉线杀掉。
+* 八个臂全部实测可求值：TP 2→2 / 1→2 / 2→4 / 4→2 / 1→2 / **2→1** / **1→4** / **4→1**。
+* **风险点（第一次跑才知道）**：`D_NNODES=1` 从未跑过 —— `start_workers.sh` 的 rank 循环支持它，
+  但端口/就绪检查、以及退化成一个 rank 的 DCP 组是否被各 family 正确处理，要靠 `tp2tp1`/`kv4kv1`
+  自己暴露。
+
+第 37 轮全部 durable state：本 worklog §(68)–(77) + `RESUME.md`（本机 / 98 `handoff/` /
+83 `pdroute83/` 三处同 md5）；已推 `57b856294`、`05b0f972e`。
+
