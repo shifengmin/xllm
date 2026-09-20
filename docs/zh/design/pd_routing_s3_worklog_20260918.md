@@ -4108,6 +4108,18 @@ conv/ssm 它归到 `other/written=18/36 zero=0`——**行级比较器看不见 
 * 运维坑（重要）：长任务挂在 ssh 会话下会被**静默截断**——本地拿到 `rc=0`、远端脚本却在中途被切断
   （build 成功、deploy 成功，但后续 3 个臂从未开始；日志停在 deploy 之后）。现在一律
   `setsid nohup bash <driver> > /tmp/<driver>.log 2>&1 < /dev/null &` 完全脱离会话，再用短探针读日志。
-* legacy 对照：legacy 只搬 K/V，decode 侧 conv/ssm 全零（`ssm zero=486/504`），所以它只能证明
-  「模型能在 PD 上服务」，不能作为 head reshard 的判据；canonical 才是目标。
+* legacy 对照（`q35t1t1-legacy-r20-122624`，同一个几何、同一个逐头比较器）：http 200，
+  **conv 288/288、ssm 288/288 全 match**，K/V `match=312 misplaced=24（全是 block ±1）not delivered=4`
+  → **HEAD VERDICT: FAIL**。两条结论：
+  1. **纠正上一轮的判断**：「legacy 只搬 K/V、decode 侧 conv/ssm 全零（`ssm zero=486/504`）」是
+     **旧 tracer 行空间的产物**——它拿 K/V block table 当 conv/ssm 的行，而那些行本来就没人写。
+     行空间改对之后可见：在 tp1→tp1 这种同构对上，legacy 的数据面**确实把 linear-state 的 slot 行搬过去了**
+     （逐头逐字节命中）。
+  2. 更重要的：同一个几何、同一个比较器，**legacy FAIL、canonical PASS**，说明逐头判定不是
+     「永远 PASS」的空判据。legacy 那 24 个 `(block ±1, head)` 错位与 4 个未交付的**归属**
+     （legacy 的行映射本就与 canonical 不同，还是 legacy 自己的缺陷）不足以由这一个 run 判定——
+     逐头比较器的行映射是按 canonical 写的。如实记为「未定」。
+* 比较器口径再确认（避免把「两边都零」当成 match）：`compare_heads.py` 把目标侧逐头摘要等于
+  `zero_digest` 的算 `zero` 而非 `match`，源端索引只收非零摘要，`match` 必须是目标摘要等于某个源摘要
+  → `match=288 zero=0` 的含义是「目标真的持有源字节」。canonical 三条臂的 PASS 因此不是空判据。
 
