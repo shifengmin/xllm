@@ -3894,3 +3894,109 @@ rank 上写索引池）。真要做时先查：PD 传输是否给被 elide 的�
 第 37 轮全部 durable state：本 worklog §(68)–(77) + `RESUME.md`（本机 / 98 `handoff/` /
 83 `pdroute83/` 三处同 md5）；已推 `57b856294`、`05b0f972e`。
 
+## 第 38 轮（2026-09-20 11:00–）：异构 TP 要用 Qwen3 验证 —— 域前提更正、混合架构缓存实测、当前卡在 op 包
+
+### (78) 前提更正：GLM-5.2 是 MLA/DSA，KV cache 只有 1 个 head、**不随 TP 切分**
+
+用户在开工前指出这一点，代码确认（`kv_cache_shape.cpp`）：
+
+| 分支 | 形状 | 是否随 `world_size`(=TP) 变 |
+|---|---|---|
+| `enable_mla()`（GLM-5.2） | `key=[n_blocks, block_size, 1, kv_lora_rank]`、`value=[…, 1, qk_rope_head_dim]` | **不变**（`:316-318`、`:341-344` 直接写死 1） |
+| GQA（Qwen 系） | `key=[n_blocks, block_size, local_kv_head_count, head_dim]`，`local_kv_head_count = get_local_head_count(n_kv_heads, world_size)` | **变**（`:320-326`、`:351-357`） |
+
+所以第 37 轮准备的 GLM 异构-TP 场景（`tp2tp1`/`p4d4`/`kv4kv1`）只能验证**rank 几何与副本扇出**
+（GLM 的 K/V 在 TP 上是复制的），**无法验证 head-range reshard**；真正要验的是 GQA 模型。
+
+Qwen3.5-0.8B（用户指定，share 里唯一可跑的 Qwen3 系小模型；`Qwen3-VL-*` 是 17G/63G，`Qwen3-Coder-480B`
+是 450G，`Qwen3-8B-DFlash-b16`/`Eagle3-*`/`Qwen3EAGLE` 是草稿模型，`Qwen3.5-9B`/`Qwen3.6-27B` 目录为空）：
+
+```
+24 层 = 18 linear_attention + 6 full_attention（full_attention_interval=4，full 层 = 3,7,11,15,19,23）
+attention : 8 Q heads / 2 KV heads / head_dim 256
+linear    : 16 K heads / 16 V heads / head_dim 128 / conv kernel 4
+mtp       : 1 层（NUM_SPECULATIVE_TOKENS=0 关掉）  权重前缀 model.language_model.
+model_type= qwen3_5 -> 引擎解析成 qwen3_5_text（model_config_utils.cpp:50-62）-> registry 的 qwen3_5/
+             qwen3_5_text -> xllm/python/models/qwen3_5.py（NPU 层实现在 layers/npu/qwen3_5/）
+```
+
+**TP 约束**（`model_loader/sharding.py:66-75` `gqa_head_split`）：`n_kv_heads >= tp_size` 才按 head 切，
+否则每 rank 1 个 KV head、被 `tp_size/n_kv_heads` 个 rank 复制。所以本模型的 attention KV 在
+tp1 = 2 heads/rank、tp2 = 1 head/rank、tp4 = 1 head/rank（复制模式）；异构 TP 取 **tp1 ↔ tp2**。
+
+### (79) 实测：Qwen3.5 的缓存张量与 row 契约（来自归档 trace，不是推断）
+
+第一次 smoke（`q35t1t1` = P tp1/kv1 → D tp1/kv1，短 prompt）虽然 forward 失败了，但 tracer 在
+`ModelExecution.execute` 入口写出了 batch 的 dump，从归档里读出来的布局与代码完全一致：
+
+```
+meta: call=0 is_prefill=True blocks=[1,2] slot_len=256 slot_unit=128 has_kv_shard=0 kv_split_cfg=1
+slot=key    shape=[31407, 128, 2, 256]  bf16   row_bytes=131072  layers 3..23  (6 个 full-attention 层)
+slot=value  shape=[31407, 128, 2, 256]  bf16   row_bytes=131072  同上
+slot=conv   shape=[202, 3, 6144]        bf16   row_bytes=36864   layers 0..22  (18 个 linear 层)
+slot=ssm    shape=[202, 16, 128, 128]   fp32   row_bytes=1048576  同上
+```
+
+* `key/value` 的第 2 维 = **local KV heads**（tp1 时 2）→ head 切分轴在这里，逐头比对必须按这一维。
+* `conv` 的第 2 维 = 3 = `conv_kernel_dim-1`；第 3 维 6144 = `linear_key_head_dim*local_k(16)*2 +
+  linear_key_head_dim*local_v(16)` = 4096+2048 → **实测到的就是那个 composite descriptor**。
+* `ssm` 的第 1 维 = 16 = `local_linear_value_head_count` → 逐头比对轴在这里。
+* 两者都是 **sequence-scoped**（state block，不是 token block），与 `RouteBinder::peer_row` 的
+  sequence-scoped 分支对应。
+
+### (80) 路由侧现状（读码结论，待下一轮决策）
+
+`cache_directory.cpp:456-524` `declare_cache_group`：
+
+* **SSM**：`global_head_count = linear_value_head_count`、`sequence_scoped=true`、`full_sequence_replica=false`
+  → canonical 路由**可以**服务。
+* **CONV**：注释原文 *"Without MLA this role publishes a composite descriptor, which the canonical route
+  refuses on purpose (see describe_tensor). Declaring the geometry anyway keeps that refusal in one place."*
+  → **非 MLA（= Qwen3.5）的 conv 族目前 canonical 路由拒绝服务**，这正是 C1 MixedLayers 欠账的入口。
+  下一轮必须先决定：给 canonical 补上 composite CONV 的 key/value head-range 切分，还是让 conv 走 legacy
+  planner（混合路由）。
+
+### (81) 当前阻塞点：镜像里没有任何 vendor 提供 `aclnnMegaGdnPrefill`
+
+首次 smoke 的结论（**模型加载成功，第一次 forward Fatal**）：
+
+```
+I llm_engine.cpp:277] Block info, block_size: 128, n_local_kv_heads: 2, head_dim: 256, n_layers: 24, dtype: BFloat16
+I llm_engine.cpp:303] Initializing model with ModelArgs: [model_type: qwen3_5_text, ... n_heads: 8, n_kv_heads: 2 ...]
+F npu_mega_gdn_prefill.cpp:163] Check failed: get_workspace_size_func_addr != nullptr && op_api_func_addr != nullptr
+    aclnnMegaGdnPrefillOp or aclnnMegaGdnPrefillOpGetWorkspaceSize not in libopapi.so, or libopapi.so not found
+```
+
+* 镜像的四个 vendor（`custom_transformer` / `custom_xllm_math` / `glm_next_transformer` /
+  `kpool_transformer`）的 `op_api/lib/*.so` 里 `strings | grep MegaGdnPrefill` 全为 0，也没有任何
+  `*MegaGdn*` 头文件；83/98 的 workspace 里也没有现成的 GDN op 包（只有历次别的 vendor 备份）。
+* 引擎侧调用链：`xllm_ops::mega_gdn_prefill`（`npu_ops_library.cpp:917`）→ `EXEC_NPU_CMD(aclnnMegaGdnPrefill)`
+  （`xllm_ops/npu_mega_gdn_prefill.cpp:163`）；另有 `aclnnMegaGdnDecode`、`aclnnMegaGdnMtpDecode`。
+* 与之前 `aclnnSparseFlashAttentionLse` 的情况同类：需要另找/另建 op 包，再按 `lse_vendor` 的做法用
+  `ASCEND_CUSTOM_OPP_PATH` 挂上（env.sh 已有该机制与 vendor 优先级的处理）。
+* **结论：Qwen3.5 异构 TP 验证当前卡在 op 包（环境），不是路由。** 归档
+  `runs/q35t1t1-canonical-r20-110629` 里只有 `before call=0` 的 dump（96 行 = 24 层 × 4 slot），
+  decode 侧没有 dump → 两个 gate 都是 FAIL（预期，请求没走完）。
+
+### (82) 第 38 轮已落地的工具（未跑通）
+
+* 场景臂 `q35t1t1` / `q35t2t1` / `q35t1t2`（脚本 `apply_scenario_q35.py`，md5 `018853cf…`）：
+  在臂内覆盖 `MODEL`/`MODEL_NAME` 到 `Qwen3.5-0.8B`，并置 `P_PREFIX_CACHE=false P_CHUNKED_PREFILL=false`
+  （state cache 与 chunked prefill 交织会让失败无法归因）。
+* `start_workers.sh` 的 prefill 两个 flag 改成环境变量驱动（`${P_PREFIX_CACHE:-true}` /
+  `${P_CHUNKED_PREFILL:-true}`，默认值 = 原硬编码值，GLM 场景行为不变）。
+* `run_trace_q35{t1t1,t2t1,t1t2}.sh`；`remote_loop.sh` 几何表三行（`1 1 1 1 1 1` / `1 2 1 1 1 1` /
+  `1 1 1 1 2 1`，md5 `9d86348c6ec183f5241b271d8dbfebee`）；`q35_smoke.sh`、`verify_scen3.sh`
+  （11 个臂全部实测可求值）。
+* 工具改造设计（**下一步要做**）：tracer 对 `key/value/ssm` 这类多 head 张量改成按 `(row, head)`
+  出记录（head 轴：key/value 是 dim 2、ssm 是 dim 1、conv 是 composite dim 里的两段），并记录
+  `tp_size/tp_rank/local_heads`；比较器与 owner check 按 `(canonical block, 全局 head)` 比对，
+  `head_base` 规则 = sharded 时 `tp_rank*local_heads`、replicated 时 `tp_rank % global_kv_heads`；
+  conv/ssm 还要按 state block / checkpoint stride 建 row 契约。
+
+**暂停点（用户指示）**：smoke 结束后存档、暂停，等压缩上下文后继续。下一轮顺序：
+(a) 拿到 `aclnnMegaGdnPrefill`/`Decode`(/`MtpDecode`) 的 op 包并挂上 → 重跑 `q35t1t1`（短 prompt）；
+(b) 用 trace 确认 conv/ssm/key/value 的真实 row 契约（本轮的形状表是起点）；
+(c) 实现上面的逐头比对工具；
+(d) 跑 `q35t2t1` / `q35t1t2`，并同时决定 CONV composite descriptor 在 canonical 路由下的走法。
+
