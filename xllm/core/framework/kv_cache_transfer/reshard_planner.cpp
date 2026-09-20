@@ -101,15 +101,50 @@ bool supports_kv_split_topology(const ParallelCoordinates& coordinates) {
          kv_split_spans_cp_and_tp(coordinates);
 }
 
+// The source and destination sequence-split widths must be integer multiples of
+// one another. A canonical row c then routes deterministically by modular
+// arithmetic: it lives on D rank c % M (M = destination width) and is owned by
+// P rank c % N (N = source width). Non-multiple widths would split a physical
+// row across destinations and are unsupported.
+bool kv_split_widths_are_integer_multiples(int32_t source_kv_split_size,
+                                           int32_t destination_kv_split_size) {
+  const int32_t larger =
+      std::max(source_kv_split_size, destination_kv_split_size);
+  const int32_t smaller =
+      std::min(source_kv_split_size, destination_kv_split_size);
+  return smaller > 0 && larger % smaller == 0;
+}
+
+// A source and destination kv-split rank exchange data only when they own an
+// overlapping set of canonical rows. Rows are congruent mod the source width N
+// on P and mod the destination width M on D, so the two ranks overlap iff they
+// agree modulo min(N, M). This subsumes the homogeneous case (N==M requires
+// equal ranks) and the collapse case (M==1 accepts every source rank).
+bool kv_split_ranks_overlap(const ParallelCoordinates& source,
+                            const ParallelCoordinates& destination) {
+  const int32_t smaller =
+      std::min(source.kv_split_size, destination.kv_split_size);
+  return smaller > 0 &&
+         source.kv_split_rank % smaller == destination.kv_split_rank % smaller;
+}
+
 bool supports_partition_layout(const ParallelCoordinates& source,
                                const ParallelCoordinates& destination) {
   if (same_partition_sizes(source, destination)) {
     return true;
   }
-  return destination.cp_size == 1 && destination.cp_rank == 0 &&
-         (destination.kv_split_size == 1 ||
-          (supports_kv_split_topology(source) &&
-           source.kv_split_size == destination.kv_split_size));
+  if (destination.cp_size != 1 || destination.cp_rank != 0) {
+    return false;
+  }
+  // D collapses P's CP ranks into TP. A fully unsharded destination (M==1)
+  // absorbs every source row, so it needs no topology or width test; otherwise
+  // the widths must be integer multiples over a valid source topology.
+  if (destination.kv_split_size == 1) {
+    return true;
+  }
+  return supports_kv_split_topology(source) &&
+         kv_split_widths_are_integer_multiples(source.kv_split_size,
+                                               destination.kv_split_size);
 }
 
 bool supports_partition_pair(const ParallelCoordinates& source,
@@ -117,10 +152,8 @@ bool supports_partition_pair(const ParallelCoordinates& source,
   if (same_partition_sizes(source, destination)) {
     return same_partition(source, destination);
   }
-  // D can collapse P's CP ranks into TP while retaining the same DCP shard.
   return supports_partition_layout(source, destination) &&
-         (destination.kv_split_size == 1 ||
-          source.kv_split_rank == destination.kv_split_rank);
+         kv_split_ranks_overlap(source, destination);
 }
 
 Status validate_compatibility(const WorkerCacheLayoutManifest& source,
@@ -463,10 +496,22 @@ Status select_collapsed_writers(
           ? 1
           : static_cast<size_t>(sources.front().coordinates.cp_size /
                                 sources.front().coordinates.kv_split_size);
+  const int32_t destination_kv_split_size =
+      destination.coordinates.kv_split_size;
   for (const auto& [group, cp_workers] : cp_groups) {
-    if (destination.coordinates.kv_split_size > 1 &&
-        group.second != destination.coordinates.kv_split_rank) {
-      continue;
+    // A source kv-split rank feeds this destination rank only when the two own
+    // an overlapping set of canonical rows, i.e. they agree modulo the smaller
+    // width. When the destination is unsharded (M==1) every source rank feeds
+    // it; when widths match this reduces to rank equality.
+    if (destination_kv_split_size > 1) {
+      const int32_t source_kv_split_size =
+          sources.front().coordinates.kv_split_size;
+      const int32_t smaller =
+          std::min(source_kv_split_size, destination_kv_split_size);
+      if (group.second % smaller !=
+          destination.coordinates.kv_split_rank % smaller) {
+        continue;
+      }
     }
     if (cp_workers.size() != expected_cp_count) {
       return invalid("CP replica group has an unexpected partition count");

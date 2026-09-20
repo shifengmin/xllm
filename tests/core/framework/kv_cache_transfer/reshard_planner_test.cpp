@@ -1273,6 +1273,106 @@ TEST(RequestRegionBinderTest, RejectsOutOfRangeNonContiguousResourceIds) {
   EXPECT_TRUE(regions.empty());
 }
 
+// A destination kv-split rank draws from exactly the source ranks that share
+// its canonical rows: r_src and r_dst overlap iff they agree modulo the smaller
+// of the two widths. These cases exercise the integer-multiple N->M routing.
+TEST(ReshardPlannerTest, RoutesSourceRanksWhenDestinationSplitsLess) {
+  // M | N: source width N=4 collapses to destination width M=2. Each D rank m
+  // is fed by the source ranks n with n % 2 == m, i.e. {m, m + 2}.
+  constexpr int32_t kSourceKvSplit = 4;
+  constexpr int32_t kDestinationKvSplit = 2;
+  const std::vector<WorkerCacheLayoutManifest> sources =
+      make_cp_instance(/*cp_size=*/kSourceKvSplit,
+                       /*kv_split_size=*/kSourceKvSplit,
+                       /*tp_size=*/1,
+                       /*global_heads=*/1,
+                       /*first_buffer_id=*/3,
+                       "prefill");
+  ReshardPlanner planner;
+
+  for (int32_t destination_rank = 0; destination_rank < kDestinationKvSplit;
+       ++destination_rank) {
+    WorkerCacheLayoutManifest destination = make_head_manifest(
+        /*tp_rank=*/0,
+        /*tp_size=*/1,
+        /*global_heads=*/1,
+        /*buffer_id=*/17 + static_cast<uint64_t>(destination_rank),
+        "decode" + std::to_string(destination_rank));
+    destination.coordinates.cp_size = 1;
+    destination.coordinates.kv_split_size = kDestinationKvSplit;
+    destination.coordinates.kv_split_rank = destination_rank;
+
+    std::vector<size_t> selected_indices;
+    ASSERT_TRUE(
+        planner.select_sources(sources, destination, &selected_indices).ok());
+    std::sort(selected_indices.begin(), selected_indices.end());
+    EXPECT_EQ(selected_indices,
+              (std::vector<size_t>{
+                  static_cast<size_t>(destination_rank),
+                  static_cast<size_t>(destination_rank + kDestinationKvSplit)}))
+        << "destination_rank=" << destination_rank;
+  }
+}
+
+TEST(ReshardPlannerTest, RoutesSourceRankWhenDestinationSplitsMore) {
+  // N | M: source width N=2 fans out to destination width M=4. Each D rank m is
+  // fed by the single source rank n with n == m % 2.
+  constexpr int32_t kSourceKvSplit = 2;
+  constexpr int32_t kDestinationKvSplit = 4;
+  const std::vector<WorkerCacheLayoutManifest> sources =
+      make_cp_instance(/*cp_size=*/kSourceKvSplit,
+                       /*kv_split_size=*/kSourceKvSplit,
+                       /*tp_size=*/1,
+                       /*global_heads=*/1,
+                       /*first_buffer_id=*/3,
+                       "prefill");
+  ReshardPlanner planner;
+
+  for (int32_t destination_rank = 0; destination_rank < kDestinationKvSplit;
+       ++destination_rank) {
+    WorkerCacheLayoutManifest destination = make_head_manifest(
+        /*tp_rank=*/0,
+        /*tp_size=*/1,
+        /*global_heads=*/1,
+        /*buffer_id=*/17 + static_cast<uint64_t>(destination_rank),
+        "decode" + std::to_string(destination_rank));
+    destination.coordinates.cp_size = 1;
+    destination.coordinates.kv_split_size = kDestinationKvSplit;
+    destination.coordinates.kv_split_rank = destination_rank;
+
+    std::vector<size_t> selected_indices;
+    ASSERT_TRUE(
+        planner.select_sources(sources, destination, &selected_indices).ok());
+    EXPECT_EQ(selected_indices,
+              std::vector<size_t>{
+                  static_cast<size_t>(destination_rank % kSourceKvSplit)})
+        << "destination_rank=" << destination_rank;
+  }
+}
+
+TEST(ReshardPlannerTest, RejectsNonMultipleKvSplitWidths) {
+  // 3 and 2 are not integer multiples: the negotiation must refuse the pair.
+  const std::vector<WorkerCacheLayoutManifest> sources =
+      make_cp_instance(/*cp_size=*/3,
+                       /*kv_split_size=*/3,
+                       /*tp_size=*/1,
+                       /*global_heads=*/1,
+                       /*first_buffer_id=*/3,
+                       "prefill");
+  WorkerCacheLayoutManifest destination =
+      make_head_manifest(0, 1, 1, 17, "decode");
+  destination.coordinates.cp_size = 1;
+  destination.coordinates.kv_split_size = 2;
+  destination.coordinates.kv_split_rank = 1;
+
+  std::vector<size_t> selected_indices;
+  const Status status =
+      ReshardPlanner().select_sources(sources, destination, &selected_indices);
+
+  EXPECT_FALSE(status.ok());
+  EXPECT_NE(status.message().find("CP/KV-split"), std::string::npos);
+}
+
 }  // namespace
 
 }  // namespace xllm
