@@ -4123,3 +4123,22 @@ conv/ssm 它归到 `other/written=18/36 zero=0`——**行级比较器看不见 
   `zero_digest` 的算 `zero` 而非 `match`，源端索引只收非零摘要，`match` 必须是目标摘要等于某个源摘要
   → `match=288 zero=0` 的含义是「目标真的持有源字节」。canonical 三条臂的 PASS 因此不是空判据。
 
+### (89) 新 ELF 的 GLM 8 场景回归：8/8（先踩了一次自己的 staging 回归）
+
+* 用本轮部署件（md5 `3ad29504bb18e981024ba0270bcd587c`）复跑 `scenarios.txt` 的 8 条：
+  base / p2d4 / p4d2 r20 / p4d2 r120 / base r121 / cp4kv2 r20 / cp4kv2 r120 全部
+  `VERDICT: PASS` + `OWNER VERDICT: PASS`，只有 `kv4kv2` 首轮失败
+  （`F sparse_flash_attention_lse.cpp:153] aclnnSparseFlashAttentionLse or ... GetWorkspaceSize not in libopapi.so`）。
+* **根因不是路由，是本轮自己的一次 staging 回归**：LSE op 不在任何已装 vendor 里，靠
+  `pdroute83/env.sh` 里由 `apply_lse_env.py` 注入的一段
+  `ASCEND_CUSTOM_OPP_PATH="$BASE/lse_vendor..."` 接通；而**本地 `pdroute83/env.sh` 没有这一段**
+  （它只在远端被 patch 过），11:34 的 `stage83.sh` 把远端那份覆盖掉 → LSE 查不到。
+  修法：把该段折回本地 `env.sh`（md5 `dd721b55…` → `b33cb63a509362912cfe55e0c31b650c`）再 stage；
+  `kv4kv2` 复跑 `runs/kv4kv2-130734` 双 gate PASS ⇒ **新 ELF 的 8 场景矩阵 = 8/8**。
+* **教训（写进恢复点）**：staging 的「无损」判据必须是「本地 == 远端在 stage **之前**」，
+  而不是「stage **之后**两边相等」——后者恒真，正好掩盖了这次覆盖。
+  凡是远端被脚本 patch 过的文件（`env.sh` 是唯一一个），本地副本必须先吃进同样的 patch。
+* ops 源码包的复现性：那两个 protobuf patch 文件其实**已经在 `third_party/xllm_ops` 当前 commit
+  `b94b873`**（就是加 LSE nope 特化那次）里；83 上用于构建 GDN op 的树是**旧快照**，所以「补
+  `cmake/`」只是补快照。要让 op 构建可复现，应改用当前 submodule commit 重做快照，而不是继续在旧树上打补丁。
+
