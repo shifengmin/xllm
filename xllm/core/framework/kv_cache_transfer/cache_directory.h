@@ -20,8 +20,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/kv_cache/cache_layout_types.h"
 #include "framework/kv_cache/kv_cache_tensor_role.h"
-#include "framework/kv_cache/logical_cache_layout.h"
 #include "framework/kv_cache_transfer/cache_layout.h"
 #include "framework/kv_cache_transfer/kv_redundancy.h"
 #include "framework/kv_cache_transfer/route_binder.h"
