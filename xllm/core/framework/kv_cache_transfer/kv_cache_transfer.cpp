@@ -19,7 +19,9 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <unordered_set>
+#include <utility>
 
 #include "core/framework/config/kv_cache_config.h"
 
@@ -40,12 +42,16 @@ bool KVCacheTransfer::validate_transfer_mappings(
     return false;
   }
 
-  std::unordered_set<int32_t> group_ids;
-  group_ids.reserve(mappings.size());
+  std::set<std::pair<int32_t, int32_t>> group_dst_keys;
   for (const KVTransferMapping& mapping : mappings) {
-    if (!group_ids.emplace(mapping.group_id).second) {
+    // A group_id may appear once per destination kv-split rank when N|M routing
+    // splits one source mapping across destination ranks; the uniqueness
+    // invariant is therefore (group_id, dst_kv_split_rank), not group_id alone.
+    if (!group_dst_keys.emplace(mapping.group_id, mapping.dst_kv_split_rank)
+             .second) {
       LOG(ERROR) << "Duplicate KV cache transfer mapping, request_id="
-                 << request_id << ", group_id=" << mapping.group_id;
+                 << request_id << ", group_id=" << mapping.group_id
+                 << ", dst_kv_split_rank=" << mapping.dst_kv_split_rank;
       return false;
     }
 
@@ -153,27 +159,83 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
       continue;
     }
     TransferKVInfo filtered = kv_info;
-    for (KVTransferMapping& mapping : filtered.mappings) {
+    filtered.mappings.clear();
+    filtered.mappings.reserve(kv_info.mappings.size());
+    for (const KVTransferMapping& source_mapping : kv_info.mappings) {
       const std::optional<BlockType> block_type =
-          block_type_from_cache_group_id(mapping.group_id);
+          block_type_from_cache_group_id(source_mapping.group_id);
       if (!block_type.has_value() ||
           !is_kv_split_cache_block_type(block_type.value())) {
+        filtered.mappings.emplace_back(source_mapping);
         continue;
       }
-      const std::vector<uint64_t> remote_ids = mapping.remote_ids;
-      mapping.remote_ids.clear();
-      size_t mapped_local = 0;
-      mapping.remote_ids.reserve(mapping.local_ids.size());
-      for (size_t k = 0; k < mapping.local_ids.size(); ++k) {
-        const size_t remote_idx = static_cast<size_t>(kv_split_rank) +
-                                  k * static_cast<size_t>(kv_split_size);
-        if (remote_idx >= remote_ids.size()) {
+      // Destination sequence-split width M for this group (0 == unset, treated
+      // as the source width so the homogeneous N==M path is unchanged).
+      const int32_t remote_kv_split =
+          source_mapping.remote_kv_split > 0
+              ? static_cast<int32_t>(source_mapping.remote_kv_split)
+              : kv_split_size;
+      const std::vector<uint64_t>& remote_ids = source_mapping.remote_ids;
+      // canonical row c = kv_split_rank + k * N selects the position this
+      // source rank owns; its value remote_ids[c] is already the D-local
+      // physical row. For M <= N (D splits no finer than P) all of this rank's
+      // rows land on a single destination rank, so one mapping with the default
+      // broadcast routing is correct. For M > N the owned rows fan out across
+      // the M destination ranks (row c lives on D rank c % M): split into one
+      // mapping per destination rank so merge_kv_blocks can route each to its
+      // rank.
+      if (remote_kv_split <= kv_split_size) {
+        KVTransferMapping mapping = source_mapping;
+        mapping.remote_ids.clear();
+        mapping.remote_ids.reserve(mapping.local_ids.size());
+        size_t mapped_local = 0;
+        for (size_t k = 0; k < mapping.local_ids.size(); ++k) {
+          const size_t remote_idx = static_cast<size_t>(kv_split_rank) +
+                                    k * static_cast<size_t>(kv_split_size);
+          if (remote_idx >= remote_ids.size()) {
+            break;
+          }
+          mapping.remote_ids.emplace_back(remote_ids[remote_idx]);
+          ++mapped_local;
+        }
+        mapping.local_ids.resize(mapped_local);
+        filtered.mappings.emplace_back(std::move(mapping));
+        continue;
+      }
+      // M > N: group this rank's owned rows by destination rank c % M.
+      const int32_t split_ratio = remote_kv_split / kv_split_size;
+      CHECK_EQ(remote_kv_split % kv_split_size, 0)
+          << "N|M kv-split widths must be integer multiples, group_id="
+          << source_mapping.group_id << ", source_kv_split=" << kv_split_size
+          << ", destination_kv_split=" << remote_kv_split;
+      std::vector<KVTransferMapping> per_dst(static_cast<size_t>(split_ratio));
+      for (int32_t slot = 0; slot < split_ratio; ++slot) {
+        KVTransferMapping& mapping = per_dst[static_cast<size_t>(slot)];
+        mapping.group_id = source_mapping.group_id;
+        mapping.remote_shared_num = source_mapping.remote_shared_num;
+        mapping.remote_kv_split = source_mapping.remote_kv_split;
+        mapping.dst_kv_split_rank = kv_split_rank + slot * kv_split_size;
+      }
+      for (size_t k = 0; k < source_mapping.local_ids.size(); ++k) {
+        const size_t canonical_row = static_cast<size_t>(kv_split_rank) +
+                                     k * static_cast<size_t>(kv_split_size);
+        if (canonical_row >= remote_ids.size()) {
           break;
         }
-        mapping.remote_ids.emplace_back(remote_ids[remote_idx]);
-        ++mapped_local;
+        // c % M in [kv_split_rank, kv_split_rank + (ratio-1)*N] since c % N is
+        // always kv_split_rank; slot = (c % M - kv_split_rank) / N.
+        const int32_t dst_rank = static_cast<int32_t>(
+            canonical_row % static_cast<size_t>(remote_kv_split));
+        const int32_t slot = (dst_rank - kv_split_rank) / kv_split_size;
+        KVTransferMapping& mapping = per_dst[static_cast<size_t>(slot)];
+        mapping.local_ids.emplace_back(source_mapping.local_ids[k]);
+        mapping.remote_ids.emplace_back(remote_ids[canonical_row]);
       }
-      mapping.local_ids.resize(mapped_local);
+      for (KVTransferMapping& mapping : per_dst) {
+        if (!mapping.local_ids.empty()) {
+          filtered.mappings.emplace_back(std::move(mapping));
+        }
+      }
     }
     // local_ids[k] maps to remote_ids[kv_split_rank + k * kv_split_size]. When
     // the strided remote index runs past the D-side block list (the prompt

@@ -313,6 +313,13 @@ struct KVTransferMapping {
   // callers fall back to the instance kv-split width, leaving the homogeneous
   // N==M path byte-for-byte unchanged.
   uint32_t remote_kv_split = 0;
+  // Destination kv-split rank this mapping must be delivered to, or -1 to
+  // broadcast to every destination rank in the target DP group (the default,
+  // homogeneous and M|N behavior). When D splits the sequence more finely than
+  // P (M > N), the filter splits one source mapping into per-destination-rank
+  // mappings; each carries the rank its rows belong to (canonical row c -> rank
+  // c % M) so merge_kv_blocks routes it to exactly that destination.
+  int32_t dst_kv_split_rank = -1;
 };
 
 struct TransferKVInfo {

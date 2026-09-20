@@ -103,24 +103,41 @@ void merge_kv_info(
     std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo>&
         merged_kv_infos,
     const TransferKVInfo& info,
-    const int32_t dst_rank) {
+    const int32_t dst_rank,
+    const int32_t dst_kv_split_rank) {
   uint64_t dst_cluster_id = info.remote_instance_info.cluster_ids[dst_rank];
   const std::string& dst_addr = info.remote_instance_info.addrs[dst_rank];
   std::string key = get_merge_key(dst_cluster_id, dst_addr);
+
+  // A mapping tagged with a destination kv-split rank (>=0) is delivered only
+  // to that rank; an untagged mapping (-1) broadcasts to every rank, preserving
+  // the homogeneous and M<=N behavior. Select the mappings this destination is
+  // entitled to before merging.
+  std::vector<KVTransferMapping> routed_mappings;
+  routed_mappings.reserve(info.mappings.size());
+  for (const KVTransferMapping& mapping : info.mappings) {
+    if (mapping.dst_kv_split_rank < 0 ||
+        mapping.dst_kv_split_rank == dst_kv_split_rank) {
+      routed_mappings.emplace_back(mapping);
+    }
+  }
+  if (routed_mappings.empty()) {
+    return;
+  }
 
   auto it = merged_kv_infos.find(key);
   if (it == merged_kv_infos.end()) {
     KVCacheTransfer::KVCacheInfo kv_info;
     kv_info.dst_cluster_id = dst_cluster_id;
     kv_info.dst_addr = dst_addr;
-    append_mappings(kv_info.mappings, info.mappings);
+    append_mappings(kv_info.mappings, routed_mappings);
     merge_xtensor_offsets(kv_info.dst_xtensor_layer_offsets,
                           info.dst_xtensor_layer_offsets);
     merged_kv_infos.emplace(key, std::move(kv_info));
     return;
   }
 
-  append_mappings(it->second.mappings, info.mappings);
+  append_mappings(it->second.mappings, routed_mappings);
   merge_xtensor_offsets(it->second.dst_xtensor_layer_offsets,
                         info.dst_xtensor_layer_offsets);
 }
@@ -652,8 +669,18 @@ void MooncakeKVCacheTransferBase::merge_kv_blocks(
     const int32_t dst_tp_size = dst_world_size / dst_dp_size;
     const int32_t begin = info.dp_rank * dst_tp_size;
     const int32_t end = begin + dst_tp_size;
+    // Destination sequence-split width M. The per-DP span [begin, end) covers
+    // the whole pcp x tp block, so a worker's kv-split rank is its position in
+    // that span scaled by M (verified against the topology decomposition:
+    // ((local rank) * M) / span == dcp_rank across the supported topologies).
+    const int32_t dst_kv_split_size =
+        std::max(info.remote_instance_info.kv_split_size, 1);
     for (int32_t dst_rank = begin; dst_rank < end; ++dst_rank) {
-      merge_kv_info(merged_kv_infos, info, dst_rank);
+      const int32_t dst_kv_split_rank =
+          dst_kv_split_size > 1
+              ? ((dst_rank - begin) * dst_kv_split_size) / dst_tp_size
+              : 0;
+      merge_kv_info(merged_kv_infos, info, dst_rank, dst_kv_split_rank);
     }
   }
 }
