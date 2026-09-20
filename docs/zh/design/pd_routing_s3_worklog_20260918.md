@@ -4193,3 +4193,52 @@ D 是 `c+2`，差 `S_P−S_D` 行）。`peer_row` 第二分支刻意用**该侧 
 「源侧按片交付 → 目标侧合成全量」；② replica-0 写是**去重假设**（假定同 (head, slice) 各副本字节相同），
 binder 只校验放置、不校验源端副本一致性，靠 owner check 在真机兜；③ 索引器能走 canonical 的前提是
 head 几何钉得住（固定 1 个逻辑 head），`WINDOW/SWA/KV_STATE` 这类直接拒绝。
+
+### (91) rebase 到内部 main（`92de1966d`）+ 编译 + 单测
+
+**目标**：把分支 rebase 到内部仓库（`git@coding.jd.com:xLLM_AI/xllm.git`，网页入口
+`xingyun.jd.com/codingRoot/xLLM_AI/xllm`）的最新 main。注意本机 `upstream` 指的是 github 的
+`jd-opensource/xllm`（`cf4c7732d`），内部主线的 remote 叫 **`coding`**（`92de1966d`），两者不是同一条线。
+
+* 差距：merge-base `200939593`，`coding/main...HEAD` = **39 behind / 55 ahead**；rebase 后 **0 冲突**，
+  55 个提交全部重放（无 empty drop）。新增两个提交修 rebase 暴露的集成断裂，并推回 fork：
+  `00244bef6`（rebase 后 tip）、`cbd5d2765`、`18df8abef`。旧 tip 在 fork 上留档为
+  `backup/pd-routing-s0s1-prerebase-20260921`（`30883a9f4`）。
+* rebase 的语义安全网：对 6 个「双方都改过」的文件，逐文件核对 **main 新增的标识符在 HEAD 里一个不少**
+  （74/50/27/25/2/53 个，缺失 0），并单独确认 main 的 `index_block_capacity` / `compressed_kpool_tail`
+  两个新特性存活。
+
+**只有编译才能发现的两处集成断裂**（rebase 本身是干净的，这两处都不会冲突）：
+
+1. **`logical_cache_layout.h` 被 main 删除**（`6f7d6c49f feat: integrate compressed KPool cache
+   management. (#244)`），其类型被合并进既有的 `cache_layout_types.h`。我们的 `cache_directory.h:24`
+   还指着旧名 → `fatal error: framework/kv_cache/logical_cache_layout.h: No such file or directory`。
+   修法 `cbd5d2765`：改指向 `cache_layout_types.h`（三个结构体逐字段比对过，只有 main 新增的
+   `index_block_capacity` 一项差异，我们不用）。**教训**：某文件只被 `#include`、没有任何提交改它时，
+   上游删除它不会产生冲突，只会让编译在很远的地方炸。
+2. **98 的 ATB 子模块是旧版**：树里记录的指针是 `4bc59182f`，而磁盘上那份的
+   `models/eagle3/layer/decoder_layer.h` 没有 `normBeforeResidual`/`useQKNorm`/`enableSplitRmsNormRope`
+   → `npu_eagle3_decoder_layer_impl.cpp` 编译失败 8 处。修法：从本机 submodule 的对象库
+   `git archive 4bc59182f`（仅 440KB）覆盖到 98（保留嵌套子模块目录），字段随即齐全。
+
+**环境坑（与本次改动无关，但会挡住任何父仓 HEAD 变化后的构建）**：98 的
+`third_party/xllm_ops` 不是真正的 submodule 检出——**没有 `build.sh`**，而且
+`git -C third_party/xllm_ops rev-parse HEAD` 返回的是**父仓的 HEAD**（`.git` 实际指向父仓）。
+`CMakeLists.txt:69-81` 用 `XLLM_OPS_GIT_HEAD_CACHED`（来自 `xllm_build_env.sh:89`）与它比较，
+父仓 HEAD 一动就触发 `xllm_ops` 预编译 → 报 `Failed to precompile xllm ops, error code: 127`。
+绕过方式：构建时把 `XLLM_OPS_GIT_HEAD_CACHED` 钉成该目录当前 `rev-parse HEAD`（两个值相等即跳过）。
+这不是掩盖问题——ops 指针在 `7f922461d`/`92de1966d`/HEAD 三处都是 `b94b873`，算子已经装在
+`$ASCEND_OPP_PATH/vendors` 下，本次改动也不碰 ops。
+
+**编译与单测结果**（98 容器，`ninja -j 12`，tree 内容经 `git write-tree` 与提交 tree 哈希逐字节对齐）：
+
+* 引擎 `xllm` + 10 个测试二进制：**249/249，NINJA_RC=0**。
+* 单测：**181 passed / 1 skipped / 0 failed**
+  （cache_directory 27、pd_route 18、kv_redundancy 12、pd_route_transfer 14、kv_shard_contract 6、
+  host_kv_transfer 7、cache_layout_builder 10、kv_cache 29+1 skipped、linear_state_restore 28、
+  kv_cache_estimation 30）。
+* **顺带抓出我自己上一轮的一个回归**：`pd_route_transfer_test` 有**自己的** view 夹具，
+  没跟上 `head_runs` 要求 → 8 个用例报 `a cache view published no physical head run`。
+  该二进制在本轮之前**从未编过/跑过**（我只挑编了 3 个）。修法 `00244bef6`：夹具按描述符同样的方式
+  发布一条 run + `unit_head_stride`。**流程教训**：改到共享结构体（这里是 `PeerCacheView`）时，
+  要编**同一目录下全部**测试目标，不能挑三个跑。
