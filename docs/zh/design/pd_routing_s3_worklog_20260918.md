@@ -3828,3 +3828,32 @@ C. 再次切回补丁              -> 1 passed
 （用 `total_local=6 / packed=4` 作为 874/870 的最小同构。）另外在打补丁的树上跑**整个 CPU python
 测试目录**：`684 passed, 44 skipped`。
 
+### (76) C++ 侧补齐「副本源端」的字节级单测，并修掉一个本来就在红的测试
+
+第 66 轮复核列出的最后一个验收缺口：`pd_route_test.cpp` 只钉了**分片源端**（`block / S + 1`）
+的字节级契约，**副本源端**（`block + S_P`，即 `kv4kv2` 形状）只有端到端覆盖。补上：
+
+* 新增 `run_mock_replica_transfer(bool wrong_source_row)` + 两个用例
+  （`MockReplicaTransferCopiesWholeSequenceRows` / `MockReplicaTransferIsDiscriminating`）：
+  拓扑就是 `kv4kv2`（P cp1/tp4/kv4 → D cp1/tp2/kv2，组 `full_sequence_replica=true`），
+  期望独立推导为「canonical block h 取自源端 `h + S_P` 行、落在目的端 `h + S_D` 行」；
+  源端四个 rank **同种一份字节**（这正是端到端 owner 检查测的不变量），所以期望与「路由选中哪个副本」
+  无关；`wrong_source_row` 变体按 `h` 读，必须产生 mismatch。
+* 顺带修了一个**改动前就在红**的用例：`MockIndexTransferIsDiscriminating` 原本靠
+  `remote.explicit_offsets`（把目的端 row 基整体挪一行）制造「错误」，但 `RouteBinder` 后来加了
+  「bound region exceeds its cache buffer」的越界保护，于是 `bind` 直接返回 false、
+  内层 `EXPECT_TRUE` 失败——测试变成了在测那道保护，而不是测字节比较。改成
+  **给源端 rank 种错一份模式**（`mock_pattern(rank + 1, …)`）：绑定仍然合法、结构不变量全过，
+  只有字节比较能发现它，判别力回到字节层面。
+
+98 上的结果（打了 `glm5_2.py` 补丁的树）：
+
+```
+pd_route_test         16 passed
+kv_redundancy_test    12 passed
+cache_directory_test  23 passed
+```
+
+另外发现构建树 `route_binder.cpp` 与仓库只差一行注释折行（md5 不同、代码相同），已把仓库版本
+stage 回树里保持一致（不改变行为）。
+
