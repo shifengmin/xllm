@@ -67,6 +67,21 @@ bool row_bases_match(const CacheRowBases& bases,
          bases.group_id == tensor.group_id;
 }
 
+// One contiguous run of local heads inside one sub-unit of a cache resource.
+//
+// A single-tensor descriptor yields exactly one run. A composite descriptor
+// yields one per packed component, because a head range there is several byte
+// ranges: the Qwen3.5 conv row packs `[conv_key_a | conv_key_b | conv_value]`,
+// and one head of each component sits at its own offset. `repeat_count` and
+// `physical_stride_bytes` carry a run that appears more than once inside the
+// same sub-unit -- the conv state rows of one slot.
+struct HeadRunGeometry {
+  uint64_t physical_offset_bytes = 0;
+  uint64_t head_bytes = 0;
+  uint64_t repeat_count = 1;
+  uint64_t physical_stride_bytes = 0;
+};
+
 // Physical geometry of the local heads of one rank, as the descriptor states
 // it. `whole_resource` marks the degenerate descriptor whose single span covers
 // the entire cache resource and therefore carries no head axis of its own.
@@ -75,6 +90,11 @@ struct HeadGeometry {
   int32_t head_begin = 0;
   int32_t local_head_count = 0;
   bool whole_resource = false;
+  // The byte runs a head range covers, in the order the route moves them.
+  std::vector<HeadRunGeometry> runs;
+  // Bytes one sub-unit of the resource occupies. The binder strides over it, so
+  // it is the descriptor's own number rather than a re-derivation.
+  uint64_t unit_stride_bytes = 0;
 };
 
 // Reads the head axis of a descriptor and proves that it is the layout
@@ -145,6 +165,11 @@ bool derive_head_geometry(const WorkerCacheLayoutManifest& manifest,
     geometry->head_begin = head_begin;
     geometry->local_head_count = kSingleHead;
     geometry->whole_resource = true;
+    geometry->runs.clear();
+    HeadRunGeometry run;
+    run.head_bytes = geometry->head_bytes;
+    geometry->runs.emplace_back(run);
+    geometry->unit_stride_bytes = geometry->head_bytes;
     return true;
   }
 
@@ -260,6 +285,272 @@ bool derive_head_geometry(const WorkerCacheLayoutManifest& manifest,
   geometry->head_begin = head_begin;
   geometry->local_head_count = local_heads;
   geometry->whole_resource = false;
+  geometry->runs.clear();
+  HeadRunGeometry run;
+  run.head_bytes = head_bytes;
+  geometry->runs.emplace_back(run);
+  geometry->unit_stride_bytes = static_cast<uint64_t>(local_heads) * head_bytes;
+  return true;
+}
+
+// Reads a composite descriptor into one head run per packed component.
+//
+// The canonical route carries one head interval per edge, so every component of
+// the descriptor has to expose the *same* interval: the same first global head,
+// the same number of local heads, and the same width of one head. Qwen3.5-0.8B
+// satisfies that -- its conv row packs 16 key-a, 16 key-b and 16 value heads --
+// while a model whose packed components disagreed would need one interval per
+// component, which the route does not have. Such a descriptor is refused rather
+// than approximated, which is what the previous version of this function did
+// for every composite.
+//
+// The repeat dimension of a composite descriptor is *inside* one resource: its
+// spans already describe the state rows of one slot. The binder has a separate
+// sub-unit loop for the families that flatten their states into rows (SSM), so
+// a composite resource must hold exactly one sub-unit; anything else would
+// apply the same repeat twice.
+bool derive_composite_head_geometry(const WorkerCacheLayoutManifest& manifest,
+                                    const CacheTensorManifest& tensor,
+                                    const CacheTensorDeclaration& declaration,
+                                    const KvRedundancy& redundancy,
+                                    uint64_t units,
+                                    HeadGeometry* geometry,
+                                    std::string* error) {
+  const std::string id = tensor_id(tensor);
+  const std::vector<LogicalSpan>& spans = tensor.shard.spans;
+  if (units != 1) {
+    set_error(error,
+              id +
+                  ": a composite descriptor describes the state inside one "
+                  "cache resource, so its resource holds " +
+                  std::to_string(units) +
+                  " sub-units; publish one span per sub-unit instead");
+    return false;
+  }
+
+  const int32_t local_heads = redundancy.local_head_count();
+  const int32_t tp_redundancy = redundancy.tp_redundancy();
+  if (declaration.group.global_head_count <= 0) {
+    set_error(error,
+              id + ": the group declares no head count, so a packed component "
+                   "has no global head range to sit in");
+    return false;
+  }
+  if (local_heads <= 0) {
+    set_error(error,
+              id + ": the group declares no local head for this rank, so a "
+                   "packed component has no head axis to route");
+    return false;
+  }
+
+  // Group the spans by the logical tensor they name, in order of first
+  // appearance: the descriptor's component order is the physical packing order.
+  std::vector<std::string> names;
+  std::vector<std::vector<size_t>> groups;
+  for (size_t index = 0; index < spans.size(); ++index) {
+    const std::string& name = spans[index].logical_tensor;
+    auto it = std::find(names.begin(), names.end(), name);
+    if (it == names.end()) {
+      names.emplace_back(name);
+      groups.emplace_back();
+      groups.back().emplace_back(index);
+      continue;
+    }
+    groups[static_cast<size_t>(it - names.begin())].emplace_back(index);
+  }
+  if (names.size() < 2) {
+    set_error(error,
+              id +
+                  ": a composite descriptor must pack at least two logical "
+                  "tensors, but it names " +
+                  std::to_string(names.size()));
+    return false;
+  }
+
+  int32_t head_begin = -1;
+  uint64_t head_bytes = 0;
+  std::vector<HeadRunGeometry> runs;
+  runs.reserve(groups.size());
+  uint64_t covered_bytes = 0;
+  // The components all address the same cache rows, so they have to agree on
+  // how a row repeats; and they tile one row, so the check after the loop needs
+  // their physical bases in order.
+  uint64_t component_repeat = 0;
+  uint64_t component_stride = 0;
+  std::vector<std::pair<uint64_t, std::string>> component_bases;
+  component_bases.reserve(groups.size());
+  for (size_t group = 0; group < groups.size(); ++group) {
+    const std::vector<size_t>& members = groups[group];
+    if (members.size() != static_cast<size_t>(local_heads)) {
+      set_error(error,
+                id + ": component " + names[group] + " packs " +
+                    std::to_string(members.size()) +
+                    " local heads where the group's head class holds " +
+                    std::to_string(local_heads) +
+                    "; the route carries one head interval per edge, so every "
+                    "packed component has to expose the same heads");
+      return false;
+    }
+    std::vector<size_t> order = members;
+    std::sort(order.begin(), order.end(), [&spans](size_t lhs, size_t rhs) {
+      return spans[lhs].logical_offset_bytes < spans[rhs].logical_offset_bytes;
+    });
+
+    const LogicalSpan& first = spans[order.front()];
+    if (first.bytes_per_region == 0) {
+      set_error(error,
+                id + ": component " + names[group] + " has an empty span");
+      return false;
+    }
+    const int64_t base_bytes = static_cast<int64_t>(first.logical_offset_bytes);
+    if (base_bytes % static_cast<int64_t>(first.bytes_per_region) != 0) {
+      set_error(error,
+                id + ": the first logical span of component " + names[group] +
+                    " does not start on a head boundary");
+      return false;
+    }
+    const int32_t component_head_begin = static_cast<int32_t>(
+        base_bytes / static_cast<int64_t>(first.bytes_per_region));
+    if (component_head_begin % local_heads != 0) {
+      set_error(error,
+                id + ": component " + names[group] + " starts at global head " +
+                    std::to_string(component_head_begin) +
+                    ", which is not the start of a " +
+                    std::to_string(local_heads) + "-head class");
+      return false;
+    }
+    if (head_begin < 0) {
+      head_begin = component_head_begin;
+      head_bytes = first.bytes_per_region;
+    } else if (component_head_begin != head_begin ||
+               first.bytes_per_region != head_bytes) {
+      set_error(error,
+                id + ": component " + names[group] +
+                    " holds another global head range than component " +
+                    names.front() +
+                    "; the route carries one head interval per edge, so every "
+                    "packed component has to expose the same heads");
+      return false;
+    }
+    if (first.repeat_count == 0) {
+      set_error(error, id + ": component " + names[group] + " repeats no run");
+      return false;
+    }
+    const uint64_t group_repeat = first.repeat_count;
+    const uint64_t group_stride = first.physical_stride_bytes;
+    if (runs.empty()) {
+      component_repeat = group_repeat;
+      component_stride = group_stride;
+    } else if (group_repeat != component_repeat ||
+               group_stride != component_stride) {
+      set_error(error,
+                id + ": component " + names[group] +
+                    " repeats with another stride than component " +
+                    names.front() +
+                    "; the packed components address the same cache rows, so "
+                    "one row stride describes all of them");
+      return false;
+    }
+
+    const int32_t head_class = head_begin / local_heads;
+    if (head_class >= redundancy.head_class_count()) {
+      set_error(error,
+                id + ": the descriptor claims head class " +
+                    std::to_string(head_class) + " of " +
+                    std::to_string(redundancy.head_class_count()));
+      return false;
+    }
+    if (tensor.cache_namespace == CacheNamespace::MAIN &&
+        head_class != manifest.coordinates.tp_rank / tp_redundancy) {
+      set_error(
+          error,
+          id + ": the descriptor holds head class " +
+              std::to_string(head_class) + " but tp rank " +
+              std::to_string(manifest.coordinates.tp_rank) + " owns class " +
+              std::to_string(manifest.coordinates.tp_rank / tp_redundancy));
+      return false;
+    }
+    const int32_t owner_tp_rank = head_class * tp_redundancy;
+
+    const uint64_t physical_base = first.physical_offset_bytes;
+    for (size_t position = 0; position < order.size(); ++position) {
+      const LogicalSpan& span = spans[order[position]];
+      if (span.repeat_count != group_repeat ||
+          span.physical_stride_bytes != group_stride) {
+        set_error(error,
+                  id + ": the spans of component " + names[group] +
+                      " disagree on how the run repeats");
+        return false;
+      }
+      if (span.logical_offset_bytes !=
+          (static_cast<uint64_t>(head_begin) + position) * head_bytes) {
+        set_error(error,
+                  id + ": span " + std::to_string(position) + " of component " +
+                      names[group] + " is not the next global head");
+        return false;
+      }
+      if (span.physical_offset_bytes != physical_base + position * head_bytes) {
+        set_error(error,
+                  id + ": span " + std::to_string(position) + " of component " +
+                      names[group] +
+                      " is not the next local head inside the cache resource");
+        return false;
+      }
+      if (span.owner_tp_rank != owner_tp_rank) {
+        set_error(error,
+                  id + ": span " + std::to_string(position) + " of component " +
+                      names[group] + " names owner tp rank " +
+                      std::to_string(span.owner_tp_rank) + " but head class " +
+                      std::to_string(head_class) + " is written by tp rank " +
+                      std::to_string(owner_tp_rank));
+        return false;
+      }
+      covered_bytes += group_repeat * head_bytes;
+    }
+
+    HeadRunGeometry run;
+    run.physical_offset_bytes = physical_base;
+    run.head_bytes = head_bytes;
+    run.repeat_count = group_repeat;
+    run.physical_stride_bytes = group_stride;
+    runs.emplace_back(run);
+    component_bases.emplace_back(physical_base, names[group]);
+  }
+
+  // The components tile one cache row: the first starts at the row's first byte
+  // and each next one follows without a gap. The coverage check below proves
+  // the component sizes add up to the resource; this one proves they add up
+  // *where* the descriptor says they do, so a descriptor whose components
+  // overlap would be refused instead of bound twice over the same bytes.
+  std::sort(component_bases.begin(), component_bases.end());
+  uint64_t expected_base = 0;
+  for (const std::pair<uint64_t, std::string>& component : component_bases) {
+    if (component.first != expected_base) {
+      set_error(error,
+                id + ": component " + component.second + " starts at byte " +
+                    std::to_string(component.first) + " where " +
+                    std::to_string(expected_base) +
+                    " is the first byte the components before it leave free");
+      return false;
+    }
+    expected_base += static_cast<uint64_t>(local_heads) * head_bytes;
+  }
+
+  if (covered_bytes != tensor.resource_stride_bytes) {
+    set_error(error,
+              id + ": the packed components cover " +
+                  std::to_string(covered_bytes) +
+                  " bytes of a cache resource that holds " +
+                  std::to_string(tensor.resource_stride_bytes));
+    return false;
+  }
+
+  geometry->head_bytes = head_bytes;
+  geometry->head_begin = head_begin;
+  geometry->local_head_count = local_heads;
+  geometry->whole_resource = false;
+  geometry->runs = std::move(runs);
+  geometry->unit_stride_bytes = tensor.resource_stride_bytes;
   return true;
 }
 
@@ -295,16 +586,6 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
   const LogicalShardDescriptor& descriptor = tensor.shard;
   if (descriptor.spans.empty()) {
     set_error(error, id + ": the descriptor has no logical span");
-    return false;
-  }
-  if (descriptor.kind == LogicalShardKind::COMPOSITE) {
-    set_error(error,
-              id +
-                  ": a composite descriptor interleaves several logical "
-                  "tensors in one physical row, and the canonical route "
-                  "carries one head interval per edge; keep such groups on the "
-                  "legacy planner or extend the edge with per-component byte "
-                  "offsets");
     return false;
   }
 
@@ -384,8 +665,28 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
   }
 
   HeadGeometry geometry;
-  if (!derive_head_geometry(
-          manifest, tensor, declaration, redundancy, units, &geometry, error)) {
+  // A composite descriptor packs several logical tensors into one physical row
+  // (the Qwen3.5 conv state is `[key_a | key_b | value]`), so it is described
+  // by one head run per component instead of by a single head axis. The
+  // single-tensor path below would read its first span and mis-place every
+  // other component.
+  if (descriptor.kind == LogicalShardKind::COMPOSITE) {
+    if (!derive_composite_head_geometry(manifest,
+                                        tensor,
+                                        declaration,
+                                        redundancy,
+                                        units,
+                                        &geometry,
+                                        error)) {
+      return false;
+    }
+  } else if (!derive_head_geometry(manifest,
+                                   tensor,
+                                   declaration,
+                                   redundancy,
+                                   units,
+                                   &geometry,
+                                   error)) {
     return false;
   }
 
@@ -396,6 +697,21 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
                   std::to_string(declaration.group.head_bytes) +
                   " bytes per head but the descriptor holds " +
                   std::to_string(geometry.head_bytes));
+    return false;
+  }
+
+  // The binder addresses a sub-unit as `unit * unit_stride_bytes`, so the head
+  // runs have to account for exactly one sub-unit of the resource. A descriptor
+  // whose runs covered more or less would address the next sub-unit's bytes.
+  if (geometry.unit_stride_bytes == 0 ||
+      multiply_overflows(geometry.unit_stride_bytes, units) ||
+      geometry.unit_stride_bytes * units != tensor.resource_stride_bytes) {
+    set_error(error,
+              id + ": the descriptor's head runs cover " +
+                  std::to_string(geometry.unit_stride_bytes) +
+                  " bytes per sub-unit but one cache resource of " +
+                  std::to_string(tensor.resource_stride_bytes) +
+                  " bytes holds " + std::to_string(units) + " of them");
     return false;
   }
 
@@ -443,6 +759,17 @@ bool describe_tensor(const WorkerCacheLayoutManifest& manifest,
   view->entry.buffer_bytes = tensor.buffer_bytes;
   view->entry.units_per_resource = units;
   view->entry.explicit_offsets = tensor.explicit_resource_offsets;
+  view->head_runs.clear();
+  view->head_runs.reserve(geometry.runs.size());
+  for (const HeadRunGeometry& run : geometry.runs) {
+    HeadRun packed;
+    packed.physical_offset_bytes = run.physical_offset_bytes;
+    packed.head_bytes = run.head_bytes;
+    packed.repeat_count = run.repeat_count;
+    packed.physical_stride_bytes = run.physical_stride_bytes;
+    view->head_runs.emplace_back(packed);
+  }
+  view->unit_stride_bytes = geometry.unit_stride_bytes;
   if (row_bases != nullptr) {
     view->row_offsets = row_bases->row_offsets;
   } else {
@@ -504,9 +831,12 @@ bool declare_cache_group(const CacheTensorLayoutContext& context,
 
   if (role == KVCacheTensorRole::CONV && context.linear_key_head_count > 0 &&
       context.linear_value_head_count > 0) {
-    // Without MLA this role publishes a composite descriptor, which the
-    // canonical route refuses on purpose (see describe_tensor). Declaring the
-    // geometry anyway keeps that refusal in one place.
+    // Without MLA this role publishes a composite descriptor, whose packed
+    // components the route reads as one head run each (see
+    // derive_composite_head_geometry). The head class is the value heads':
+    // every component has to expose that same interval for the route to carry
+    // it, which is why a model whose key and value head counts differ is
+    // refused there rather than routed by halves.
     group->global_head_count =
         static_cast<int32_t>(context.linear_value_head_count);
     group->sequence_scoped = true;

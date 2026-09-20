@@ -79,6 +79,26 @@ class BufferDirectory final {
   std::vector<BufferDirectoryEntry> entries_;
 };
 
+// One contiguous run of local heads inside one sub-unit of a cache resource.
+//
+// A plain family publishes exactly one run: its local heads are contiguous, so
+// the run starts at the sub-unit's first byte and holds every head. A composite
+// descriptor (the Qwen3.5 conv row, which packs `[conv_key_a | conv_key_b |
+// conv_value]`) publishes one run per packed component instead, because a head
+// range there is several byte ranges rather than one.
+//
+// `repeat_count`/`physical_stride_bytes` describe a run that appears more than
+// once inside the same sub-unit -- the conv state rows of one slot are the
+// canonical case. A plain family leaves the repeat at one and lets the binder's
+// sub-unit loop cover the block's tokens instead, so the two dimensions are
+// never both applied to the same bytes.
+struct HeadRun {
+  uint64_t physical_offset_bytes = 0;
+  uint64_t head_bytes = 0;
+  uint64_t repeat_count = 1;
+  uint64_t physical_stride_bytes = 0;
+};
+
 // Everything binding needs to know about one peer's view of one cache tensor:
 // its instance topology, this group's geometry, and the physical buffer.
 struct PeerCacheView {
@@ -93,6 +113,13 @@ struct PeerCacheView {
   // Page bases indexed by physical row; used only when entry.explicit_offsets
   // is set, and therefore empty otherwise.
   std::vector<uint64_t> row_offsets;
+  // Physical head layout this rank published, in the order the route moves it.
+  // Never empty for an accepted view.
+  std::vector<HeadRun> head_runs;
+  // Bytes one sub-unit of this rank's resource occupies. Derived from the
+  // descriptor, not from the head runs, because the sub-unit loop strides over
+  // it: `resource_stride_bytes / units_per_resource`.
+  uint64_t unit_stride_bytes = 0;
 };
 
 // Turns canonical blocks into byte ranges.

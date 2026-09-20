@@ -33,6 +33,18 @@ struct RankGeometry {
   int32_t local_head_count = 0;
 };
 
+// One head run of one edge, with both peers' offsets already resolved. Every
+// value is peer-independent once computed, so the block loop only adds the row
+// bases.
+struct RunSlice {
+  uint64_t local_offset = 0;
+  uint64_t remote_offset = 0;
+  uint64_t length = 0;
+  uint64_t repeat = 1;
+  uint64_t local_stride = 0;
+  uint64_t remote_stride = 0;
+};
+
 void set_error(std::string* error, const std::string& message) {
   if (error != nullptr) {
     *error = message;
@@ -244,6 +256,40 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
               "(canonical block size)");
     return false;
   }
+  // The head layout has to be compared run by run: two peers of different TP
+  // widths hold a different number of heads, but they must agree on how many
+  // runs a row holds and on the width of one head inside each of them, or a
+  // head range would name bytes of a different tensor.
+  if (local.head_runs.empty() || remote.head_runs.empty()) {
+    set_error(error, "a cache view published no physical head run");
+    return false;
+  }
+  if (local.head_runs.size() != remote.head_runs.size()) {
+    set_error(
+        error,
+        "peers disagree on the number of head runs in one cache resource");
+    return false;
+  }
+  for (size_t run = 0; run < local.head_runs.size(); ++run) {
+    if (local.head_runs[run].head_bytes != remote.head_runs[run].head_bytes ||
+        local.head_runs[run].head_bytes == 0) {
+      set_error(error,
+                "peers disagree on the size of the heads of run " +
+                    std::to_string(run));
+      return false;
+    }
+    if (local.head_runs[run].repeat_count !=
+        remote.head_runs[run].repeat_count) {
+      set_error(error,
+                "peers disagree on how often run " + std::to_string(run) +
+                    " repeats inside one cache resource");
+      return false;
+    }
+  }
+  if (local.unit_stride_bytes == 0 || remote.unit_stride_bytes == 0) {
+    set_error(error, "a cache view published no sub-unit stride");
+    return false;
+  }
 
   KvRedundancy local_redundancy;
   KvRedundancy remote_redundancy;
@@ -265,7 +311,6 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
   const int32_t local_split = local_redundancy.split();
   const int32_t remote_split = remote_redundancy.split();
   const uint64_t units = local.entry.units_per_resource;
-  const uint64_t head_bytes = local.group.head_bytes;
 
   if (dst_local_rank < 0 ||
       dst_local_rank >= static_cast<int32_t>(remote_ranks.size())) {
@@ -376,17 +421,35 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
 
     const uint64_t head_count =
         static_cast<uint64_t>(edge.head_end - edge.head_begin);
-    if (multiply_overflows(head_count, head_bytes)) {
-      set_error(error, "bound region length overflows");
-      return false;
+    // One slice per head run: the byte range of this edge's head interval
+    // inside that run, on both peers. A plain family has one run and the loop
+    // below is the same arithmetic it always was; a composite family has one
+    // run per packed component, which is the whole point of the run list.
+    std::vector<RunSlice> slices;
+    slices.reserve(local.head_runs.size());
+    for (size_t run = 0; run < local.head_runs.size(); ++run) {
+      const HeadRun& local_run = local.head_runs[run];
+      const HeadRun& remote_run = remote.head_runs[run];
+      if (multiply_overflows(head_count, local_run.head_bytes) ||
+          multiply_overflows(head_count, remote_run.head_bytes)) {
+        set_error(error, "bound region length overflows");
+        return false;
+      }
+      RunSlice slice;
+      slice.length = head_count * local_run.head_bytes;
+      slice.local_offset =
+          local_run.physical_offset_bytes +
+          static_cast<uint64_t>(edge.head_begin - local_rank.head_begin) *
+              local_run.head_bytes;
+      slice.remote_offset =
+          remote_run.physical_offset_bytes +
+          static_cast<uint64_t>(edge.head_begin - remote_rank.head_begin) *
+              remote_run.head_bytes;
+      slice.repeat = local_run.repeat_count;
+      slice.local_stride = local_run.physical_stride_bytes;
+      slice.remote_stride = remote_run.physical_stride_bytes;
+      slices.emplace_back(slice);
     }
-    const uint64_t length = head_count * head_bytes;
-    const uint64_t local_head_offset =
-        static_cast<uint64_t>(edge.head_begin - local_rank.head_begin) *
-        head_bytes;
-    const uint64_t remote_head_offset =
-        static_cast<uint64_t>(edge.head_begin - remote_rank.head_begin) *
-        head_bytes;
 
     const std::vector<size_t>& bucket =
         buckets[static_cast<size_t>(edge.src_slice)];
@@ -436,41 +499,55 @@ bool RouteBinder::bind(const std::vector<RouteEdge>& edges,
         return false;
       }
 
-      const uint64_t local_unit_stride =
-          static_cast<uint64_t>(local_rank.local_head_count) * head_bytes;
-      const uint64_t remote_unit_stride =
-          static_cast<uint64_t>(remote_rank.local_head_count) * head_bytes;
       for (uint64_t unit = 0; unit < units; ++unit) {
-        if (multiply_overflows(unit, local_unit_stride) ||
-            multiply_overflows(unit, remote_unit_stride)) {
+        if (multiply_overflows(unit, local.unit_stride_bytes) ||
+            multiply_overflows(unit, remote.unit_stride_bytes)) {
           set_error(error, "sub-unit offset overflows");
           return false;
         }
-        RouteRegion region;
-        region.local_buffer_id = local.entry.buffer_id;
-        region.remote_buffer_id = remote.entry.buffer_id;
-        region.length = length;
-        if (add_overflows(local_base, local_head_offset) ||
-            add_overflows(local_base + local_head_offset,
-                          unit * local_unit_stride) ||
-            add_overflows(remote_base, remote_head_offset) ||
-            add_overflows(remote_base + remote_head_offset,
-                          unit * remote_unit_stride)) {
-          set_error(error, "bound region offset overflows");
-          return false;
+        const uint64_t local_unit_offset = unit * local.unit_stride_bytes;
+        const uint64_t remote_unit_offset = unit * remote.unit_stride_bytes;
+        for (const RunSlice& slice : slices) {
+          for (uint64_t repeat = 0; repeat < slice.repeat; ++repeat) {
+            if (multiply_overflows(repeat, slice.local_stride) ||
+                multiply_overflows(repeat, slice.remote_stride) ||
+                add_overflows(local_base, slice.local_offset) ||
+                add_overflows(local_base + slice.local_offset,
+                              local_unit_offset) ||
+                add_overflows(
+                    local_base + slice.local_offset + local_unit_offset,
+                    repeat * slice.local_stride) ||
+                add_overflows(remote_base, slice.remote_offset) ||
+                add_overflows(remote_base + slice.remote_offset,
+                              remote_unit_offset) ||
+                add_overflows(
+                    remote_base + slice.remote_offset + remote_unit_offset,
+                    repeat * slice.remote_stride)) {
+              set_error(error, "bound region offset overflows");
+              return false;
+            }
+            RouteRegion region;
+            region.local_buffer_id = local.entry.buffer_id;
+            region.remote_buffer_id = remote.entry.buffer_id;
+            region.length = slice.length;
+            region.local_offset = local_base + slice.local_offset +
+                                  local_unit_offset +
+                                  repeat * slice.local_stride;
+            region.remote_offset = remote_base + slice.remote_offset +
+                                   remote_unit_offset +
+                                   repeat * slice.remote_stride;
+            if (region.local_offset > local.entry.buffer_bytes ||
+                region.length >
+                    local.entry.buffer_bytes - region.local_offset ||
+                region.remote_offset > remote.entry.buffer_bytes ||
+                region.length >
+                    remote.entry.buffer_bytes - region.remote_offset) {
+              set_error(error, "bound region exceeds its cache buffer");
+              return false;
+            }
+            regions->emplace_back(region);
+          }
         }
-        region.local_offset =
-            local_base + local_head_offset + unit * local_unit_stride;
-        region.remote_offset =
-            remote_base + remote_head_offset + unit * remote_unit_stride;
-        if (region.local_offset > local.entry.buffer_bytes ||
-            region.length > local.entry.buffer_bytes - region.local_offset ||
-            region.remote_offset > remote.entry.buffer_bytes ||
-            region.length > remote.entry.buffer_bytes - region.remote_offset) {
-          set_error(error, "bound region exceeds its cache buffer");
-          return false;
-        }
-        regions->emplace_back(region);
       }
 
       matched[block_index] = 1;

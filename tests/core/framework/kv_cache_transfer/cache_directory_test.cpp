@@ -206,6 +206,114 @@ WorkerCacheLayoutManifest make_replicated_manifest(
   return manifest;
 }
 
+// Mirrors append_conv_component: one span per local head of one packed
+// component, every component sitting in the same head class of its own global
+// head count. Returns the bytes the component occupies, so the next component
+// starts where this one ends.
+uint64_t append_conv_component(LogicalShardDescriptor* descriptor,
+                               const std::string& logical_tensor,
+                               int32_t first_global_head,
+                               int32_t local_head_count,
+                               int32_t global_head_count,
+                               uint64_t component_offset_bytes,
+                               uint64_t state_count,
+                               uint64_t head_bytes,
+                               uint64_t physical_state_stride,
+                               int32_t owner_tp_rank) {
+  for (int32_t local_head = 0; local_head < local_head_count; ++local_head) {
+    const int32_t global_head = first_global_head + local_head;
+    descriptor->spans.emplace_back(make_span(
+        logical_tensor,
+        static_cast<uint64_t>(global_head) * head_bytes,
+        component_offset_bytes + static_cast<uint64_t>(local_head) * head_bytes,
+        head_bytes,
+        state_count,
+        static_cast<uint64_t>(global_head_count) * head_bytes,
+        physical_state_stride,
+        owner_tp_rank));
+  }
+  return static_cast<uint64_t>(local_head_count) * head_bytes;
+}
+
+// Mirrors describe_conv: the conv state row packs
+// `[conv_key_a | conv_key_b | conv_value]` into one physical row of the linear
+// group, one span per local head of each component. `slots` is the number of
+// sequence slots the pool holds and `state_count` the conv kernel minus one.
+WorkerCacheLayoutManifest make_conv_manifest(int32_t tp_rank,
+                                             int32_t tp_size,
+                                             int64_t global_key_heads,
+                                             int64_t global_value_heads,
+                                             int64_t slots,
+                                             int64_t state_count) {
+  const int64_t local_key_heads =
+      global_key_heads >= tp_size ? global_key_heads / tp_size : 1;
+  const int64_t local_value_heads =
+      global_value_heads >= tp_size ? global_value_heads / tp_size : 1;
+  const int64_t first_key_head = tp_rank * local_key_heads;
+  const int64_t first_value_head = tp_rank * local_value_heads;
+  const uint64_t head_bytes = static_cast<uint64_t>(kHeadDim) * kElementBytes;
+  const int64_t features = kHeadDim * (local_key_heads * 2 + local_value_heads);
+  const uint64_t physical_state_stride =
+      static_cast<uint64_t>(features) * kElementBytes;
+
+  WorkerCacheLayoutManifest manifest;
+  set_coordinates(&manifest,
+                  tp_rank,
+                  tp_size,
+                  /*cp_rank=*/0,
+                  /*cp_size=*/1,
+                  /*kv_split_size=*/1);
+  CacheTensorManifest tensor;
+  tensor.role = kConvRole;
+  tensor.group_id = kLinearGroup;
+  tensor.layer_id = 0;
+  tensor.mooncake_buffer_id = 12;
+  tensor.block_token_capacity = 128;
+  set_geometry(&tensor,
+               {slots, state_count, features},
+               kElementBytes,
+               /*rows_per_resource=*/1);
+
+  LogicalShardDescriptor descriptor;
+  descriptor.kind = LogicalShardKind::COMPOSITE;
+  descriptor.resource_scope = CacheResourceScope::SEQUENCE;
+  uint64_t component_offset =
+      append_conv_component(&descriptor,
+                            "conv_key_a",
+                            static_cast<int32_t>(first_key_head),
+                            static_cast<int32_t>(local_key_heads),
+                            static_cast<int32_t>(global_key_heads),
+                            /*component_offset_bytes=*/0,
+                            static_cast<uint64_t>(state_count),
+                            head_bytes,
+                            physical_state_stride,
+                            tp_rank);
+  component_offset +=
+      append_conv_component(&descriptor,
+                            "conv_key_b",
+                            static_cast<int32_t>(first_key_head),
+                            static_cast<int32_t>(local_key_heads),
+                            static_cast<int32_t>(global_key_heads),
+                            component_offset,
+                            static_cast<uint64_t>(state_count),
+                            head_bytes,
+                            physical_state_stride,
+                            tp_rank);
+  append_conv_component(&descriptor,
+                        "conv_value",
+                        static_cast<int32_t>(first_value_head),
+                        static_cast<int32_t>(local_value_heads),
+                        static_cast<int32_t>(global_value_heads),
+                        component_offset,
+                        static_cast<uint64_t>(state_count),
+                        head_bytes,
+                        physical_state_stride,
+                        tp_rank);
+  tensor.shard = std::move(descriptor);
+  manifest.tensors.emplace_back(std::move(tensor));
+  return manifest;
+}
+
 CacheTensorDeclaration make_declaration(int32_t role,
                                         int32_t group_id,
                                         int32_t cp_size,
@@ -496,51 +604,218 @@ TEST(PeerDirectoryTest, DescribesPageMappedRowsThroughExplicitBases) {
   EXPECT_EQ(view->entry.buffer_bytes, 1U << 20);
 }
 
-TEST(PeerDirectoryTest, RejectsCompositeCacheGroups) {
-  // describe_conv packs conv_key_a, conv_key_b and conv_value into one row, and
-  // the canonical route carries one head interval per edge.
-  WorkerCacheLayoutManifest manifest;
-  set_coordinates(&manifest,
-                  /*tp_rank=*/1,
-                  /*tp_size=*/2,
-                  /*cp_rank=*/0,
-                  /*cp_size=*/1,
-                  /*kv_split_size=*/4);
-  CacheTensorManifest tensor;
-  tensor.role = kConvRole;
-  tensor.group_id = kLinearGroup;
-  tensor.mooncake_buffer_id = 12;
-  tensor.block_token_capacity = 128;
-  set_geometry(&tensor,
-               /*shape=*/{2, 5, 15},
-               kElementBytes,
-               /*rows_per_resource=*/1);
-  LogicalShardDescriptor descriptor;
-  descriptor.kind = LogicalShardKind::COMPOSITE;
-  descriptor.resource_scope = CacheResourceScope::SEQUENCE;
-  descriptor.spans.emplace_back(make_span("conv_key_a", 0, 0, 6, 5, 24, 30, 1));
-  descriptor.spans.emplace_back(make_span("conv_key_b", 0, 6, 6, 5, 24, 30, 1));
-  descriptor.spans.emplace_back(
-      make_span("conv_value", 0, 12, 6, 5, 12, 30, 1));
-  tensor.shard = std::move(descriptor);
-  manifest.tensors.emplace_back(std::move(tensor));
+// Rewrites one packed component of a conv descriptor onto another global head
+// range, which is what a model that packs components from different head
+// classes would publish. `component_index` counts the equal-sized components of
+// `make_conv_manifest`, in its packing order.
+void retarget_conv_component(CacheTensorManifest* tensor,
+                             size_t component_index,
+                             int32_t local_heads,
+                             int32_t first_global_head,
+                             uint64_t head_bytes) {
+  const size_t begin = component_index * static_cast<size_t>(local_heads);
+  for (size_t offset = 0; offset < static_cast<size_t>(local_heads); ++offset) {
+    LogicalSpan& span = tensor->shard.spans[begin + offset];
+    span.logical_offset_bytes =
+        (static_cast<uint64_t>(first_global_head) + offset) * head_bytes;
+    // The owner of a head class is its first rank, one per replica.
+    span.owner_tp_rank = first_global_head / local_heads;
+  }
+}
 
+// The conv state row of a Qwen3.5 linear layer packs three logical tensors into
+// one physical row, `[conv_key_a | conv_key_b | conv_value]`. The canonical
+// route carries one head interval per edge, so the directory has to read the
+// packed row as one byte run per component instead of refusing it. The runs are
+// asserted by offset, because a run list in the wrong order would move every
+// component's bytes into another component's slot.
+TEST(PeerDirectoryTest, DescribesEveryHeadRunOfACompositeConvRow) {
+  // tp 1 of 2 holds global heads 2..3 of four; the row packs two key-a, two
+  // key-b and two value heads of eight features each, so one head is 16 bytes.
+  const WorkerCacheLayoutManifest manifest = make_conv_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/2,
+      /*global_key_heads=*/4,
+      /*global_value_heads=*/4,
+      /*slots=*/2,
+      /*state_count=*/3);
   const std::vector<CacheTensorDeclaration> declarations = {
       make_declaration(kConvRole,
                        kLinearGroup,
                        /*cp_size=*/1,
                        /*tp_size=*/2,
-                       /*kv_split_size=*/4,
+                       /*kv_split_size=*/1,
                        /*tokens_per_block=*/128,
-                       /*global_head_count=*/6,
-                       /*head_bytes=*/6,
+                       /*global_head_count=*/4,
+                       /*head_bytes=*/16,
+                       /*sequence_scoped=*/true,
+                       /*full_sequence_replica=*/false)};
+  PeerDirectory directory;
+  std::string error;
+
+  ASSERT_TRUE(describe(manifest, declarations, &directory, &error)) << error;
+  const PeerCacheView* view =
+      directory.find(CacheNamespace::MAIN, 0, kConvRole, kLinearGroup);
+  ASSERT_NE(view, nullptr);
+  EXPECT_EQ(view->entry.resource_count, 2U);
+  EXPECT_EQ(view->entry.resource_stride_bytes, 288U);
+  // The state rows of one slot live inside the cache resource, so the binder
+  // must not apply a sub-unit stride on top of the runs' own repeat.
+  EXPECT_EQ(view->entry.units_per_resource, 1U);
+  EXPECT_EQ(view->group.head_bytes, 16U);
+  EXPECT_EQ(view->group.global_head_count, 4);
+  ASSERT_EQ(view->head_runs.size(), 3U);
+  // key-b starts 32 bytes into the row and value 64, each holding two 16-byte
+  // heads over three state rows 96 bytes apart.
+  EXPECT_EQ(view->head_runs[0].physical_offset_bytes, 0U);
+  EXPECT_EQ(view->head_runs[1].physical_offset_bytes, 32U);
+  EXPECT_EQ(view->head_runs[2].physical_offset_bytes, 64U);
+  for (const HeadRun& run : view->head_runs) {
+    EXPECT_EQ(run.head_bytes, 16U);
+    EXPECT_EQ(run.repeat_count, 3U);
+    EXPECT_EQ(run.physical_stride_bytes, 96U);
+  }
+  EXPECT_EQ(view->unit_stride_bytes, 288U);
+}
+
+// The route carries one head interval per edge, so a model whose packed
+// components expose different head counts cannot be served by it. Refusing is
+// the point: half a head interval is not one, and reading only the first
+// component would move bytes of another tensor.
+TEST(PeerDirectoryTest, RejectsCompositeComponentsOfDifferentWidths) {
+  // Eight key heads and four value heads: at tp 2 the key components hold four
+  // local heads where the group's head class holds two.
+  const WorkerCacheLayoutManifest manifest = make_conv_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/2,
+      /*global_key_heads=*/8,
+      /*global_value_heads=*/4,
+      /*slots=*/2,
+      /*state_count=*/3);
+  const std::vector<CacheTensorDeclaration> declarations = {
+      make_declaration(kConvRole,
+                       kLinearGroup,
+                       /*cp_size=*/1,
+                       /*tp_size=*/2,
+                       /*kv_split_size=*/1,
+                       /*tokens_per_block=*/128,
+                       /*global_head_count=*/4,
+                       /*head_bytes=*/16,
                        /*sequence_scoped=*/true,
                        /*full_sequence_replica=*/false)};
   PeerDirectory directory;
   std::string error;
 
   EXPECT_FALSE(describe(manifest, declarations, &directory, &error));
-  EXPECT_NE(error.find("composite"), std::string::npos) << error;
+  EXPECT_NE(error.find("has to expose the same heads"), std::string::npos)
+      << error;
+  EXPECT_EQ(directory.size(), 0U);
+}
+
+// A component in another head class than the rest would be moved to heads of
+// another rank, so the descriptor is refused rather than half-routed.
+TEST(PeerDirectoryTest, RejectsCompositeComponentsOfDifferentHeadClasses) {
+  WorkerCacheLayoutManifest manifest = make_conv_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/2,
+      /*global_key_heads=*/4,
+      /*global_value_heads=*/4,
+      /*slots=*/2,
+      /*state_count=*/3);
+  // The value component now claims head class 0, which rank 0 owns.
+  retarget_conv_component(&manifest.tensors[0],
+                          /*component_index=*/2,
+                          /*local_heads=*/2,
+                          /*first_global_head=*/0,
+                          /*head_bytes=*/16);
+  const std::vector<CacheTensorDeclaration> declarations = {
+      make_declaration(kConvRole,
+                       kLinearGroup,
+                       /*cp_size=*/1,
+                       /*tp_size=*/2,
+                       /*kv_split_size=*/1,
+                       /*tokens_per_block=*/128,
+                       /*global_head_count=*/4,
+                       /*head_bytes=*/16,
+                       /*sequence_scoped=*/true,
+                       /*full_sequence_replica=*/false)};
+  PeerDirectory directory;
+  std::string error;
+
+  EXPECT_FALSE(describe(manifest, declarations, &directory, &error));
+  EXPECT_NE(error.find("another global head range"), std::string::npos)
+      << error;
+  EXPECT_EQ(directory.size(), 0U);
+}
+
+// Every packed component of a conv row addresses the same cache rows, so one
+// row stride describes all of them. A component that repeats with its own
+// stride would be read out of another component's rows.
+TEST(PeerDirectoryTest, RejectsCompositeComponentsThatRepeatDifferently) {
+  WorkerCacheLayoutManifest manifest = make_conv_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/2,
+      /*global_key_heads=*/4,
+      /*global_value_heads=*/4,
+      /*slots=*/2,
+      /*state_count=*/3);
+  // The value component alone keeps its own stride across the state rows.
+  for (size_t offset = 4; offset < 6; ++offset) {
+    manifest.tensors[0].shard.spans[offset].physical_stride_bytes = 128;
+  }
+  const std::vector<CacheTensorDeclaration> declarations = {
+      make_declaration(kConvRole,
+                       kLinearGroup,
+                       /*cp_size=*/1,
+                       /*tp_size=*/2,
+                       /*kv_split_size=*/1,
+                       /*tokens_per_block=*/128,
+                       /*global_head_count=*/4,
+                       /*head_bytes=*/16,
+                       /*sequence_scoped=*/true,
+                       /*full_sequence_replica=*/false)};
+  PeerDirectory directory;
+  std::string error;
+
+  EXPECT_FALSE(describe(manifest, declarations, &directory, &error));
+  EXPECT_NE(error.find("another stride than component"), std::string::npos)
+      << error;
+  EXPECT_EQ(directory.size(), 0U);
+}
+
+// The components have to tile one cache row. A descriptor whose components all
+// start past the row's first byte still covers the same number of bytes in
+// total, so only a check on *where* they sit can refuse it -- and binding it
+// would move every component into its neighbour's bytes.
+TEST(PeerDirectoryTest, RejectsCompositeComponentsThatDoNotTileTheRow) {
+  WorkerCacheLayoutManifest manifest = make_conv_manifest(
+      /*tp_rank=*/1,
+      /*tp_size=*/2,
+      /*global_key_heads=*/4,
+      /*global_value_heads=*/4,
+      /*slots=*/2,
+      /*state_count=*/3);
+  // Every component moves 32 bytes along, leaving the row's first head empty
+  // and pushing the last component past the row.
+  for (LogicalSpan& span : manifest.tensors[0].shard.spans) {
+    span.physical_offset_bytes += 32;
+  }
+  const std::vector<CacheTensorDeclaration> declarations = {
+      make_declaration(kConvRole,
+                       kLinearGroup,
+                       /*cp_size=*/1,
+                       /*tp_size=*/2,
+                       /*kv_split_size=*/1,
+                       /*tokens_per_block=*/128,
+                       /*global_head_count=*/4,
+                       /*head_bytes=*/16,
+                       /*sequence_scoped=*/true,
+                       /*full_sequence_replica=*/false)};
+  PeerDirectory directory;
+  std::string error;
+
+  EXPECT_FALSE(describe(manifest, declarations, &directory, &error));
+  EXPECT_NE(error.find("starts at byte"), std::string::npos) << error;
   EXPECT_EQ(directory.size(), 0U);
 }
 
