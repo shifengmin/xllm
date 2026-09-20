@@ -351,16 +351,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     }
 
     const bool is_flat_kv = block_type.value() == BlockType::KV;
-    // Destination sequence-split width M for this group. Prefer the per-group
-    // value D placed on the wire; fall back to the instance kv-split width when
-    // it is unset (0) so any path predating the field keeps its behavior. In a
-    // homogeneous deployment M equals the instance width, so the stride below
-    // is unchanged. This is the single site that used to hard-code N==M.
-    const size_t remote_kv_split =
-        full_mapping.remote_kv_split > 0
-            ? static_cast<size_t>(full_mapping.remote_kv_split)
-            : static_cast<size_t>(kv_split_size);
-    const bool uses_kv_split = remote_kv_split > 1;
+    const bool uses_kv_split = is_kv_split_cache_block_type(block_type.value());
     const size_t next_transfer_idx =
         is_flat_kv ? sequence->kv_state().next_transfer_block_idx()
                    : sequence->kv_state().next_group_transfer_block_idx(
@@ -368,8 +359,9 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t win_end =
         static_cast<size_t>(util::ceil_div(seq_len, block_size));
     const size_t map_end = std::min(win_end, local_ids.size());
-    const size_t remote_stride =
-        uses_kv_split && !full_info.rank_local_mapping ? remote_kv_split : 1;
+    const size_t remote_stride = uses_kv_split && !full_info.rank_local_mapping
+                                     ? static_cast<size_t>(kv_split_size)
+                                     : 1;
     CHECK_GT(remote_stride, static_cast<size_t>(0));
     const size_t remote_shared_num =
         static_cast<size_t>(full_mapping.remote_shared_num);
