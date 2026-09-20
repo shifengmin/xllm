@@ -915,6 +915,10 @@ INDEX 因为 `split = 1` 全取，即它的全部 26052 行）。序列型组（
   （它是 `MooncakeKVCacheTransferDefault` 的成员，`MooncakeTransferEngine` 的方法是 virtual，理论上可派生 mock）；
 - 未覆盖的 T5 项：`MixedLayers`、`DpExpansion`、XTensor `explicit_offsets` 端到端；
 - `ContextParallelTopology` 的 DCP **组组成**判据（第 9 轮主动放弃）仍未钉死，与路由契约无关。
+  **第 39 轮更新**：对「有效 split == 实例配置的 kv_split」的族，`cache_directory.cpp:620-632` 会把
+  推导出的 `slice_of(cp,tp)` 与 worker 自己发布的 DCP rank（`coordinates.kv_split_rank`）对比，
+  不一致直接拒绝（`the split is not placed where the runtime places it`）。所以这个约定在**会被用到的形状上**
+  已有运行时哨兵；只有「有效 split 退化成 1」的族（全量池）跳过该检查——那种族没有可争辩的 slice。
 
 ## 5. 剩余工作清单（第 15 轮盘点，按"是否依赖实机"分组）
 
@@ -4142,3 +4146,50 @@ conv/ssm 它归到 `other/written=18/36 zero=0`——**行级比较器看不见 
   `b94b873`**（就是加 LSE nope 特化那次）里；83 上用于构建 GDN op 的树是**旧快照**，所以「补
   `cmake/`」只是补快照。要让 op 构建可复现，应改用当前 submodule commit 重做快照，而不是继续在旧树上打补丁。
 
+
+### (90) 索引器（「全量」族）与 kv split / CP 的兼容机制
+
+问题：prefill 开 CP 时索引器池子实际被切成片，而 decode 不开 CP 时它必须是全量——这两种形状怎么在
+同一条路由里共存？
+
+**核心：实现里没有「索引器特例」。** 它把问题拆成两个正交的问句——① 这个族**要求**全序列吗
+（模型声明 `full_sequence_replica`）；② 这个实例**真的做到了吗**（`cp_size <= 1`）——于是两侧对同一份
+声明算出**不同的有效 split** 和**不同的行公式**，路由只共享 canonical block。
+
+| 层次 | 代码位置 | 规则 |
+|---|---|---|
+| 声明 | `cache_layout_builder.cpp:404-411`；`cache_directory.cpp:814-822` | 索引器固定 1 个逻辑 head；组 = `{G=1, sequence_scoped=false, full_sequence_replica=true}` |
+| 推导（每族每侧） | `kv_redundancy.cpp:46-54`、`:87`、`:111` | `group_keeps_whole_sequence = full_sequence_replica && cp_size <= 1`；命中则 `split=1`，否则 `split=kv_split`（须整除 `D=cp*tp_redundancy`，否则拒绝） |
+| 行公式（每侧） | `route_binder.cpp:183-192` | sequence-scoped → `row=block`；全量族 → `row=block+该侧配置的 kv_split`；分片族 → `row=block/split+1` |
+| 边枚举 | `pd_route_table.cpp:185-232` | 每 (head, src_slice) 只取 **replica-0 writer**；`destination_slices` 算可达目标片（周期 `dst/gcd`）；对目标**每个副本 rank** 各出一条边 |
+| bind 兜底 | `route_binder.cpp:459-468` | `block % remote_split == edge.dst_slice`，不符即报错 |
+| 启动哨兵 | `cache_directory.cpp:620-632` | 「有效 split == 配置 kv_split」的族，`slice_of(cp,tp)` 必须等于 worker 发布的 DCP rank |
+| 真机判据 | owner check | 目标行 `c + S_dst` 逐字节等于「拥有 c 的源 rank 的 `c / S_src + 1` 行」 |
+
+`cp4kv2`（P `cp4/tp1/kv2` → D `cp1/tp2/kv2`）的具体数字：
+
+| | P | D |
+|---|---|---|
+| `group_keeps_whole_sequence` | false（cp=4） | **true**（cp=1） |
+| 有效 `split` / `replica_count` | 2 / 2 | 1 / 2 |
+| `sequence_groups = cp/split` | 2（`slice_of(cp)=cp/2`） | 1（两 rank 都是副本） |
+| writer | 片 0 = 本地 rank 0；片 1 = 本地 rank 2 | — |
+| 行公式 | `c/2 + 1`（逻辑块行，前留 1 行 padding） | `c + 2`（`id*S+slice` + S 行 reserved 前缀） |
+
+边 = `1 head class × 2 src_slice × 1 period × 2 dst replica = 4`；每个 canonical block 恒属于唯一源片
+（`c%2`），故每个目标副本恰好被唯一源 rank 写一次——不漏不重。
+
+**为什么行公式必须每侧各算**（共用一份会分别错在三处）：用 D 的公式读 P（P 只持有 `c/2+1`，会读到
+`c+2`）；用 P 的公式写 D（写到 `c/2+1`）；或把一侧的 reserved 前缀套到另一侧（`kv4kv2` 里 P 是 `c+4`、
+D 是 `c+2`，差 `S_P−S_D` 行）。`peer_row` 第二分支刻意用**该侧 `topology.kv_split_size`** 而不是族自己的
+有效 split，就是因为池子的行寻址是运行时的、按实例 DCP 宽度排的。
+
+**验收**：`cp4kv2` r20 与 r120（长 prompt 带 CP padding 行）在本轮 8 场景矩阵里都是
+`VERDICT` + `OWNER VERDICT` 双 gate PASS；单测侧有 `pd_route_test.cpp` 的
+`IndexerPoolIsAShardedSourceAndAReplicaDestination` 与三个 mock 传输逐字节用例、
+`kv_redundancy_test.cpp` 的 `EverySliceHasOneWriterAndNrepReplicas`。
+
+**边界**：① 「全量」是**目标侧**的性质——CP rank 没算过别的 shard，源侧只能是分片，准确说法是
+「源侧按片交付 → 目标侧合成全量」；② replica-0 写是**去重假设**（假定同 (head, slice) 各副本字节相同），
+binder 只校验放置、不校验源端副本一致性，靠 owner check 在真机兜；③ 索引器能走 canonical 的前提是
+head 几何钉得住（固定 1 个逻辑 head），`WINDOW/SWA/KV_STATE` 这类直接拒绝。
