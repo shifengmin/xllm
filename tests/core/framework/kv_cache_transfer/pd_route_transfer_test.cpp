@@ -143,6 +143,15 @@ void build_side(const SideSpec& spec,
       view.entry.buffer_bytes =
           view.entry.resource_count * view.entry.resource_stride_bytes;
       view.entry.explicit_offsets = false;
+      // The route addresses one run of heads per physical row; a fixture whose
+      // family is a single contiguous head range states it the way the
+      // descriptor does: one run over every local head, and a sub-unit that is
+      // `local_heads * head_bytes` wide.
+      HeadRun run;
+      run.head_bytes = kHeadBytes;
+      view.head_runs.emplace_back(run);
+      view.unit_stride_bytes =
+          static_cast<uint64_t>(redundancy.local_head_count()) * kHeadBytes;
       view.local_rank = rank;
       side->views.emplace_back(std::move(view));
     }
