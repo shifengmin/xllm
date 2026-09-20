@@ -98,6 +98,11 @@ bool leaf_participates_in_prefix_cache(BlockType type,
     case BlockType::LINEAR:
     case BlockType::EMBEDDING:
       return false;
+    case BlockType::INDEX:
+      // The DSA indexer is never a block-allocated leaf (it derives its rows
+      // from the KV group's blocks), so it does not participate in prefix cache
+      // as a leaf here. Present only to keep this switch exhaustive.
+      return false;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
   // disable prefix cache for the new leaf across both P and D, and every

@@ -52,6 +52,13 @@ enum class BlockType : int8_t {
                   // from LinearStateBlockManager; exported via
   // get_linear_block_id() (linear_state_ids). Also the cache group
   // for the conv/ssm recurrent-state KV tensors.
+  INDEX = 6,  // DSA indexer cache. NOT a block-allocation type: the indexer
+              // has no blocks of its own, its rows are derived from the KV
+              // group's blocks (logical_block * kv_split + shard). Used only
+              // as a distinct PD-transfer group id so the indexer can carry
+              // its own sequence-split width, independent of the MLA K/V it
+              // shares physical blocks with. Appended (never renumbered) for
+              // proto BlockType wire compatibility.
 };
 
 // Fixed column order of worker multi_block_tables. The exported tables must
@@ -78,6 +85,7 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
     case BlockType::SWA:
     case BlockType::C4:
     case BlockType::C128:
+    case BlockType::INDEX:
       return true;
     case BlockType::EMBEDDING:
     case BlockType::LINEAR:
@@ -101,6 +109,8 @@ inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
       return BlockType::EMBEDDING;
     case cache_group_id(BlockType::LINEAR):
       return BlockType::LINEAR;
+    case cache_group_id(BlockType::INDEX):
+      return BlockType::INDEX;
     default:
       return std::nullopt;
   }
