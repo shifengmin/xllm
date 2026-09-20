@@ -4000,3 +4000,114 @@ F npu_mega_gdn_prefill.cpp:163] Check failed: get_workspace_size_func_addr != nu
 (c) 实现上面的逐头比对工具；
 (d) 跑 `q35t2t1` / `q35t1t2`，并同时决定 CONV composite descriptor 在 canonical 路由下的走法。
 
+---
+
+## 第 39 轮：Qwen3.5 异构 TP 逐头验收（(a)-(d) 全部完成）
+
+### (83) 环境阻塞解除：`aclnnMegaGdnPrefill` op 包
+
+* 83 的暂存 ops 树里**本来就有** `mega_gdn_prefill_op`，之前构建失败的真因是源码包缺
+  `cmake/third_party/build/modules/patch/{protobuf_25.1_change_version,protobuf-hide_absl_symbols}.patch`
+  （`gmake ascend_protobuf_build_xllm-patch Error 1`；更早的 LSE 构建死在同一个坑）。从本机补 `cmake/`
+  （`cp -rn`，只补缺）后一次构建成功。
+* 装成独立 vendor `custom_extra_xllm_math`（`aclnnMegaGdnPrefillOp`/`Decode`/`MtpDecode`，kernel 覆盖
+  `ascend910_93`）。`build.sh -n` 的 `update_vendor_config` 会**前插** `load_priority`，于是把
+  `config.ini` 重写为 `glm_next_transformer,custom_transformer,custom_xllm_math,kpool_transformer,custom_extra_xllm_math`
+  ——新 vendor 放最后，`libcust_opapi.so` 的解析顺序与 GLM 场景完全一致。
+* 效果：prefill 不再 Fatal，trace 正常落盘（PREFILL 868~2984 行、DECODE 750 行量级）。
+
+### (84) 逐头验收工具（tracer + 比较器）
+
+* `_pd_trace.py`：新增 `_HEAD_AXIS`（key/value = dim 2、ssm = dim 1、conv = 复合段）、
+  `_head_layout`（conv 的 head 几何从**同层 ssm** 推：`heads=ssm.shape[1]`、`head_dim=ssm.shape[2]`；
+  旧版按 `width%3` 把 6144 feature 算成 2048 个假 head）、`_linear_state_slot_ids`/`_linear_rows`
+  （conv 的 row = linear state slot id；ssm 的 row = `slot*stride + r`，`stride = ssm.shape[0]//conv.shape[0]`）。
+  每个 dump 记录 `heads`/`head_sha256` 与 `linear_state_ids`/`linear_state_rows`/`linear_ssm_stride`。
+  **根因修正**：旧 tracer 用 K/V block table 当 conv/ssm 的 row，行空间根本不对，所以旧比较器把
+  每一条都判成 missing。
+* `compare_heads.py`：按 `(canonical block, 全局 head)` 判三件事——放置、覆盖、零值；`head_base`
+  = sharded 时 `rank*(G/tp)`、否则 `rank%G`；源端索引对**所有** prefill call 取并集（旧版只取 call 0，
+  把后面的 block 全判 missing）；decode meta 缺 `linear_state_rows` 时 conv/ssm 标 **ungraded** 而不是
+  静默 PASS。单测 `test_compare_heads.py` 8/8，其中 5 个是必须 FAIL 的鉴别用例（head 区间互换、
+  丢 rank、目标全零、无逐头摘要、linear 行空间未知）。
+
+### (85) canonical 拒绝 COMPOSITE 的根因与修复
+
+* 现象（两个 rank 相同）：
+  `mooncake_kv_cache_transfer.cpp:538] The canonical route cannot interpret this rank's own published layout:
+  layer 0, role 3, group 5: a composite descriptor interleaves several logical tensors in one physical ...`
+  role 3 = CONV，group 5 = linear group；随后 `llm_worker_impl.cpp:286] Check failed: kv_transfers.wait() KV cache push failed`。
+  这就是 canonical 路由在 Qwen3.5 上的**唯一**阻塞点（不是 GDN 算子）。
+* 设计：`HeadGeometry` 里原来只有单一 head 轴，现在补 `runs`（`HeadRunGeometry{physical_offset_bytes,
+  head_bytes, repeat_count, physical_stride_bytes}`）与 `unit_stride_bytes`。
+  `derive_composite_head_geometry` 按 `logical_tensor` 分组（首现顺序 = 物理打包顺序），每个组件一条 run；
+  校验：组件数 ≥2、每组件恰好 `local_heads` 个 span 且全局 head 区间**完全一致**（同一 head class、
+  同 `head_bytes`）、组件内 span 的 logical 偏移按全局 head 递增、physical 偏移按 local head 连续、
+  owner 一致、**组件之间 repeat/stride 一致**、**物理区间从 0 起无缝铺满一行**、总覆盖 ==
+  `resource_stride_bytes`；并要求 `units == 1`（state 行在资源**内部**，不能再叠 sub-unit 循环）。
+  `unit_stride_bytes = resource_stride_bytes`。
+* 数据面（`route_binder`）：`PeerCacheView` 加 `head_runs` + `unit_stride_bytes`；bind 先逐 run 比对两侧
+  的 run 数 / `head_bytes` / `repeat_count`，再出 region：
+  `base + run.offset + (edge.head_begin - 该侧 rank.head_begin) * run.head_bytes + unit*unit_stride + repeat*run.stride`。
+  单 run 族（K/V、SSM、MLA 整资源）的 `derived_head_geometry` 给的就是 `{0, head_bytes, repeat=1}` 且
+  `unit_stride = local_heads*head_bytes`（整资源路径 `= head_bytes`，此时 `local_heads==1`），与旧公式
+  `local_unit_stride = local_rank.local_head_count * head_bytes` **逐字节等价**。
+* 关键点：同一 head 区间在两个 peer 上的偏移**本来就不同**——tp1 的 rank 持有全部 4 个 head，区间
+  `[2,4)` 要从组件内第 2 个 head 起读；tp2 的 rank 只有 heads `[2,4)` 并且它们就是它自己组件的
+  第 0/1 个 head，偏移为 0。这正是 head reshard 的实质。
+
+### (86) 单测（98 上 `cache_directory_test 27 / pd_route_test 18 / kv_redundancy_test 12` 全绿）
+
+* `cache_directory_test`：+3 接受/拒绝（复合描述符读出三条 run 并逐条断言物理偏移/repeat/stride、
+  组件 head 数不同拒绝、组件落在不同 head class 拒绝）+2 硬化（组件之间 stride 不一致拒绝、
+  组件偏移整体前移 32 字节——总量不变因此**只有铺满检查能看到**——拒绝）。
+* `pd_route_test`：+2（TP1→TP2 的复合 bind 逐 run 断言 + 双胞胎：dst rank 0 与 rank 1 的偏移必须不同；
+  peer 之间 run 数/重复次数/unit stride 不一致拒绝）。`make_view` 现在按 descriptor 的方式发布
+  run 与 unit stride，既有用例的语义不变。
+* 这一轮踩到的**测试自身**的坑，值得记下来：第一版把「head class 偏移」也加到了 destination 上，
+  于是 `BinderWalksEveryRunOfACompositeRow` 报 remote 期望 864 实得 832。**实现是对的，期望是错的**：
+  `edge.head_begin - rank.head_begin` 在 destination 侧本来就是 0（那是它自己 class 的起点）。
+  这也说明这个用例确实有鉴别力。
+
+### (87) 端到端：三条 Qwen3.5 臂全部 PASS
+
+部署不走 wheel：`remote_loop.sh build`（ninja xllm + `strip`，563MB → 111MB）+ `deploy`
+（98 → 83，`docker cp` 换入 site-packages 的 `xllm`），每次核对 md5。最终部署件 md5 `3ad29504bb18e981024ba0270bcd587c`。
+
+| 臂 | 几何 | http | compare_heads |
+|---|---|---|---|
+| `q35t1t1` | P cp1/tp1/kv1 → D cp1/tp1/kv1 | 200（3492 token） | **HEAD VERDICT: PASS** |
+| `q35t2t1` | P cp1/tp2/kv1 → D cp1/tp1/kv1 | 200 | **HEAD VERDICT: PASS** |
+| `q35t1t2` | P cp1/tp1/kv1 → D cp1/tp2/kv1 | 200 | **HEAD VERDICT: PASS** |
+
+三条臂的逐族数字（`rows` 是目标侧被 dump 的行数，`graded` 是 `(block, global head)` 对数）：
+
+* conv：`graded=288 match=288 misplaced=0 missing=0 zero=0 | source pairs=16 not delivered=0 unexpected=0`
+* ssm：同上（288/288）
+* key/value：`graded=336 match=336 misplaced=0 missing=0 zero=0 | source pairs=56 not delivered=0 unexpected=0`
+
+`q35t1t2` 的目标侧宽度 `conv/ssm dest widths=r0:8h,r1:8h`、`key/value r0:1h,r1:1h`
+（tp2 下 conv 的 16 个 head 被两个 rank 各 8 个、K/V 的 2 个 head 各 1 个）；`q35t2t1` 的
+`conv/ssm r0:16h`、`key/value r0:2h`。archive：
+`runs/q35t1t1-canonical-r20-121734`、`runs/q35t2t1-canonical-r20-121948`、`runs/q35t1t2-canonical-r20-122152`。
+另外行级 `compare_kv.py` 在这三条上都报 `VERDICT: PASS`（key/value `match=168 mismatch=0 absent_in=0`），
+conv/ssm 它归到 `other/written=18/36 zero=0`——**行级比较器看不见 head reshard，逐头才是判据**。
+
+### (88) 结论与边界
+
+* **S3-4 / C1（MixedLayers 的 CONV 复合描述符）阻塞解除**：Qwen3.5 的混合 cache（全注意力 GQA KV
+  + linear-attention 的 conv/ssm 状态）现在都能走 canonical 路由，且**同构与双向异构 TP**（tp2→tp1、
+  tp1→tp2）逐头逐字节全部命中。head 轴口径两侧一致、`units==1`、铺满检查同时成立。
+* 复合描述符的能力边界（写进代码注释）：**各组件必须暴露同一 head 区间**——Qwen3.5 的
+  `linear_key_head_count == linear_value_head_count == 16` 成立；`NK≠NV` 的模型会被明确拒绝
+  （错误信息点名「同一 head interval」）。`units != 1`（资源内含多个 sub-unit）也拒绝，因为
+  composite 的 repeat 已经在资源内部。
+* 工具口径：`remote_loop.sh run` 对 Qwen3.5 会因 `index_owner_check` 找不到 indexer dump
+  （`no dumps found`）而记 `OWNER VERDICT: FAIL` → 整条 run 记 FAIL。**这是工具口径而非路由问题**；
+  Qwen3.5 臂统一走 `q35_run98.sh`（跑一遍 + 逐头判定）。
+* 运维坑（重要）：长任务挂在 ssh 会话下会被**静默截断**——本地拿到 `rc=0`、远端脚本却在中途被切断
+  （build 成功、deploy 成功，但后续 3 个臂从未开始；日志停在 deploy 之后）。现在一律
+  `setsid nohup bash <driver> > /tmp/<driver>.log 2>&1 < /dev/null &` 完全脱离会话，再用短探针读日志。
+* legacy 对照：legacy 只搬 K/V，decode 侧 conv/ssm 全零（`ssm zero=486/504`），所以它只能证明
+  「模型能在 PD 上服务」，不能作为 head reshard 的判据；canonical 才是目标。
+
