@@ -679,7 +679,14 @@ int32_t run_mock_transfer(bool shift_remote_rows) {
 // replica row. The expectation is derived independently of the route table, so
 // a wrong row on either side moves bytes without breaking any structural
 // invariant.
-int32_t run_mock_index_transfer(bool shift_remote_rows) {
+//
+// ``wrong_source_rank`` seeds every source rank with its neighbour's pattern:
+// the route still binds legal regions (nothing structural changes, and the
+// binder's own bounds guard stays quiet), but the bytes that land in the
+// destination are no longer the ones the contract names -- which is what the
+// "is discriminating" test needs.  Shifting the *remote* row offsets instead
+// would be caught by that guard and turn the test into a check of the guard.
+int32_t run_mock_index_transfer(bool wrong_source_rank) {
   const KvTopology prefill = prefill_topology(kMockTokens);
   const KvTopology decode = decode_topology(kMockTokens);
   const GroupTopology indexer = make_group(/*global_head_count=*/1,
@@ -695,22 +702,13 @@ int32_t run_mock_index_transfer(bool shift_remote_rows) {
                  kMockRows,
                  kMockRowBytes,
                  /*units_per_resource=*/kMockTokens);
-  BufferDirectoryEntry remote_entry =
+  const BufferDirectoryEntry remote_entry =
       make_entry(/*buffer_id=*/200,
                  kMockRows,
                  kMockRowBytes,
                  /*units_per_resource=*/kMockTokens);
-  if (shift_remote_rows) {
-    remote_entry.explicit_offsets = true;
-  }
   const PeerCacheView local = make_view(prefill, indexer, local_entry);
-  PeerCacheView remote = make_view(decode, indexer, remote_entry);
-  if (shift_remote_rows) {
-    remote.row_offsets.reserve(kMockRows);
-    for (uint64_t row = 0; row < kMockRows; ++row) {
-      remote.row_offsets.emplace_back((row + 1) * kMockRowBytes);
-    }
-  }
+  const PeerCacheView remote = make_view(decode, indexer, remote_entry);
 
   std::vector<std::vector<uint8_t>> source(
       32, std::vector<uint8_t>(kMockBufferBytes, 0));
@@ -718,7 +716,7 @@ int32_t run_mock_index_transfer(bool shift_remote_rows) {
     for (uint64_t row = 0; row < kMockRows; ++row) {
       for (uint64_t offset = 0; offset < kMockRowBytes; ++offset) {
         source[rank][row * kMockRowBytes + offset] =
-            mock_pattern(rank, row, offset);
+            mock_pattern(wrong_source_rank ? rank + 1 : rank, row, offset);
       }
     }
   }
@@ -789,14 +787,14 @@ int32_t run_mock_index_transfer(bool shift_remote_rows) {
   return mismatches;
 }
 
-}  // namespace
-
 TEST(PdRouteTest, MockIndexTransferCopiesCanonicalBlocksByteForByte) {
-  EXPECT_EQ(run_mock_index_transfer(/*shift_remote_rows=*/false), 0);
+  EXPECT_EQ(run_mock_index_transfer(/*wrong_source_rank=*/false), 0);
 }
 
 TEST(PdRouteTest, MockIndexTransferIsDiscriminating) {
-  EXPECT_GT(run_mock_index_transfer(/*shift_remote_rows=*/true), 0);
+  // Seeding the wrong source pattern must move bytes without breaking any
+  // structural invariant, so only the byte check can see it.
+  EXPECT_GT(run_mock_index_transfer(/*wrong_source_rank=*/true), 0);
 }
 
 TEST(PdRouteTest, MockTransferCopiesCanonicalBlocksByteForByte) {
@@ -807,6 +805,136 @@ TEST(PdRouteTest, MockTransferIsDiscriminating) {
   // A wrong remote row base moves every byte into the wrong place without
   // breaking any structural invariant, so only the byte check can see it.
   EXPECT_GT(run_mock_transfer(/*shift_remote_rows=*/true), 0);
+}
+
+// The replica pair (`kv4kv2`): context parallelism is off on both instances, so
+// the indexer family is a whole-sequence replica on every rank of both sides
+// and the only heterogeneity left is the kv split (4 -> 2).  The route
+// therefore moves whole rows and only re-bases them: canonical block h sits at
+// source row `h + S_P` and belongs at destination row `h + S_D`, with no
+// ownership split at all.  Every source replica holds identical bytes (that
+// invariant is what the end-to-end PD owner check measures), so one seed models
+// every rank's buffer and the expectation stays independent of which replica
+// the route picked.
+int32_t run_mock_replica_transfer(bool wrong_source_row) {
+  constexpr int32_t kSrcSplit = 4;
+  constexpr int32_t kDstSplit = 2;
+  // Rows are `kMockRows` = 8 wide and the source row base is 4, so four
+  // canonical blocks fit inside one buffer.
+  constexpr int64_t kCanonical = 4;
+
+  const KvTopology prefill = make_topology(/*dp_size=*/1,
+                                           /*cp_size=*/1,
+                                           /*tp_size=*/4,
+                                           /*kv_split_size=*/kSrcSplit,
+                                           kMockTokens);
+  const KvTopology decode = make_topology(/*dp_size=*/1,
+                                          /*cp_size=*/1,
+                                          /*tp_size=*/2,
+                                          /*kv_split_size=*/kDstSplit,
+                                          kMockTokens);
+  const GroupTopology indexer = make_group(/*global_head_count=*/1,
+                                           kMockHeadBytes,
+                                           /*sequence_scoped=*/false,
+                                           /*full_sequence_replica=*/true);
+  const std::vector<RouteEdge> edges =
+      build_edges(prefill, indexer, decode, indexer);
+  EXPECT_GT(edges.size(), 0u);
+
+  std::string error;
+  EXPECT_TRUE(
+      PdRouteTable::validate(edges, prefill, indexer, decode, indexer, &error))
+      << error;
+
+  const BufferDirectoryEntry local_entry =
+      make_entry(/*buffer_id=*/100,
+                 kMockRows,
+                 kMockRowBytes,
+                 /*units_per_resource=*/kMockTokens);
+  const BufferDirectoryEntry remote_entry =
+      make_entry(/*buffer_id=*/200,
+                 kMockRows,
+                 kMockRowBytes,
+                 /*units_per_resource=*/kMockTokens);
+  const PeerCacheView local = make_view(prefill, indexer, local_entry);
+  const PeerCacheView remote = make_view(decode, indexer, remote_entry);
+
+  std::vector<std::vector<uint8_t>> source(
+      static_cast<size_t>(prefill.tp_size * prefill.cp_size),
+      std::vector<uint8_t>(kMockBufferBytes, 0));
+  for (std::vector<uint8_t>& rank_buffer : source) {
+    for (uint64_t row = 0; row < kMockRows; ++row) {
+      for (uint64_t offset = 0; offset < kMockRowBytes; ++offset) {
+        // Rank-independent on purpose: with the sequence replicated the bytes
+        // of a pool row are the same on every source rank.
+        rank_buffer[row * kMockRowBytes + offset] =
+            mock_pattern(0, row, offset);
+      }
+    }
+  }
+  std::vector<std::vector<uint8_t>> destination(
+      static_cast<size_t>(decode.tp_size * decode.cp_size),
+      std::vector<uint8_t>(kMockBufferBytes, 0));
+
+  std::vector<int64_t> blocks;
+  for (int64_t block = 0; block < kCanonical; ++block) {
+    blocks.emplace_back(block);
+  }
+  for (int32_t dst_local = 0; dst_local < decode.tp_size * decode.cp_size;
+       ++dst_local) {
+    std::vector<RouteRegion> regions;
+    EXPECT_TRUE(RouteBinder::bind(
+        edges, dst_local, blocks, local, remote, &regions, &error))
+        << error;
+    for (const RouteRegion& region : regions) {
+      EXPECT_LE(region.local_offset + region.length, kMockBufferBytes);
+      EXPECT_LE(region.remote_offset + region.length, kMockBufferBytes);
+      std::memcpy(destination[static_cast<size_t>(dst_local)].data() +
+                      region.remote_offset,
+                  source[0].data() + region.local_offset,
+                  region.length);
+    }
+  }
+
+  int32_t mismatches = 0;
+  for (int32_t dst_local = 0; dst_local < decode.tp_size * decode.cp_size;
+       ++dst_local) {
+    for (int64_t block = 0; block < kCanonical; ++block) {
+      const uint64_t row = static_cast<uint64_t>(block) + kDstSplit;
+      for (int64_t unit = 0; unit < kMockTokens; ++unit) {
+        for (int32_t byte = 0; byte < kMockHeadBytes; ++byte) {
+          const uint64_t offset_in_row =
+              static_cast<uint64_t>(unit) * kMockHeadBytes + byte;
+          const uint8_t actual =
+              destination[static_cast<size_t>(dst_local)]
+                         [static_cast<size_t>(row) * kMockRowBytes +
+                          offset_in_row];
+          // Derived independently of the route table: a replica keeps canonical
+          // block h at `h + S`, so the destination must hold the source's
+          // `h + S_P` row and nothing else.
+          const uint64_t source_row =
+              static_cast<uint64_t>(block) + (wrong_source_row ? 0 : kSrcSplit);
+          const uint8_t expected = mock_pattern(0, source_row, offset_in_row);
+          if (actual != expected) {
+            ++mismatches;
+          }
+        }
+      }
+    }
+  }
+  return mismatches;
+}
+
+}  // namespace
+
+TEST(PdRouteTest, MockReplicaTransferCopiesWholeSequenceRows) {
+  EXPECT_EQ(run_mock_replica_transfer(/*wrong_source_row=*/false), 0)
+      << "a whole-sequence source must ship its `block + S_P` rows";
+}
+
+TEST(PdRouteTest, MockReplicaTransferIsDiscriminating) {
+  EXPECT_GT(run_mock_replica_transfer(/*wrong_source_row=*/true), 0)
+      << "reading the compact `block` row instead of `block + S_P` must differ";
 }
 
 TEST(PdRouteTest, BinderRejectsPeersThatDisagreeOnTheCanonicalUnit) {
