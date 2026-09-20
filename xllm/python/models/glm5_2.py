@@ -484,22 +484,21 @@ class Glm52MLAAttention(Attention):
                         device=hidden.device,
                     )
                 distributed.broadcast_(topk, layer_owner, "layerwise")
-            elif cp_context is None:
-                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
             else:
-                # Indexer queries are packed to real CP-owned rows.  The key
-                # side is all-gathered inside the indexer so the paged index
-                # cache remains globally addressable.
-                query_index = cp_context.query_index
-                topk = self.indexer.select_qli(
-                    hidden.index_select(0, query_index),
-                    q_c.index_select(0, query_index),
-                    positions.index_select(0, query_index),
-                    ctx,
-                    cos_sin_cache,
-                    cache_hidden=hidden,
-                    cache_positions=positions,
-                )
+                # Context parallelism gathers both sides inside the indexer: the
+                # query side so one global-order top-k covers every rank (the
+                # result is sharded back to this rank at the end of select_qli),
+                # the key side so the paged index cache stays globally
+                # addressable.  The gather rebuilds global order from the
+                # *padded* local layout -- restore_index picks the real rows out
+                # of a shard of ``total_local`` rows -- so the indexer has to be
+                # handed the padded local tensors.  Packing them with
+                # query_index first shortens this rank's contribution whenever it
+                # owns the sequence tail (the only rank that holds padding rows),
+                # and restore_index then addresses past the end of the gathered
+                # buffer: the ``Index N out of range[0 N)`` prefill crash on a
+                # prompt that is not a multiple of 2 * cp_size.
+                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
         else:
             if prev_topk_indices is None:
                 raise ValueError(
@@ -628,26 +627,22 @@ class Glm52Indexer(nn.Module):
         positions: torch.Tensor,
         ctx: MlaIndexContext,
         cos_sin_cache: torch.Tensor,
-        cache_hidden: torch.Tensor | None = None,
-        cache_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        cache_hidden = hidden if cache_hidden is None else cache_hidden
-        cache_positions = positions if cache_positions is None else cache_positions
-        k = self.wk(cache_hidden)
+        k = self.wk(hidden)
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         if self.indexer_rope_interleave:
             cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
             q_pe = _interleave_rope_with(q_pe, cos, sin)
-            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
+            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
             k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
         else:
             q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
+            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
         weights = self.weights_proj(hidden)
