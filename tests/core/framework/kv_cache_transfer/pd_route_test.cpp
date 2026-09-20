@@ -99,6 +99,18 @@ PeerCacheView make_view(const KvTopology& topology,
   view.topology = topology;
   view.group = group;
   view.entry = entry;
+  // Production reads the head layout out of the descriptor; a fixture whose
+  // family is one contiguous head range states it the way the descriptor does:
+  // a single run over every local head, whose bytes are one sub-unit.
+  KvRedundancy redundancy;
+  std::string reason;
+  EXPECT_TRUE(KvRedundancy::derive(topology, group, &redundancy, &reason))
+      << reason;
+  HeadRun run;
+  run.head_bytes = group.head_bytes;
+  view.head_runs.emplace_back(run);
+  view.unit_stride_bytes =
+      static_cast<uint64_t>(redundancy.local_head_count()) * group.head_bytes;
   return view;
 }
 
@@ -536,6 +548,170 @@ TEST(PdRouteTest, BinderExpandsCheckpointSubUnitsOfSequenceState) {
     EXPECT_EQ(regions.front().length, 8 * static_cast<uint64_t>(kSsmHeadBytes));
   }
   EXPECT_EQ(pairs_into_rank_zero, 4);
+}
+
+// A composite family packs several logical tensors into one physical row -- the
+// Qwen3.5 conv state is `[key_a | key_b | value]` -- so a head range is one
+// byte range per component rather than one contiguous range. Binding therefore
+// has to walk every component's own offsets, and those offsets differ between
+// peers whenever their TP widths do: this test reshard one slot from one TP1
+// rank onto the two ranks of a TP2 instance.
+TEST(PdRouteTest, BinderWalksEveryRunOfACompositeRow) {
+  const KvTopology source = make_topology(/*dp_size=*/1,
+                                          /*cp_size=*/1,
+                                          /*tp_size=*/1,
+                                          /*kv_split_size=*/1,
+                                          kTokensPerBlock);
+  const KvTopology dest = make_topology(/*dp_size=*/1,
+                                        /*cp_size=*/1,
+                                        /*tp_size=*/2,
+                                        /*kv_split_size=*/1,
+                                        kTokensPerBlock);
+  const GroupTopology conv = make_group(/*global_head_count=*/4,
+                                        /*head_bytes=*/16,
+                                        /*sequence_scoped=*/true,
+                                        /*full_sequence_replica=*/false);
+  const std::vector<RouteEdge> edges = build_edges(source, conv, dest, conv);
+  ASSERT_EQ(edges.size(), 2u);
+
+  // TP1 holds all four key-a, four key-b and four value heads: 96 features per
+  // state row and three rows per slot, so one slot is 576 bytes and every
+  // component starts 64 bytes into each row.
+  const uint64_t source_slot_bytes = 576;
+  const uint64_t source_state_stride = 192;
+  const std::array<uint64_t, 3> source_component_offsets = {0, 64, 128};
+  const BufferDirectoryEntry source_entry =
+      make_entry(/*buffer_id=*/41,
+                 /*resource_count=*/4,
+                 source_slot_bytes,
+                 /*units_per_resource=*/1);
+  PeerCacheView local = make_view(source, conv, source_entry);
+  local.head_runs = {{0, 16, 3, source_state_stride},
+                     {source_component_offsets[1], 16, 3, source_state_stride},
+                     {source_component_offsets[2], 16, 3, source_state_stride}};
+  local.unit_stride_bytes = source_slot_bytes;
+
+  // TP2 holds half the heads, which halves the feature dimension with them: 48
+  // features per state row, one slot 288 bytes, components 32 bytes apart.
+  const uint64_t remote_slot_bytes = 288;
+  const uint64_t remote_state_stride = 96;
+  const std::array<uint64_t, 3> remote_component_offsets = {0, 32, 64};
+  const BufferDirectoryEntry remote_entry =
+      make_entry(/*buffer_id=*/42,
+                 /*resource_count=*/4,
+                 remote_slot_bytes,
+                 /*units_per_resource=*/1);
+  PeerCacheView remote = make_view(dest, conv, remote_entry);
+  remote.head_runs = {
+      {0, 16, 3, remote_state_stride},
+      {remote_component_offsets[1], 16, 3, remote_state_stride},
+      {remote_component_offsets[2], 16, 3, remote_state_stride}};
+  remote.unit_stride_bytes = remote_slot_bytes;
+
+  // Slot 2 through the second head class: destination rank 1 holds global heads
+  // [2, 4), the second half of every component. Inside that rank the half *is*
+  // the component's first two heads, so its run offset needs no head shift --
+  // while the source rank holds all four heads and therefore reads those two
+  // heads 32 bytes into every component. The two peers' offsets have to differ
+  // here: that is the head reshard.
+  const uint64_t source_head_offset = 32;
+  const uint64_t remote_head_offset = 0;
+  std::vector<RouteRegion> regions;
+  std::string error;
+  ASSERT_TRUE(RouteBinder::bind(
+      {edges[1]}, /*dst_local_rank=*/1, {2}, local, remote, &regions, &error))
+      << error;
+  // Three components times three state rows, each a 32 byte run.
+  ASSERT_EQ(regions.size(), 9u);
+  size_t region = 0;
+  for (uint64_t repeat = 0; repeat < 3; ++repeat) {
+    for (size_t component = 0; component < source_component_offsets.size();
+         ++component) {
+      EXPECT_EQ(regions[region].length, 32u);
+      EXPECT_EQ(regions[region].local_offset,
+                2 * source_slot_bytes + source_component_offsets[component] +
+                    source_head_offset + repeat * source_state_stride);
+      EXPECT_EQ(regions[region].remote_offset,
+                2 * remote_slot_bytes + remote_component_offsets[component] +
+                    remote_head_offset + repeat * remote_state_stride);
+      ++region;
+    }
+  }
+
+  // The first head class of the same slot lands on rank 0, and there neither
+  // peer shifts inside a component: the source's rank 0 starts at global head 0
+  // and the destination's rank 0 starts at its own class start. The bytes are a
+  // different set from rank 1's, which is what keeps the two calls apart.
+  ASSERT_TRUE(RouteBinder::bind(
+      {edges[0]}, /*dst_local_rank=*/0, {2}, local, remote, &regions, &error))
+      << error;
+  ASSERT_EQ(regions.size(), 9u);
+  EXPECT_EQ(regions[0].local_offset, 2 * source_slot_bytes);
+  EXPECT_EQ(regions[0].remote_offset, 2 * remote_slot_bytes);
+  EXPECT_EQ(regions[2].local_offset,
+            2 * source_slot_bytes + source_component_offsets[2]);
+  EXPECT_EQ(regions[2].remote_offset,
+            2 * remote_slot_bytes + remote_component_offsets[2]);
+}
+
+// Two peers whose rows pack different runs disagree about what the bytes after
+// a head mean, so binding refuses instead of addressing another component's
+// bytes.
+TEST(PdRouteTest, BinderRejectsPeersThatDisagreeOnTheHeadRuns) {
+  const KvTopology prefill = prefill_topology(kTokensPerBlock);
+  const KvTopology decode = decode_topology(kTokensPerBlock);
+  const GroupTopology conv = make_group(/*global_head_count=*/64,
+                                        /*head_bytes=*/16,
+                                        /*sequence_scoped=*/true,
+                                        /*full_sequence_replica=*/false);
+  const std::vector<RouteEdge> edges = build_edges(prefill, conv, decode, conv);
+  ASSERT_FALSE(edges.empty());
+
+  const BufferDirectoryEntry entry = make_entry(/*buffer_id=*/11,
+                                                /*resource_count=*/8,
+                                                /*resource_stride_bytes=*/288,
+                                                /*units_per_resource=*/1);
+  PeerCacheView local = make_view(prefill, conv, entry);
+  local.head_runs = {{0, 16, 1, 0}, {64, 16, 1, 0}, {128, 16, 1, 0}};
+  local.unit_stride_bytes = 288;
+  PeerCacheView remote = make_view(decode, conv, entry);
+  remote.head_runs = local.head_runs;
+  remote.unit_stride_bytes = 288;
+  std::vector<RouteRegion> regions;
+  std::string error;
+
+  PeerCacheView short_row = remote;
+  short_row.head_runs.pop_back();
+  EXPECT_FALSE(RouteBinder::bind({edges[0]},
+                                 edges[0].dst_local_rank,
+                                 {0},
+                                 local,
+                                 short_row,
+                                 &regions,
+                                 &error));
+  EXPECT_NE(error.find("number of head runs"), std::string::npos) << error;
+
+  PeerCacheView other_repeat = remote;
+  other_repeat.head_runs[1].repeat_count = 2;
+  EXPECT_FALSE(RouteBinder::bind({edges[0]},
+                                 edges[0].dst_local_rank,
+                                 {0},
+                                 local,
+                                 other_repeat,
+                                 &regions,
+                                 &error));
+  EXPECT_NE(error.find("how often run"), std::string::npos) << error;
+
+  PeerCacheView no_stride = remote;
+  no_stride.unit_stride_bytes = 0;
+  EXPECT_FALSE(RouteBinder::bind({edges[0]},
+                                 edges[0].dst_local_rank,
+                                 {0},
+                                 local,
+                                 no_stride,
+                                 &regions,
+                                 &error));
+  EXPECT_NE(error.find("sub-unit stride"), std::string::npos) << error;
 }
 
 namespace {

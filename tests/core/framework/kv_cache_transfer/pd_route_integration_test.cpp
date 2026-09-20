@@ -164,8 +164,8 @@ std::vector<RoleSpec> role_specs(bool enable_mla) {
 
   // An MLA instance describes every tensor as a whole resource, so the
   // convolution state of the linear layers arrives as a packed single-head row
-  // (see PeerDirectoryTest.RejectsCompositeCacheGroups for the composite
-  // descriptor a non-MLA instance produces instead).
+  // (see PeerDirectoryTest.DescribesEveryHeadRunOfACompositeConvRow for the
+  // composite descriptor a non-MLA instance produces instead).
   if (!enable_mla) {
     return {key, index, ssm};
   }
