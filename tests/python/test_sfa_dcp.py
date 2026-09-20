@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -299,6 +300,73 @@ def test_glm_quant_indexer_uses_materialized_scale_and_reshards_topk() -> None:
     assert quant_lightning_indexer.call_args.args[4] is materialized_scale
     assert quant_lightning_indexer.call_args.args[8] is materialized_table
     cp_shard_rows.assert_called_once_with(global_topk, cp_context)
+
+
+class _IndexerReached(Exception):
+    """Sentinel raised by the mocked indexer to stop the forward at its call."""
+
+
+def test_cp_indexer_is_handed_the_padded_local_rows() -> None:
+    """Context parallelism must not pre-pack the indexer query.
+
+    ``select_qli`` gathers its input back to global order with ``cp_gather_kv``,
+    which is defined on the *padded* local layout: ``restore_index`` addresses
+    ``cp_size * total_local`` rank-major slots.  A ``query_index``-packed tensor
+    makes the rank that owns the sequence tail contribute fewer rows than its
+    peers, so the gathered buffer is shorter than ``restore_index`` addresses and
+    the gather reads past its end:
+
+        [ASSERT] gather_v3_base.h:137 Index 3480 out of range[0 3480)!
+        aclnnIndexSelect failed, error code is 507035
+
+    for a 3492-token prompt at cp_size 4 (3480 = 4 * 870 = cp_size * the packed
+    rows of rank 0, which owns the sequence's four padding rows).
+    """
+    total_local = 6
+    packed_rows = 4  # what `query_index` selects on the tail-owning rank
+    captured: dict[str, object] = {}
+
+    def select_qli(hidden, qr, positions, ctx, cos_sin_cache, *args, **kwargs):
+        del ctx, cos_sin_cache
+        captured["hidden_rows"] = int(hidden.shape[0])
+        captured["qr_rows"] = int(qr.shape[0])
+        captured["positions_rows"] = int(positions.shape[0])
+        captured["kwargs"] = sorted(kwargs)
+        raise _IndexerReached
+
+    attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
+    attention.layer_id = 0
+    attention.cfg = SimpleNamespace(layerwise_split_size=1, layerwise_split_rank=0)
+    attention.q_a_proj = lambda value: value
+    attention.q_a_layernorm = lambda value: value
+    attention.indexer = MagicMock()
+    attention.indexer.select_qli = select_qli
+
+    cp_context = SimpleNamespace(
+        cp_size=4,
+        cp_rank=0,
+        total_local=total_local,
+        query_index=torch.arange(packed_rows, dtype=torch.int64),
+    )
+    backend = MagicMock()
+    backend.mla_index_context.return_value = MagicMock()
+    forward_context_stub = SimpleNamespace(attention_backend=backend, cp_context=cp_context)
+
+    hidden = torch.ones(total_local, 3)
+    positions = torch.arange(total_local)
+    with (
+        patch.object(glm5_2, "get_forward_context", return_value=forward_context_stub),
+        pytest.raises(_IndexerReached),
+    ):
+        attention.forward(hidden, positions, torch.empty(0))
+
+    assert captured["hidden_rows"] == total_local, (
+        "the indexer must see the padded local layout; a packed query set "
+        f"({packed_rows} rows) is what crashed the prefill"
+    )
+    assert captured["qr_rows"] == total_local
+    assert captured["positions_rows"] == total_local
+    assert "cache_hidden" not in captured["kwargs"]
 
 
 def test_lse_as_token_head_squeezes_graph_leading_one() -> None:

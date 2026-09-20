@@ -3677,3 +3677,154 @@ decode 不切分的场景」。按仓库 `code-review` skill 走了一遍（含 
 而不是 packing 循环里的 off-by-one。下一步：在 `glm5_2.py` 的三个 `index_select` 之前断言/打印
 `hidden.shape[0] == cp_context.total_local`，并把 `cp_size/cp_rank/q_seq_lens/kv_seq_lens/total_local/
 query_index.max()` 记下来。
+
+## 第 37 轮（2026-09-19 21:00–）：`3480` 定位为**预打包的 indexer query**，修在模型侧；padding 场景从必崩到双 gate 全绿
+
+### (68) 触发条件收紧：不是「长 prompt」，是 **prompt 长度不整除 `2 * cp_size`**
+
+把此前所有**绿过**的 CP 场景排一遍，共同点立刻出来：
+
+| 场景 | P 侧 | prompt token | `token % (2*cp_size)` |
+|---|---|---|---|
+| `base` | cp2 | 3492 | 0 ✓ |
+| `p2d4` | cp2 | 3492 | 0 ✓ |
+| `p4d2`（短） | cp4 | 592 | 0 ✓ |
+| `kv4kv2` | cp1（无 CP） | 3492 | — |
+| `p4d2`（长） | cp4 | 3492 | **4 ✗** |
+
+于是做了一个**只改 prompt 长度、不改几何**的判定性实验：`base`（cp2，本来全绿）用 121 repeats
+（3521 token，`3521 % 4 = 1`）→ 复现同一个 `aclnnIndexSelect … 507035` 崩溃；同一场景 120 repeats
+（3492，整除）→ 仍然绿。**触发条件是 padding 行，不是 CP4/kv4 的形状。**
+
+### (69) 探针：挂在 tracer 通道上（不改构建树、不重编）
+
+`_pd_trace.py` 增加一段 CP plan 探针（只在本轮验证用，不进仓库）：wrap 所有绑定了
+`cp_shard_rows / cp_shard_positions / cp_gather_kv / cp_merge_rows` 的模块（`glm5_2` 是
+`from … import` 绑定的，只 patch 定义模块会漏掉真正被调用的那个名字）、`Glm52Indexer.select_qli`、
+以及后端的 `_update_mla_index_cache`；每次调用记 `in_rows / total_local / cp / restore_n /
+restore_max / gathered_rows / values_rows / slots` 并附**调用点**，日志写在 trace 目录（随归档一起留档）。
+探针只在 `XLLM_PD_TRACE_DIR` 打开时生效，且 `run_trace.sh` 每次都把 `tracefiles/_pd_trace.py`
+覆盖安装进容器，所以迭代探针不需要重编、也不需要动构建树。
+
+两个工具教训：
+
+1. **探针第一版把后端类名猜成 `NpuPagedAttention`**（真名 `NpuPagedAttentionBackend`），
+   `AttributeError` 在 warmup 的 `dump()` 里抛出 → worker 当场死掉、HTTP 端口关闭，
+   `smoke_long.sh` 只留下 `http_code=000`、trace 目录全空，白跑一轮 7 分钟。现在安装流程整体
+   `try/except` + 按内省（遍历模块里的类找 `_update_mla_index_cache`）取类名：**探针绝不能弄死 worker**。
+2. **`probe_check.sh` 最初把归档的 probe 日志一起 grep**，于是修复后的检查仍然报 `MISMATCH`
+   （命中的是修复前的归档）。verdict 只看 live trace dir，归档只作参考。
+
+### (70) 根因（实测一行即结论）
+
+```
+[1789823018.132] cp_gather_kv in_rows=870 total_local=874 cp=4/0 restore_n=3492 restore_max=3495
+                 gathered_rows=3480 PLAN_BUFFER_MISMATCH at=glm5_2.py:655:select_qli
+```
+
+- 3492 token @ cp4：pad 到 3496、`chunk_len=437`、`total_local=874`；rank0 拥有 chunk0 与 chunk7，
+  而 3492..3495 落在 chunk7 尾部 → **rank0 的真实行只有 870**，其它 rank 是 874。
+- `Glm52MLAAttention.forward` 的 CP 分支先用 `query_index` 把 `hidden/q_c/positions` 压成 870 行，
+  再把它们交给 `select_qli`；而 `select_qli` 里的 `cp_gather_kv` 假定输入是 **`total_local` 行的
+  padded 本地布局**：它 `all_gather` 出 `cp_size * 870 = 3480` 行，随后用 `restore_index`
+  （按 `cp_size * total_local = 3496` 定义，max = 3495）去索引 → `Index 3480 out of range[0 3480)`。
+- 只有 rank0 崩（唯一带 padding 的 rank）；短 prompt 不崩（`592 % 8 == 0`，打包无损）；
+  warmup 也不崩（probe 里 `in_rows=64 total_local=64 gathered_rows=256 restore_max=255`），
+  所以 worker 能活过 warmup、只在真正的请求上死。
+- `kv_transfer_completion.cpp:44 CHECK(futures_.empty())` 与
+  `npu_layer_synchronizer.cpp:98 Record event failed: 507035` 都是这次设备端失败的**二次症状**。
+
+### (71) 修复（模型侧，python-only，不需要重编 ELF）
+
+`xllm/python/models/glm5_2.py`：
+
+- CP 分支不再预打包：直接把 **padded 本地** `hidden/q_c/positions` 交给 indexer（与
+  `cp_context is None` 分支同一个调用）。`select_qli` 结尾本来就有 `cp_shard_rows(topk)`，
+  会把全局 top-k 归还成这个 rank 的真实行。
+- 顺手删掉 `cache_hidden` / `cache_positions` 两个参数（唯一调用方就是这里）：它们只为那次
+  打包而存在，留着就是把同一个陷阱再埋一遍。
+
+语义核对（为什么这才是对的）：
+
+- `ctx.actual_seq_q = metadata.q_cu_seq_lens[1:]` 是**全局**每请求 q 长度，`restore_index` /
+  `shard_index` / `kv_gather_index` 全部按 `total_local` 布局定义 → indexer 的输入必须是 padded
+  本地张量；不打包时 q/k/weights 都被 gather 成 `T_real` 行，正好等于 `sum(actual_seq_q)`
+  （3492），index 池写入也正好对齐（实测 warmup `values_rows=256 slots=256`）。
+- 为什么以前"看起来对"：长度整除 `2 * cp_size` 时每个 rank 的两个 chunk 全真实，
+  `query_index` 恰是恒等映射，打包无损 —— 这也是为什么四个绿场景掩盖了这个 bug。
+- K/V 那条路（`_fia_prefill_cp`）本来就没打包，`cp_gather_kv(k_3d)` 一直是对的；它只是被
+  indexer 抢崩在前面。
+
+### (72) 修复验证（容器内 `glm5_2.py` md5 = 仓库文件 `5c331399f97d77d804a4efd7bfc88c33`）
+
+| 运行 | 修复前 | 修复后 |
+|---|---|---|
+| `base` r120（cp2，3492，无 padding） | VERDICT + OWNER 全 PASS | VERDICT + OWNER 全 PASS；probe NO-MISMATCH |
+| `p4d2` r120（cp4，3492，有 padding） | ❌ `507035`，prefill rank0 崩 | **VERDICT + OWNER 全 PASS**（index 84/84、K/V 56/56、owner 56/56，0 padding 行）|
+| `base` r121（cp2，3521，有 padding） | ❌ `507035`，prefill rank0 崩 | **VERDICT + OWNER 全 PASS**；probe NO-MISMATCH |
+
+修复后的 probe 行（rank0）：`select_qli hidden_rows=874 total_local=874`，
+`cp_gather_kv in_rows=874 total_local=874 restore_n=3492 restore_max=3495 gathered_rows=3496`
+（不再有 `PLAN_BUFFER_MISMATCH`），`_fia_prefill_cp` 的 K/V gather 同样 874 → 3496。
+
+### (73) 工具与场景改动
+
+- 新增场景 `cp4kv2` = P cp4/tp1/kv_split2 → D cp1/tp2/kv_split2：`kv_split` 是 CP 组的真因子，
+  `sequence_groups = cp/kv_split = 2`，同一 slice 由两个 CP rank 持有副本 —— 这正是
+  「每 slice 单写者」从未被验证过的形状（第 66 轮遗留的复核项 1）。
+  `env.sh` 加了 case 臂（`apply_scenario_cp4kv2.py`），`run_trace_cp4kv2.sh` 由 p4d2 的生成，
+  `remote_loop.sh` 的几何表加 `cp4kv2) echo "4 1 2 1 2 2"`；五个臂都实测可求值。
+- 新脚本：`remote/apply_glm52_cp_fix.py`（幂等、带 `.pre_cpfix` 备份、逐条断言恰好匹配一次）、
+  `remote/apply_cp_fix.sh`（在 83 上把补丁打进容器，校验 py_compile + md5）、
+  `remote/probe_check.sh`（只看 live trace 的 probe verdict）、
+  `remote/probe_cp_runs.sh` / `probe_cp_fix_runs.sh` / `matrix37.sh`。
+- md5：`_pd_trace.py=6a2d05b4128f52f75a5bb0ee07c6240c`、
+  `remote_loop.sh=f045d34faf62f899be6dffd7194ebdc7`、
+  `apply_glm52_cp_fix.py=ebdc882c7008dc91a0224b8758a2e62d`、
+  `probe_check.sh=132b8806b314fd0a5735e69d52e4cdfb`、`apply_cp_fix.sh=1f709facd90f03ff6ec5aafdd4b33238`。
+
+### (74) 第 37 轮矩阵：**8 个场景、0 failure**，两个 gate 全绿（21:56–22:20）
+
+`bash matrix37.sh`（98 上，`scenarios.txt` 八行，日志 `/tmp/matrix_round37.log`）：
+
+| 场景 | Prompt | 归档 | compare | owner |
+|---|---|---|---|---|
+| `base` | 3492 | `base-215908` | PASS（index 84/84，K/V 112/112） | PASS（56/56） |
+| `p2d4` | 3492 | `p2d4-220233` | PASS（84/84，28/28） | PASS（112/112） |
+| `kv4kv2` | 3492 | `kv4kv2-220527` | PASS（84/84，56/56） | PASS（56/56） |
+| `p4d2` | 592（r20） | `p4d2-canonical-r20-220820` | PASS（15/15 +3 padding，8/8 +4 padding） | PASS（10/10 +1 padding） |
+| **`p4d2`** | **3492（r120）** | `p4d2-canonical-r120-221119` | **PASS（84/84，56/56）** | **PASS（56/56）** |
+| **`base`** | **3521（r121）** | `base-canonical-r121-221413` | **PASS（84/84，56/56）** | **PASS（56/56）** |
+| **`cp4kv2`** | 592（r20） | `cp4kv2-canonical-r20-221707` | PASS（15/15 +3 padding，8/8 +4 padding） | PASS（10/10 +1 padding） |
+| **`cp4kv2`** | 3492（r120） | `cp4kv2-canonical-r120-222006` | **PASS（84/84，56/56）** | **PASS（56/56）** |
+
+`MATRIX DONE: 0 failure(s) of 8`。
+
+**`cp4kv2`（`kv_split=2 < cp_size=4`，`sequence_groups=2`）结果**：长 prompt 全绿，且 owner 检查的
+`source replicas disagree` 计数为 **0** —— 同一 slice 上的两个 CP rank 写出的索引池**字节一致**，
+「每 slice 单写者」这条假设在这个形状下成立（第 66 轮遗留复核项 1 的实测答案）。短 prompt 的
+`abs_oos`/padding 行与 `p4d2` 完全一致（同一目的端拓扑）。
+
+**流程教训**：矩阵第一次从笔记本以 rrun 前台 ssh 启动，jump host 在 p2d4 的 compare 阶段把会话掐了，
+**远端矩阵随之被杀**（但 run 本身已经 archive，只是日志停在 `restarted`）——前台 ssh 的存活期不能当作
+远端任务的存活期。改成 98 上 `setsid nohup bash run_one98.sh` 后台跑 + 只读远端日志后，八场景一次跑完。
+（`:!` 现象是：`tail -45 | tee` 管道里未刷出的行在进程被杀时一起丢了，日志因此看起来"卡住"。)
+
+### (75) 回归测试：把「不能预打包」钉成 CPU 单测
+
+`tests/python/test_sfa_dcp.py::test_cp_indexer_is_handed_the_padded_local_rows`：用 mock 的
+`Glm52MLAAttention` 走到 indexer 调用点（indexer 抛哨兵异常终止 forward），断言
+`select_qli` 收到的 `hidden/qr/positions` 行数 == `cp_context.total_local`、且不再传
+`cache_hidden`。**判别力实测**（98 构建容器内，同一份测试）：
+
+```
+A. 打完补丁的树（5c331399…）  -> 1 passed
+B. 恢复 pre-fix 文件（8c4c8a77…）-> 1 failed：assert 4 == 6
+   "the indexer must see the padded local layout; a packed query set (4 rows)
+    is what crashed the prefill"
+C. 再次切回补丁              -> 1 passed
+```
+
+（用 `total_local=6 / packed=4` 作为 874/870 的最小同构。）另外在打补丁的树上跑**整个 CPU python
+测试目录**：`684 passed, 44 skipped`。
+
