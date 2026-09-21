@@ -96,10 +96,10 @@ class KvRedundancy final {
   //
   // C1: global_head_count % tp_size == 0 or tp_size % global_head_count == 0
   // C2: 1 <= S_eff <= D, and S_eff divides D
-  // C3: S_eff is a DCP shape the runtime can express: it divides cp_size, or
-  //     it equals cp_size * tp_size (see ContextParallelTopology). A split the
-  //     runtime cannot place would otherwise abort when the DCP process group
-  //     is built.
+  // C3: S_eff is a DCP shape the runtime can express: it divides cp_size, it
+  //     equals cp_size * tp_size, or -- when cp_size is 1 -- it divides
+  //     tp_size (see ContextParallelTopology). A split the runtime cannot place
+  //     would otherwise abort when the DCP process group is built.
   //
   // S_eff equals the configured kv_split_size when this group's redundancy can
   // absorb it. It is 1 -- every rank keeps the whole sequence -- in exactly
@@ -147,13 +147,16 @@ class KvRedundancy final {
 // t is the rank's DCP rank, because that is the identity the runtime uses:
 // KVShardLayout::globalize() maps its local row to the canonical block
 // `row * split + dcp_rank`, and the decode path builds that layout from the
-// DCP process group. ContextParallelTopology describes the two shapes the
-// runtime supports, and `derive` rejects every other split:
+// DCP process group. ContextParallelTopology describes the shapes the runtime
+// supports, and `derive` rejects every other split:
 //
 //   (a) split <= cp_size and cp_size % split == 0: DCP partitions the PCP
 //       group, so t = cp_rank / (cp_size / split);
 //   (b) split == cp_size * tp_size: DCP covers the whole DP-local domain, so
-//       t = cp_rank * tp_size + tp_rank (every rank its own slice).
+//       t = cp_rank * tp_size + tp_rank (every rank its own slice);
+//   (c) cp_size == 1 and split divides tp_size: DCP is one of the consecutive
+//       blocks of `split` TP ranks the domain is cut into, so t = tp_rank %
+//       split and the `tp_size / split` groups repeat the same slices.
 //
 // Slices are what the two peers have to agree on: canonical block b lives on
 // the rank whose t is `b % split`, on either side.
@@ -203,8 +206,10 @@ class KvLayoutIndex final {
   int32_t split_ = 0;
   int32_t replica_count_ = 0;
   // DCP shape (a) splits the PCP group into cp_size / split sequence-replica
-  // groups; shape (b) has a single group covering the whole DP-local domain.
+  // groups; shape (b) has a single group covering the whole DP-local domain and
+  // shape (c) has tp_size / split groups of `split` consecutive TP ranks.
   bool partitions_pcp_ = false;
+  bool tiles_tp_ = false;
   int32_t sequence_groups_ = 1;
 };
 

@@ -217,20 +217,30 @@ TEST(KvRedundancyTest, RejectsHeadCountThatIsNeitherDivisibleNorDividing) {
 
 TEST(KvRedundancyTest, RejectsSplitThatIsNotADcpShape) {
   // The runtime builds its DCP process group from the instance split, and
-  // ContextParallelTopology only accepts "divides cp_size" or "covers the
-  // whole DP-local domain". A split outside those shapes aborts when the group
-  // is built, so the derivation has to reject it first.
+  // ContextParallelTopology accepts only the three shapes the derivation
+  // documents: divides cp_size, covers the whole DP-local domain, or -- without
+  // PCP -- divides tp_size. cp2/tp3/S3 passes the redundancy check (3 divides
+  // D=6) but is none of them, so it aborts when the group is built and has to
+  // be rejected here first.
   const KvTopology invalid = make_topology(/*dp_size=*/1,
-                                           /*cp_size=*/1,
-                                           /*tp_size=*/8,
-                                           /*kv_split_size=*/4);
+                                           /*cp_size=*/2,
+                                           /*tp_size=*/3,
+                                           /*kv_split_size=*/3);
   KvRedundancy redundancy;
   std::string error;
   EXPECT_FALSE(KvRedundancy::derive(
       invalid, make_group(/*G=*/1, false), &redundancy, &error));
   EXPECT_NE(error.find("DCP shape"), std::string::npos) << error;
 
-  // 4 divides CP=4, so the same split is fine one PCP width up.
+  // Without PCP a split that divides TP is legal: the DCP groups are the
+  // consecutive blocks of that width, which is what makes the 8-card
+  // tp8/S2 -> tp8/S4 pair expressible at all.
+  EXPECT_TRUE(KvRedundancy::derive(make_topology(1, 1, 8, 4),
+                                   make_group(/*G=*/1, false),
+                                   &redundancy,
+                                   &error))
+      << error;
+  // 4 divides CP=4 as well, so the same split is fine one PCP width up.
   EXPECT_TRUE(KvRedundancy::derive(make_topology(1, 4, 8, 4),
                                    make_group(/*G=*/1, false),
                                    &redundancy,
@@ -377,6 +387,49 @@ TEST(KvLayoutIndexTest, EverySliceHasOneWriterAndNrepReplicas) {
       }
     }
   }
+}
+
+TEST(KvLayoutIndexTest, TilesTheTpAxisWhenThereIsNoPcp) {
+  // cp1/tp8 with S=2: the DCP groups are consecutive pairs of TP ranks, so the
+  // even ranks hold slice 0 and the odd ranks slice 1, each of them four times.
+  const KvTopology topology = make_topology(/*dp_size=*/1,
+                                            /*cp_size=*/1,
+                                            /*tp_size=*/8,
+                                            /*kv_split_size=*/2);
+  const KvRedundancy redundancy =
+      derive_ok(topology, make_group(/*G=*/1, false));
+  EXPECT_EQ(redundancy.split(), 2);
+  EXPECT_EQ(redundancy.replica_count(), 4);
+  const KvLayoutIndex index(topology, redundancy);
+  for (int32_t tp = 0; tp < 8; ++tp) {
+    EXPECT_EQ(index.slice_of(/*cp_rank=*/0, tp), tp % 2);
+    EXPECT_EQ(index.replica_of(/*cp_rank=*/0, tp), tp / 2);
+  }
+  int32_t writer = -1;
+  ASSERT_TRUE(index.writer_of(/*dp_rank=*/0, /*head_class=*/0, 0, &writer));
+  EXPECT_EQ(writer, 0);
+  ASSERT_TRUE(index.writer_of(/*dp_rank=*/0, /*head_class=*/0, 1, &writer));
+  EXPECT_EQ(writer, 1);
+
+  std::vector<int32_t> replicas;
+  ASSERT_TRUE(index.replicas_of(/*dp_rank=*/0, /*head_class=*/0, 0, &replicas));
+  EXPECT_EQ(replicas, (std::vector<int32_t>{0, 2, 4, 6}));
+  ASSERT_TRUE(index.replicas_of(/*dp_rank=*/0, /*head_class=*/0, 1, &replicas));
+  EXPECT_EQ(replicas, (std::vector<int32_t>{1, 3, 5, 7}));
+
+  // S=4 on the same instance: quarters of the TP axis, two replicas per slice.
+  const KvTopology quarters = make_topology(1, 1, 8, 4);
+  const KvRedundancy quarter_redundancy =
+      derive_ok(quarters, make_group(/*G=*/1, false));
+  EXPECT_EQ(quarter_redundancy.split(), 4);
+  EXPECT_EQ(quarter_redundancy.replica_count(), 2);
+  const KvLayoutIndex quarter_index(quarters, quarter_redundancy);
+  ASSERT_TRUE(
+      quarter_index.replicas_of(/*dp_rank=*/0, /*head_class=*/0, 0, &replicas));
+  EXPECT_EQ(replicas, (std::vector<int32_t>{0, 4}));
+  ASSERT_TRUE(
+      quarter_index.replicas_of(/*dp_rank=*/0, /*head_class=*/0, 3, &replicas));
+  EXPECT_EQ(replicas, (std::vector<int32_t>{3, 7}));
 }
 
 TEST(KvLayoutIndexTest, RejectsOutOfRangeQueries) {

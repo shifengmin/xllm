@@ -98,6 +98,32 @@ TEST(ContextParallelTopologyTest, SupportsFullDpLocalDcpLayout) {
   EXPECT_EQ(topology.dcp_group_ranks()[topology.dcp_rank()], 13);
 }
 
+TEST(ContextParallelTopologyTest, TilesTheTpAxisWhenThereIsNoPcp) {
+  // 8 ranks, no PCP, dcp 2: four consecutive DCP groups of two ranks each, so a
+  // rank's DCP rank is its position inside its group and the groups repeat the
+  // same two slices.
+  for (int32_t global_rank = 0; global_rank < 8; ++global_rank) {
+    const int32_t group_start = global_rank - global_rank % 2;
+    const ContextParallelTopology topology(global_rank,
+                                           /*world_size=*/8,
+                                           /*dp_size=*/1,
+                                           /*pcp_size=*/1,
+                                           /*dcp_size=*/2);
+    EXPECT_EQ(topology.dcp_rank(), global_rank % 2);
+    EXPECT_EQ(topology.dcp_group_ranks(),
+              (std::vector<int32_t>{group_start, group_start + 1}));
+    EXPECT_EQ(topology.dcp_group_ranks()[topology.dcp_rank()], global_rank);
+  }
+  // The same instance at dcp 4 groups four ranks at a time.
+  const ContextParallelTopology quarters(/*global_rank=*/6,
+                                         /*world_size=*/8,
+                                         /*dp_size=*/1,
+                                         /*pcp_size=*/1,
+                                         /*dcp_size=*/4);
+  EXPECT_EQ(quarters.dcp_rank(), 2);
+  EXPECT_EQ(quarters.dcp_group_ranks(), (std::vector<int32_t>{4, 5, 6, 7}));
+}
+
 TEST(ContextParallelTopologyTest, RejectsNonFactorDcpLayout) {
   EXPECT_DEATH(ContextParallelTopology(/*global_rank=*/0,
                                        /*world_size=*/8,

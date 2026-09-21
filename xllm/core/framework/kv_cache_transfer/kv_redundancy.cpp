@@ -41,6 +41,16 @@ bool dcp_spans_domain(const KvTopology& topology, int32_t split) {
   return split == topology.cp_size * topology.tp_size;
 }
 
+// DCP shape (c): without PCP the DCP group can still be narrower than the TP
+// axis. The runtime cuts the DP-local domain into `tp_size / split` consecutive
+// DCP groups of `split` ranks each (the NPU DCP process group is indexed as
+// `global_rank / dcp_size`), so a rank's slice is its TP rank modulo the split
+// and the groups after the first repeat the same slices.
+bool dcp_tiles_tp(const KvTopology& topology, int32_t split) {
+  return topology.cp_size == 1 && split > 1 && split < topology.tp_size &&
+         topology.tp_size % split == 0;
+}
+
 }  // namespace
 
 bool group_keeps_whole_sequence(const KvTopology& topology,
@@ -126,14 +136,17 @@ bool KvRedundancy::derive(const KvTopology& topology,
 
   // C3: the runtime has to be able to place this split in its DCP topology.
   if (!dcp_partitions_pcp(topology, derived.split_) &&
-      !dcp_spans_domain(topology, derived.split_)) {
+      !dcp_spans_domain(topology, derived.split_) &&
+      !dcp_tiles_tp(topology, derived.split_)) {
     set_error(error,
               "kv_split_size (" + std::to_string(derived.split_) +
                   ") is not a DCP shape the runtime supports: it must divide "
                   "cp_size (" +
                   std::to_string(topology.cp_size) +
-                  ") or equal cp_size * tp_size (" +
-                  std::to_string(topology.cp_size * topology.tp_size) + ")");
+                  "), equal cp_size * tp_size (" +
+                  std::to_string(topology.cp_size * topology.tp_size) +
+                  "), or divide tp_size (" + std::to_string(topology.tp_size) +
+                  ") when cp_size is 1");
     return false;
   }
 
@@ -166,7 +179,15 @@ KvLayoutIndex::KvLayoutIndex(const KvTopology& topology,
   split_ = redundancy.split();
   replica_count_ = redundancy.replica_count();
   partitions_pcp_ = dcp_partitions_pcp(topology, split_);
-  sequence_groups_ = partitions_pcp_ ? cp_size_ / split_ : 1;
+  tiles_tp_ = dcp_tiles_tp(topology, split_);
+  // How many ranks hold identical copies of one slice: the PCP group divided by
+  // the split for shape (a), the TP axis divided by the split for shape (c),
+  // and one for shape (b), where every rank owns its own slice.
+  if (partitions_pcp_) {
+    sequence_groups_ = cp_size_ / split_;
+  } else {
+    sequence_groups_ = tiles_tp_ ? tp_size_ / split_ : 1;
+  }
 }
 
 int32_t KvLayoutIndex::rank(int32_t dp_rank,
@@ -193,10 +214,20 @@ int32_t KvLayoutIndex::slice_of(int32_t cp_rank, int32_t tp_rank) const {
   if (partitions_pcp_) {
     return cp_rank / sequence_groups_;
   }
+  if (tiles_tp_) {
+    // Shape (c): the DCP group is the consecutive block of `split` TP ranks, so
+    // the slice is the rank's position inside that block.
+    return tp_rank % split_;
+  }
   return cp_rank * tp_size_ + tp_rank;
 }
 
 int32_t KvLayoutIndex::replica_of(int32_t cp_rank, int32_t tp_rank) const {
+  if (tiles_tp_) {
+    // Which of the `tp_size / split` groups that repeat this slice the rank
+    // belongs to.
+    return tp_rank / split_;
+  }
   if (!partitions_pcp_) {
     // Every rank holds its own slice of the single head class, so there is no
     // redundant copy and every rank is a writer.
@@ -222,6 +253,15 @@ bool KvLayoutIndex::writer_of(int32_t dp_rank,
     *rank_out = rank(dp_rank, slice * sequence_groups_, tp_rank);
     return true;
   }
+  if (tiles_tp_) {
+    // The first DCP group is the replica-0 one and a rank's position inside its
+    // group is its slice, so the writer of a slice sits at that TP rank.
+    if (slice / tp_redundancy_ != head_class) {
+      return false;
+    }
+    *rank_out = rank(dp_rank, /*cp_rank=*/0, slice);
+    return true;
+  }
   // The whole DP-local domain is one DCP group, so the rank whose DCP rank is
   // the slice is its only holder.
   const int32_t cp_rank = slice / tp_size_;
@@ -243,6 +283,17 @@ bool KvLayoutIndex::replicas_of(int32_t dp_rank,
     return false;
   }
   ranks->clear();
+  if (tiles_tp_) {
+    // One rank per repeating group, ascending by replica index.
+    ranks->reserve(static_cast<size_t>(sequence_groups_));
+    for (int32_t tp_rank = slice; tp_rank < tp_size_; tp_rank += split_) {
+      if (head_class_of(tp_rank) != head_class) {
+        continue;
+      }
+      ranks->emplace_back(rank(dp_rank, /*cp_rank=*/0, tp_rank));
+    }
+    return !ranks->empty();
+  }
   if (!partitions_pcp_) {
     const int32_t cp_rank = slice / tp_size_;
     const int32_t holder_tp = slice % tp_size_;

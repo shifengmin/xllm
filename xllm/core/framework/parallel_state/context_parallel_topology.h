@@ -32,8 +32,10 @@ namespace xllm::parallel_state {
 //
 // A PCP group varies pcp_rank while keeping dp_rank and tp_rank fixed. DCP
 // describes KV-cache ownership and decode merging. A DCP group either
-// partitions a PCP group when dcp_size divides pcp_size, or spans the complete
-// DP-local PCP x TP domain when dcp_size equals pcp_size * tp_size.
+// partitions a PCP group when dcp_size divides pcp_size, spans the complete
+// DP-local PCP x TP domain when dcp_size equals pcp_size * tp_size, or -- when
+// there is no PCP -- is one of the consecutive blocks of dcp_size ranks the
+// DP-local TP axis is cut into.
 class ContextParallelTopology final {
  public:
   ContextParallelTopology(int32_t global_rank,

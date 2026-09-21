@@ -42,9 +42,19 @@ ContextParallelTopology::ContextParallelTopology(int32_t global_rank,
 
   const bool partitions_pcp =
       dcp_size_ > 0 && dcp_size_ <= pcp_size_ && pcp_size_ % dcp_size_ == 0;
-  const bool supported_dcp_size = partitions_pcp || dcp_size_ == dp_stride;
+  // With no PCP the DCP group may still be narrower than the TP axis: the
+  // DP-local domain is then cut into dp_stride / dcp_size consecutive DCP
+  // groups, which is how the NPU DCP process group is already built -- it
+  // indexes the group as `global_rank / dcp_size`. Every dcp_size-th rank holds
+  // a different sequence slice and the following groups repeat them, so this is
+  // a replicated layout rather than a sharding one.
+  const bool tiles_tp = pcp_size_ == 1 && dcp_size_ > 0 &&
+                        dcp_size_ < dp_stride && dp_stride % dcp_size_ == 0;
+  const bool supported_dcp_size =
+      partitions_pcp || dcp_size_ == dp_stride || tiles_tp;
   CHECK(supported_dcp_size)
-      << "dcp_size must divide pcp_size or equal pcp_size * tp_size";
+      << "dcp_size must divide pcp_size, equal pcp_size * tp_size, or divide "
+         "tp_size when pcp_size is 1";
 
   const int32_t dp_group_start = dp_rank_ * dp_stride;
   pcp_group_ranks_.reserve(static_cast<size_t>(pcp_size_));
@@ -62,6 +72,19 @@ ContextParallelTopology::ContextParallelTopology(int32_t global_rank,
           dcp_replica_rank + owner_rank * pcp_per_dcp;
       dcp_group_ranks_.emplace_back(dp_group_start + owner_pcp_rank * tp_size_ +
                                     tp_rank_);
+    }
+    return;
+  }
+
+  if (tiles_tp) {
+    // The group is the consecutive block of dcp_size ranks that contains this
+    // rank; the rank's position inside it is its DCP rank, which is also its
+    // sequence slice.
+    const int32_t group_start = (dp_local_rank / dcp_size_) * dcp_size_;
+    dcp_rank_ = dp_local_rank % dcp_size_;
+    dcp_group_ranks_.reserve(static_cast<size_t>(dcp_size_));
+    for (int32_t offset = 0; offset < dcp_size_; ++offset) {
+      dcp_group_ranks_.emplace_back(dp_group_start + group_start + offset);
     }
     return;
   }
