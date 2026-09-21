@@ -4242,3 +4242,50 @@ head 几何钉得住（固定 1 个逻辑 head），`WINDOW/SWA/KV_STATE` 这类
   该二进制在本轮之前**从未编过/跑过**（我只挑编了 3 个）。修法 `00244bef6`：夹具按描述符同样的方式
   发布一条 run + `unit_head_stride`。**流程教训**：改到共享结构体（这里是 `PeerCacheView`）时，
   要编**同一目录下全部**测试目标，不能挑三个跑。
+
+### (92) 8+8 卡 tp8/dp1/cp1 异构 kv split：放开 DCP 形状 + 82 机器部署
+
+**目标（用户指定）**：GLM5.3-flash PD 分离，P/D 各 8 卡 `tp8 dp1 cp1`，prefill `kv_split=2`、
+decode `kv_split=4`；"修正这个 check，遇到问题就定位修复"。
+
+**(a) 先证明原配置被运行时自己的 CHECK 挡住**：`context_parallel_topology.cpp:45-47` 只接受
+`dcp_size` 整除 `pcp_size` 或等于 `pcp_size*tp_size`，而 `kv_split_size_effective()` 在 `cp==1` 时就是
+kv_split 本身 → `dcp=2/4` 既整除不了 1 也不等于 8 → `CHECK(dcp_size must divide pcp_size...)` FATAL。
+
+**(b) 放开得有理有据，不是绕过**：NPU 的 DCP 进程组本来就是**按 global rank 连续切块**
+（`collective_communicator.cpp:588-589`：`dcp_group_index = global_rank / dcp_size`），所以
+`cp==1 && dcp<tp && tp%dcp==0` 只需让拓扑如实描述它：新增 `tiles_tp` 形状（组 = 含本 rank 的连续
+`dcp` 块，`dcp_rank` = 块内偏移），原两种形状与死亡用例不变。
+路由侧 `KvRedundancy` 增加形状 (c)：`slice = tp_rank % split`、副本按该 (head class, slice) 组的
+**第一个持有者**计数（`writer_of` 取它、`replica_of` 从它起算）。**注意**：不能写成 `replica = tp/split`
+——`G=2/tp=4/S=2` 这类多 head class 形状下，同一 TP 块内的 rank 属于不同 class，`(class 1, slice 0)`
+的持有者是 rank 2 而不是 rank 0；第一版就是错在这里，被 `EverySliceHasOneWriterAndNrepReplicas` 和
+`RouteInvariantsHoldOverTheTopologyMatrix`（"source has no writer for head class 1 slice 0"）抓出来。
+提交：`a59033b3a`（放形状）+ `b33ba357a`（修副本索引）。
+单测（98）：`context_parallel_topology_test 7 / kv_redundancy_test 13 / pd_route_test 18 /
+cache_directory_test 27 / pd_route_transfer_test 14 / kv_shard_contract_test 6 /
+cache_layout_builder_test 10` 全绿。
+
+**(c) 82 机器（`jd-node-82`，11.87.191.82）部署**：16 芯片当时无进程（空闲）。
+* 容器 `fengmin-pdroute82`（镜像 `...20260911`，`--privileged --network=host`，挂 `/export/home` 与
+  `/mnt/cfs/.../llm_models`）；`GLM-5.3-Flash*` 在 CFS 上齐全。
+* 包：83 的 wheel（576MB）+ `libasio.so` + `custom_xllm_math`(139M) + `lse_vendor` + `etcd` +
+  `xllm_master_serving` 经 **83→98→82**（98 的 key 追加到 82 的 authorized_keys 后已是集群内链路）。
+* **引擎**：98 用 rebase 后的树构建、strip 成 `xllm82.full`（113,818,200 B，md5
+  `b3bc0e1851fb10be696aa88cf6d045e9`）换进容器；`strings` 里能查到新 CHECK 文案。
+* **踩到的坑**：① 82 上 `third_party` 无 xllm 包，wheel 装出的 **python 侧是旧的**
+  （`ModelExecutor.__init__() got an unexpected keyword argument 'is_spec_draft'`）→ 用 98 构建树的
+  `xllm/python`（173 个 .py，含 `is_spec_draft`）覆盖；② 新 main 的引擎多依赖 **`liburing.so.2`**，82 容器
+  没有 → 从 98 容器 `/usr/lib64/liburing.so.2.4`（SONAME `liburing.so.2`）改名放入 $BASE/lib 与
+  /usr/lib64，之后 `ldd` 0 缺失；③ 82 上 5389/58889/46105 被别的进程占（host 网络共享）→
+  改为 etcd `15389`、RPC `58989`、`P_TX=51100`、`D_TX=52100`、`P/D_DISAGG=19877/19878`。
+* 新场景臂 **`p8d8`**（env.sh）：`P_NNODES=8 P_CP=1 P_KVSPLIT=2 P_VISIBLE=0..7`、
+  `D_NNODES=8 D_CP=1 D_KVSPLIT=4 D_VISIBLE=8..15`，驱动 `run_trace_p8d8.sh`。
+
+**(d) 当前进度与下一步**：三次尝试逐个推进——① 缺 `liburing.so.2`；② 引擎/Python 版本错位；
+③ 现在已经**过了模型初始化**（说明 DCP 形状放宽生效、没有再撞 CHECK），但 worker 起来后
+`etcd_client.cpp:35] ... 11.87.191.82:15389: Connection refused`——运行中途 etcd 掉了。
+下一轮：查 `clean_restart.sh`/`run_all.sh` 在 82 上 etcd 的启动方式与生命周期（83 正常，差别在端口/数据目录/
+是否被同机别的 etcd 干扰），修掉后跑到 READY、发请求，再用 `compare_heads.py`/`compare_kv.py` +
+owner check 出逐字节结论。收尾时已 `clean_restart.sh reset`；82 上有约 2500 个僵尸（容器 PID 1 不 reap，
+重启容器即清）。
