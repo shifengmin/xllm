@@ -430,6 +430,32 @@ TEST(KvLayoutIndexTest, TilesTheTpAxisWhenThereIsNoPcp) {
   ASSERT_TRUE(
       quarter_index.replicas_of(/*dp_rank=*/0, /*head_class=*/0, 3, &replicas));
   EXPECT_EQ(replicas, (std::vector<int32_t>{3, 7}));
+
+  // With more than one head class the ranks of one TP block belong to different
+  // classes, so a class-slice pair can be held by a rank that is not the first
+  // of its block -- and a replica index counts from the first holder of that
+  // pair rather than from the block.
+  const KvTopology two_classes = make_topology(1, 1, 4, 2);
+  const KvRedundancy class_redundancy =
+      derive_ok(two_classes, make_group(/*G=*/2, false));
+  EXPECT_EQ(class_redundancy.split(), 2);
+  EXPECT_EQ(class_redundancy.replica_count(), 1);
+  const KvLayoutIndex class_index(two_classes, class_redundancy);
+  for (int32_t tp = 0; tp < 4; ++tp) {
+    EXPECT_EQ(class_index.slice_of(/*cp_rank=*/0, tp), tp % 2);
+    EXPECT_EQ(class_index.replica_of(/*cp_rank=*/0, tp), 0);
+  }
+  // Head class 1 owns TP ranks 2 and 3, so the holder of (class 1, slice 0) is
+  // rank 2 and it is that pair's writer.
+  ASSERT_TRUE(
+      class_index.writer_of(/*dp_rank=*/0, /*head_class=*/1, 0, &writer));
+  EXPECT_EQ(writer, 2);
+  ASSERT_TRUE(
+      class_index.writer_of(/*dp_rank=*/0, /*head_class=*/1, 1, &writer));
+  EXPECT_EQ(writer, 3);
+  ASSERT_TRUE(
+      class_index.replicas_of(/*dp_rank=*/0, /*head_class=*/1, 0, &replicas));
+  EXPECT_EQ(replicas, (std::vector<int32_t>{2}));
 }
 
 TEST(KvLayoutIndexTest, RejectsOutOfRangeQueries) {

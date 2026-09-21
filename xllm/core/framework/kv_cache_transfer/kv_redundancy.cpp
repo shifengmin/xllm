@@ -51,6 +51,25 @@ bool dcp_tiles_tp(const KvTopology& topology, int32_t split) {
          topology.tp_size % split == 0;
 }
 
+// Shape (c) only: the first TP rank of `head_class` that owns `slice`, or -1
+// when that class owns no such slice. A head class covers `tp_redundancy`
+// consecutive TP ranks while a slice is every `split`-th rank, so the two only
+// intersect when the split fits inside the class; the ranks that do intersect
+// are the redundant copies of that (class, slice) pair, and the first of them
+// is its writer.
+int32_t first_tp_holder(int32_t head_class,
+                        int32_t slice,
+                        int32_t tp_redundancy,
+                        int32_t split) {
+  const int32_t class_begin = head_class * tp_redundancy;
+  const int32_t straddle = ((slice - class_begin) % split + split) % split;
+  const int32_t first = class_begin + straddle;
+  if (first >= class_begin + tp_redundancy) {
+    return -1;
+  }
+  return first;
+}
+
 }  // namespace
 
 bool group_keeps_whole_sequence(const KvTopology& topology,
@@ -224,9 +243,16 @@ int32_t KvLayoutIndex::slice_of(int32_t cp_rank, int32_t tp_rank) const {
 
 int32_t KvLayoutIndex::replica_of(int32_t cp_rank, int32_t tp_rank) const {
   if (tiles_tp_) {
-    // Which of the `tp_size / split` groups that repeat this slice the rank
-    // belongs to.
-    return tp_rank / split_;
+    // The copies of one (head class, slice) pair are the ranks of that class
+    // that own that slice, `split` apart, so the replica index counts from the
+    // first of them. It is not `tp_rank / split`: with more than one head class
+    // the ranks of the same TP block belong to different classes and are not
+    // copies of each other.
+    const int32_t first = first_tp_holder(head_class_of(tp_rank),
+                                          slice_of(cp_rank, tp_rank),
+                                          tp_redundancy_,
+                                          split_);
+    return (tp_rank - first) / split_;
   }
   if (!partitions_pcp_) {
     // Every rank holds its own slice of the single head class, so there is no
@@ -254,12 +280,15 @@ bool KvLayoutIndex::writer_of(int32_t dp_rank,
     return true;
   }
   if (tiles_tp_) {
-    // The first DCP group is the replica-0 one and a rank's position inside its
-    // group is its slice, so the writer of a slice sits at that TP rank.
-    if (slice / tp_redundancy_ != head_class) {
+    // The writer of a (head class, slice) pair is the first rank of that class
+    // that owns the slice; the copies that follow it, `split` apart, never
+    // write.
+    const int32_t first =
+        first_tp_holder(head_class, slice, tp_redundancy_, split_);
+    if (first < 0) {
       return false;
     }
-    *rank_out = rank(dp_rank, /*cp_rank=*/0, slice);
+    *rank_out = rank(dp_rank, /*cp_rank=*/0, first);
     return true;
   }
   // The whole DP-local domain is one DCP group, so the rank whose DCP rank is
@@ -284,10 +313,14 @@ bool KvLayoutIndex::replicas_of(int32_t dp_rank,
   }
   ranks->clear();
   if (tiles_tp_) {
-    // One rank per repeating group, ascending by replica index.
-    ranks->reserve(static_cast<size_t>(sequence_groups_));
-    for (int32_t tp_rank = slice; tp_rank < tp_size_; tp_rank += split_) {
-      if (head_class_of(tp_rank) != head_class) {
+    // Every rank of this head class that owns the slice, ascending: they are
+    // `split` apart inside the class, so the class range is the whole search
+    // space.
+    const int32_t class_begin = head_class * tp_redundancy_;
+    ranks->reserve(static_cast<size_t>(replica_count_));
+    for (int32_t tp_rank = class_begin; tp_rank < class_begin + tp_redundancy_;
+         ++tp_rank) {
+      if (tp_rank % split_ != slice) {
         continue;
       }
       ranks->emplace_back(rank(dp_rank, /*cp_rank=*/0, tp_rank));
