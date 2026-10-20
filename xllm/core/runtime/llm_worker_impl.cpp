@@ -479,10 +479,15 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       } else {
         // Aux-hidden-capture algorithms (DFlash/DFlash2/Eagle3/DSpark)
         // consume the captured columns from the aux embeddings, so select
-        // their rows from that tensor. Under CP the decode batch runs
-        // without a cp_context (EagerRunner only builds one for prefill
-        // batches), so the rows are already global-ordered and the
-        // selection matches the non-CP path.
+        // their rows from that tensor. selected_hidden is not the fallback
+        // here: need_selected_hidden above excludes the aux path (its CP
+        // branch requires !aux_hidden_states.defined()), so unless a caller
+        // separately requested return_selected_hidden the lm_head pass
+        // never produced it -- and even then it would carry the hidden rows
+        // only, without the captured aux columns the draft consumes. Under
+        // CP the decode batch runs without a cp_context (EagerRunner only
+        // builds one for prefill batches), so the rows are already
+        // global-ordered and the selection matches the non-CP path.
         output.sample_output.embeddings = embeddings.index_select(
             /*dim=*/0, lm_head_selected_token_idxes);
       }

@@ -42,6 +42,7 @@ limitations under the License.
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
 #include "core/runtime/speculative_worker_impl.h"
+#include "core/util/scope_guard.h"
 #include "core/util/slice.h"
 #include "models/model_registry.h"
 
@@ -1229,10 +1230,14 @@ TEST_F(MTPHostOffloadTest, DFlash2AllowsGlmMoeDsaContextParallelism) {
   const ScopedModelTypeConfig model_config("glm_moe_dsa");
   options.model_path(model_config.path().string());
   // The glm_moe_dsa exemption is python-impl only; the ModelConfig singleton
-  // defaults elsewhere, so pin and restore it around the construction.
+  // defaults elsewhere, so pin and restore it around the construction. The
+  // ScopeGuard keeps the restore on early returns and exceptions, so a
+  // construction failure cannot leak "python" into later tests.
   ModelConfig& global_model_config = ModelConfig::get_instance();
   const std::string original_model_impl = global_model_config.model_impl();
   global_model_config.model_impl("python");
+  const ScopeGuard model_impl_guard(
+      [&] { global_model_config.model_impl(original_model_impl); });
 
   // Construction must not CHECK-fail: allow_cp resolves true because
   // model_type == "glm_moe_dsa" && is_dflash2_algorithm("DFlash2") under the
@@ -1240,7 +1245,6 @@ TEST_F(MTPHostOffloadTest, DFlash2AllowsGlmMoeDsaContextParallelism) {
   auto worker = std::make_unique<TestDFlashWorker>(
       parallel_args, device.unwrap(), options);
   EXPECT_NE(worker, nullptr);
-  global_model_config.model_impl(original_model_impl);
 }
 
 TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {

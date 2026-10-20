@@ -354,10 +354,10 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
               allow_cp = util::is_deepseek_v4_model_type(model_type) ||
                          SpeculativeConfig::is_glm5_next_dflash2(
                              model_type, options.speculative_algorithm()) ||
-                         (SpeculativeConfig::is_glm_moe_dsa_dflash2(
-                              model_type, options.speculative_algorithm()) &&
-                          ModelConfig::is_python_model_impl(
-                              ModelConfig::get_instance().model_impl()));
+                         SpeculativeConfig::is_glm_moe_dsa_dflash2(
+                             model_type,
+                             options.speculative_algorithm(),
+                             ModelConfig::get_instance().model_impl());
             }
             if (!allow_cp) {
               CHECK_LE(parallel_args.cp_size(), 1)

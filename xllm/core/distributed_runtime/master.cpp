@@ -213,8 +213,8 @@ std::optional<std::string> validate_model_cp(const Options& options,
         model_type, options.speculative_algorithm());
     const bool is_glm_moe_dsa_dflash2 =
         SpeculativeConfig::is_glm_moe_dsa_dflash2(
-            model_type, options.speculative_algorithm()) &&
-        ModelConfig::is_python_model_impl(
+            model_type,
+            options.speculative_algorithm(),
             ModelConfig::get_instance().model_impl());
     if (engine_type == EngineType::SSM &&
         SpeculativeConfig::requires_aux_hidden_capture(

@@ -230,6 +230,16 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
                 "speculative decoding on a cp_size=1 Decode instance."));
   model_config.model_impl("python");
   options.speculative_algorithm("DSpark");
+  // The exemption is DFlash2-only: with the impl restored to python, the
+  // non-DFlash2 aux-capture algorithm is still rejected.
+  EXPECT_EQ(validate_model_cp(options,
+                              EngineType::SSM,
+                              "glm_moe_dsa",
+                              /*global_world_size=*/16),
+            std::optional<std::string>(
+                "Current model-side CP does not support aux-hidden-capture "
+                "speculative algorithms (Eagle3/DFlash/DSpark); run "
+                "speculative decoding on a cp_size=1 Decode instance."));
 
   options.cp_size(1).instance_role(InstanceRole::DECODE).enable_disagg_pd(true);
   EXPECT_FALSE(validate_model_cp(options,
