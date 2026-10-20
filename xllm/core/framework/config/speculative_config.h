@@ -65,6 +65,18 @@ class SpeculativeConfig final {
     return model_type == "glm5_next" && is_dflash2_algorithm(algorithm);
   }
 
+  // The glm_moe_dsa (GLM-5.2/5.3) + DFlash2 pairing, the mirror of
+  // is_glm5_next_dflash2: glm5_2.py restores the aux-hidden buffer to
+  // global row order under CP by cp_merge_rows on the concatenated
+  // (hidden, aux_hidden_buffer) pair, unit-tested in
+  // test_glm5_2_cp_ragged.py::
+  // test_cp_aux_hidden_is_merged_with_target_in_capture_order. Consumed by
+  // the same master admission and draft worker gates.
+  static bool is_glm_moe_dsa_dflash2(std::string_view model_type,
+                                     std::string_view algorithm) {
+    return model_type == "glm_moe_dsa" && is_dflash2_algorithm(algorithm);
+  }
+
   static bool is_mtp_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "MTP");
   }
